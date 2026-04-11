@@ -169,9 +169,14 @@ export function TelemetryServicesSection() {
         <p className="text-xs text-white/70 leading-relaxed max-w-2xl">
           Interested in protecting your flight data with blockchain-grade
           integrity?{" "}
-          <span className="text-electric-cyan font-medium">
+          <a
+            href="https://x.com/BSVCasey"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-electric-cyan font-medium hover:text-electric-cyan/80 transition-colors underline-offset-2 hover:underline"
+          >
             Get in touch
-          </span>{" "}
+          </a>{" "}
           to discuss integration, pricing, and a tailored proof-of-concept
           for your operation.
         </p>
