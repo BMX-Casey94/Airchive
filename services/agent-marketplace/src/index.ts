@@ -167,7 +167,7 @@ async function main(): Promise<void> {
     log.info("Direct P2PKH payment sender initialised (bypasses ServerWallet for payments)");
   }
 
-  function wrapWalletWithDirectPay<T extends { sendMessageBoxPayment(to: string, sats: number): Promise<any> }>(
+  function wrapWalletWithDirectPay<T extends { sendMessageBoxPayment(to: string, sats: number): Promise<any>; inscribeText(text: string): Promise<any> }>(
     wallet: T,
     senderLabel: string,
     recipientLabel: string,
@@ -182,6 +182,16 @@ async function main(): Promise<void> {
               return await dp.sendPayment(senderLabel, recipientLabel, sats);
             } catch (err) {
               log.debug({ err: (err as Error).message, from: senderLabel, to: recipientLabel }, "Direct payment failed");
+              throw err;
+            }
+          };
+        }
+        if (prop === "inscribeText") {
+          return async (text: string) => {
+            try {
+              return await dp.inscribe(senderLabel, text);
+            } catch (err) {
+              log.debug({ err: (err as Error).message, from: senderLabel }, "Direct inscription failed");
               throw err;
             }
           };

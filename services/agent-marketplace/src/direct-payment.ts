@@ -1,4 +1,4 @@
-import { Hash, P2PKH, PrivateKey, Transaction, ARC } from "@bsv/sdk";
+import { Hash, P2PKH, PrivateKey, Script, Transaction, ARC } from "@bsv/sdk";
 import { createLogger } from "@airchive/logger";
 
 const log = createLogger({ service: "agent-marketplace:direct-pay" });
@@ -20,6 +20,32 @@ interface WocUtxo {
 
 function derivePkh(key: PrivateKey): number[] {
   return Hash.hash160(key.toPublicKey().encode(true) as number[]);
+}
+
+function varintLen(n: number): number {
+  if (n < 0xfd) return 1;
+  if (n <= 0xffff) return 3;
+  return 5;
+}
+
+function appendPush(script: number[], data: Uint8Array): void {
+  const n = data.length;
+  if (n <= 0x4b) {
+    script.push(n);
+  } else if (n <= 0xff) {
+    script.push(0x4c, n);
+  } else if (n <= 0xffff) {
+    script.push(0x4d, n & 0xff, (n >> 8) & 0xff);
+  } else {
+    script.push(0x4e, n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff, (n >> 24) & 0xff);
+  }
+  for (let i = 0; i < n; i++) script.push(data[i]!);
+}
+
+function buildTextOpReturn(data: Uint8Array): number[] {
+  const script: number[] = [0x00, 0x6a];
+  appendPush(script, data);
+  return script;
 }
 
 function estimateFee(inputCount: number, outputCount: number): number {
@@ -129,6 +155,73 @@ export class DirectPaymentSender {
     log.info(
       { from: fromLabel, to: toLabel, amount: amountSats, txid: result.txid, fee },
       "Direct P2PKH payment sent",
+    );
+
+    return { txid: result.txid, feeSats: fee };
+  }
+
+  async inscribe(
+    fromLabel: string,
+    text: string,
+  ): Promise<{ txid: string; feeSats: number }> {
+    const senderKey = this.keys.get(fromLabel);
+    if (!senderKey) throw new Error(`Unknown sender: ${fromLabel}`);
+
+    const senderAddress = senderKey.toAddress();
+    const utxos = await this.fetchUtxos(senderAddress);
+
+    const dataBytes = new TextEncoder().encode(text);
+    const scriptBytes = buildTextOpReturn(dataBytes);
+    const opReturnScript = Script.fromBinary(scriptBytes);
+
+    const opReturnOutputSize = 8 + varintLen(scriptBytes.length) + scriptBytes.length;
+    const txSize =
+      TX_OVERHEAD + 1 +
+      (INPUT_OVERHEAD + P2PKH_UNLOCK_SIZE) +
+      opReturnOutputSize +
+      P2PKH_OUTPUT_SIZE;
+    const fee = Math.ceil((txSize / 1000) * SATS_PER_KB * FEE_BUFFER);
+    const needed = fee + MIN_CHANGE_SATS;
+
+    const suitable = utxos.find((u) => u.value >= needed);
+    if (!suitable) {
+      const best = Math.max(0, ...utxos.map((u) => u.value));
+      throw new Error(`No suitable UTXO for ${fromLabel} inscription: need ${needed}, best ${best}`);
+    }
+
+    const changeSats = suitable.value - fee;
+
+    const senderPkh = derivePkh(senderKey);
+    const senderLock = new P2PKH().lock(senderPkh);
+
+    const tx = new Transaction();
+    tx.addInput({
+      sourceTXID: suitable.tx_hash,
+      sourceOutputIndex: suitable.tx_pos,
+      sourceSatoshis: suitable.value,
+      lockingScript: senderLock,
+      unlockingScriptTemplate: new P2PKH().unlock(
+        senderKey, "all", false, suitable.value, senderLock,
+      ),
+      sequence: 0xffffffff,
+    });
+
+    tx.addOutput({ lockingScript: opReturnScript, satoshis: 0 });
+
+    if (changeSats >= MIN_CHANGE_SATS) {
+      tx.addOutput({ lockingScript: senderLock, satoshis: changeSats });
+    }
+
+    await tx.sign();
+
+    const result = await this.arc.broadcast(tx);
+    if (result.status === "error" || !result.txid) {
+      throw new Error(`Inscription broadcast failed: ${JSON.stringify(result)}`);
+    }
+
+    log.info(
+      { from: fromLabel, txid: result.txid, fee, dataLen: dataBytes.length },
+      "Direct OP_RETURN inscription sent",
     );
 
     return { txid: result.txid, feeSats: fee };
