@@ -7,6 +7,7 @@ import { CollectorAgent } from "./collector-agent.js";
 import { AnalystAgent } from "./analyst-agent.js";
 import { MonitorAgent } from "./monitor-agent.js";
 import { AgentActivityPublisher } from "./activity-publisher.js";
+import { DirectPaymentSender } from "./direct-payment.js";
 import { registry } from "./metrics.js";
 
 const log = createLogger({ service: "agent-marketplace" });
@@ -102,8 +103,60 @@ async function main(): Promise<void> {
       analystAddress: analystWallet.getAddress(),
       monitorAddress: monitorWallet.getAddress(),
     },
-    "=== AGENT FUNDING ADDRESSES (send BSV here) ===",
+    "=== AGENT FUNDING ADDRESSES ===",
   );
+
+  for (const [name, w] of [["collector", collectorWallet], ["analyst", analystWallet], ["monitor", monitorWallet]] as const) {
+    try {
+      const bal = await (w as any).getBalance();
+      log.info(
+        { agent: name, spendableSats: bal.spendableSatoshis, totalSats: bal.totalSatoshis, outputs: bal.spendableOutputs },
+        "Agent wallet internal balance",
+      );
+    } catch (err) {
+      log.warn({ agent: name, err: (err as Error).message }, "Could not query agent wallet balance");
+    }
+  }
+
+  const arcUrl = process.env.TAAL_ARC_URL ?? "https://arc.taal.com";
+  const arcApiKey = process.env.TAAL_ARC_API_KEY ?? "";
+  const wocUrl = process.env.WOC_API_URL ?? "https://api.whatsonchain.com/v1/bsv/main";
+
+  let directPay: DirectPaymentSender | null = null;
+  if (arcApiKey) {
+    directPay = new DirectPaymentSender(wocUrl, arcUrl, arcApiKey);
+    directPay.registerKey("collector", process.env[config.collectorKeyEnv] ?? "");
+    directPay.registerKey("analyst", process.env[config.analystKeyEnv] ?? "");
+    directPay.registerKey("monitor", process.env[config.monitorKeyEnv] ?? "");
+    log.info("Direct P2PKH payment sender initialised (bypasses ServerWallet for payments)");
+  }
+
+  function wrapWalletWithDirectPay<T extends { sendMessageBoxPayment(to: string, sats: number): Promise<any> }>(
+    wallet: T,
+    senderLabel: string,
+    recipientLabel: string,
+  ): T {
+    if (!directPay) return wallet;
+    const dp = directPay;
+    return new Proxy(wallet, {
+      get(target, prop, receiver) {
+        if (prop === "sendMessageBoxPayment") {
+          return async (_to: string, sats: number) => {
+            try {
+              return await dp.sendPayment(senderLabel, recipientLabel, sats);
+            } catch (err) {
+              log.debug({ err: (err as Error).message, from: senderLabel, to: recipientLabel }, "Direct payment failed");
+              throw err;
+            }
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+  }
+
+  const wrappedMonitorWallet = wrapWalletWithDirectPay(monitorWallet, "monitor", "collector");
+  const wrappedAnalystWallet = wrapWalletWithDirectPay(analystWallet, "analyst", "collector");
 
   const collector = new CollectorAgent(redis, db, config.trackedAircraft, activityPub);
   const analyst = new AnalystAgent(collector, activityPub, config.analysisIntervalMs);
@@ -117,10 +170,10 @@ async function main(): Promise<void> {
   await collector.start(collectorWallet);
   await activityPub.publishStatus("collector", "running");
 
-  await analyst.start(analystWallet);
+  await analyst.start(wrappedAnalystWallet);
   await activityPub.publishStatus("analyst", "running");
 
-  await monitor.start(monitorWallet);
+  await monitor.start(wrappedMonitorWallet);
   await activityPub.publishStatus("monitor", "running");
 
   const metricsServer = createHttpServer((_req, res) => {

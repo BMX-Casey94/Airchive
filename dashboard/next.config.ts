@@ -13,11 +13,12 @@ dotenv.config({ path: path.join(workspaceRoot, ".env.local"), override: true });
 dotenv.config({ path: path.join(__dirname, "..", ".env") });
 dotenv.config({ path: path.join(__dirname, "..", ".env.local"), override: true });
 
+const cesiumSource = path.join(__dirname, "node_modules", "cesium", "Build", "Cesium");
+
 const nextConfig: NextConfig = {
   output: process.env.NEXT_OUTPUT === "standalone" ? "standalone" : undefined,
   outputFileTracingRoot: path.join(__dirname, ".."),
   reactStrictMode: true,
-  transpilePackages: ["cesium"],
   experimental: {},
   env: {
     NEXT_PUBLIC_GATEWAY_URL: process.env.NEXT_PUBLIC_GATEWAY_URL ?? "http://localhost:4000",
@@ -35,6 +36,11 @@ const nextConfig: NextConfig = {
         http: false,
         https: false,
         zlib: false,
+      };
+
+      config.resolve.alias = {
+        ...config.resolve.alias,
+        cesium$: path.join(cesiumSource, "Cesium.js"),
       };
     }
     return config;

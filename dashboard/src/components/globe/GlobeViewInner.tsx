@@ -73,11 +73,10 @@ export default function GlobeViewInner() {
 
     void (async () => {
       try {
+        (globalThis as unknown as { CESIUM_BASE_URL?: string }).CESIUM_BASE_URL = "/cesium/";
+
         const Cesium = await import("cesium");
         if (cancelled || !containerRef.current) return;
-
-        const g = globalThis as unknown as { CESIUM_BASE_URL?: string };
-        g.CESIUM_BASE_URL = "/cesium/";
 
         Cesium.Ion.defaultAccessToken = CESIUM_TOKEN;
 
@@ -117,16 +116,9 @@ export default function GlobeViewInner() {
 
         if (!cancelled) setReady(true);
       } catch (e) {
-        console.error(e);
-        const msg = e instanceof Error ? e.message : "Failed to initialise CesiumJS";
-        if (msg.includes("Loading chunk") || msg.includes("ChunkLoadError")) {
-          setLoadError(
-            "A stale build cache is preventing the globe from loading. " +
-            "Clear your browser cache or, if running locally, delete the dashboard/.next folder and restart.",
-          );
-        } else {
-          setLoadError(msg);
-        }
+        console.error("[GlobeViewInner] Cesium load failed:", e);
+        const msg = e instanceof Error ? e.message : String(e);
+        setLoadError(msg || "Failed to initialise CesiumJS");
       }
     })();
 
