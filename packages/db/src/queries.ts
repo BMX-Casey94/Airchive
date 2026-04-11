@@ -16,6 +16,7 @@ export interface DbAircraftConfigRow {
   reg: string | null;
   aircraft_type: string | null;
   wallet_index: number;
+  wallet_address: string | null;
   enabled: boolean;
   created_at: Date;
 }
@@ -350,6 +351,7 @@ export async function upsertAircraftConfig(
       reg: config.reg,
       aircraft_type: config.aircraft_type,
       wallet_index: config.wallet_index,
+      wallet_address: config.wallet_address,
       enabled: config.enabled,
     })
     .onConflict("icao")

@@ -84,6 +84,7 @@ function mapTelemetry(raw: RawTelemetry): AircraftTelemetry {
     originName: (raw.origin_name as string) || null,
     destIcao: (raw.dest_icao as string) || null,
     destName: (raw.dest_name as string) || null,
+    walletAddress: (raw.wallet_address as string) || null,
   };
 }
 

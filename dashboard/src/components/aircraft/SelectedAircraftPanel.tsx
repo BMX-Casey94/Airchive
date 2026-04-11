@@ -259,6 +259,39 @@ function AircraftDetail({ ac }: { ac: AircraftTelemetry }) {
           </p>
         </div>
       )}
+
+      {/* View Wallet On-Chain */}
+      {ac.walletAddress && (
+        <div className="border-t border-panel-border/30 pt-4">
+          <a
+            href={`https://whatsonchain.com/address/${ac.walletAddress}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className={clsx(
+              "flex items-center justify-center gap-2 w-full",
+              "rounded-lg border border-electric-cyan/30 bg-electric-cyan/5",
+              "px-4 py-2.5 text-xs font-mono text-electric-cyan",
+              "transition-all hover:border-electric-cyan/60 hover:bg-electric-cyan/10 hover:shadow-glow-cyan",
+            )}
+          >
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              className="h-4 w-4 shrink-0"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+              strokeWidth={1.5}
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                d="M13.5 6H5.25A2.25 2.25 0 003 8.25v10.5A2.25 2.25 0 005.25 21h10.5A2.25 2.25 0 0018 18.75V10.5m-10.5 6L21 3m0 0h-5.25M21 3v5.25"
+              />
+            </svg>
+            View Aircraft Wallet On-Chain
+          </a>
+        </div>
+      )}
     </div>
   );
 }

@@ -4,12 +4,39 @@ import { getDb } from "@airchive/db";
 
 const aircraftState = new Map<string, TelemetryRecord & { phase?: string; flight_id?: string; last_updated: number }>();
 
+const walletAddressCache = new Map<string, string>();
+
 export function updateAircraftState(record: TelemetryRecord & { phase?: string; flight_id?: string }): void {
   aircraftState.set(record.icao.toUpperCase(), { ...record, last_updated: Date.now() });
 }
 
+async function resolveWalletAddress(icao: string): Promise<string | null> {
+  const cached = walletAddressCache.get(icao);
+  if (cached) return cached;
+
+  const db = getDb();
+  const row = await db("aircraft_config")
+    .where({ icao })
+    .select("wallet_address")
+    .first();
+
+  const addr = row?.wallet_address ?? null;
+  if (addr) walletAddressCache.set(icao, addr);
+  return addr;
+}
+
 export async function fleetRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/fleet", async (_request, reply) => {
+    const db = getDb();
+    const configRows = await db("aircraft_config")
+      .where({ enabled: true })
+      .select("icao", "wallet_address");
+    const addrMap = new Map<string, string | null>();
+    for (const row of configRows) {
+      addrMap.set(row.icao, row.wallet_address ?? null);
+      if (row.wallet_address) walletAddressCache.set(row.icao, row.wallet_address);
+    }
+
     const fleet = Array.from(aircraftState.values()).map((a) => ({
       icao: a.icao,
       callsign: a.callsign,
@@ -22,6 +49,7 @@ export async function fleetRoutes(app: FastifyInstance): Promise<void> {
       phase: a.phase ?? "UNKNOWN",
       flight_id: a.flight_id,
       last_updated: a.last_updated,
+      wallet_address: addrMap.get(a.icao.toUpperCase()) ?? null,
     }));
     return reply.send({ success: true, data: fleet });
   });
@@ -34,15 +62,17 @@ export async function fleetRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const db = getDb();
-    const sessions = await db("flight_sessions")
-      .where({ aircraft_icao: icao })
-      .orderBy("started_at", "desc")
-      .limit(1);
-
-    const recentTx = await db("tx_results")
-      .where({ aircraft_icao: icao })
-      .orderBy("timestamp", "desc")
-      .limit(10);
+    const [sessions, recentTx, walletAddress] = await Promise.all([
+      db("flight_sessions")
+        .where({ aircraft_icao: icao })
+        .orderBy("started_at", "desc")
+        .limit(1),
+      db("tx_results")
+        .where({ aircraft_icao: icao })
+        .orderBy("timestamp", "desc")
+        .limit(10),
+      resolveWalletAddress(icao),
+    ]);
 
     return reply.send({
       success: true,
@@ -50,6 +80,7 @@ export async function fleetRoutes(app: FastifyInstance): Promise<void> {
         current,
         activeSession: sessions[0] ?? null,
         recentTransactions: recentTx,
+        walletAddress,
       },
     });
   });

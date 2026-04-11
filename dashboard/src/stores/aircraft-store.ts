@@ -43,6 +43,7 @@ export interface AircraftTelemetry {
   originName: string | null;
   destIcao: string | null;
   destName: string | null;
+  walletAddress: string | null;
 }
 
 export interface AircraftState {

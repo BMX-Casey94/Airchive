@@ -69,6 +69,7 @@ async function main(): Promise<void> {
       reg: "",
       aircraft_type: "",
       wallet_index: ac.wallet_index,
+      wallet_address: vault.getAircraftAddress(ac.icao),
       enabled: true,
     });
   }
