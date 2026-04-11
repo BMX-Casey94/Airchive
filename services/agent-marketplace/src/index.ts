@@ -1,5 +1,6 @@
 import { createServer as createHttpServer } from "node:http";
 import { Redis } from "ioredis";
+import { PrivateKey } from "@bsv/sdk";
 import { createLogger } from "@airchive/logger";
 import { getDb, closeDb } from "@airchive/db";
 import { loadConfig } from "./config.js";
@@ -15,29 +16,64 @@ const log = createLogger({ service: "agent-marketplace" });
 const IDENTITY_REGISTRY_URL = "https://identity.babbage.systems";
 const MESSAGEBOX_HOST = "https://messagebox.babbage.systems";
 
+function createStubWallet(hexKey: string): any {
+  const pk = PrivateKey.fromString(hexKey, 16);
+  const address = pk.toAddress();
+  const identityKey = Buffer.from(pk.toPublicKey().encode(true) as number[]).toString("hex");
+
+  const noop = async () => ({ txid: "stub" });
+  return {
+    getIdentityKey: () => identityKey,
+    getAddress: () => address,
+    registerIdentityTag: async (tag: string) => ({ tag }),
+    lookupIdentityByTag: async () => [],
+    inscribeText: noop,
+    sendMessageBoxPayment: async () => { throw new Error("Stub wallet — no ServerWallet available"); },
+    listIncomingPayments: async () => [],
+    acceptIncomingPayment: noop,
+    certifyForMessageBox: noop,
+    getBalance: async () => ({ spendableSatoshis: 0, totalSatoshis: 0, spendableOutputs: 0 }),
+  };
+}
+
 async function createAgentWallet(
   envVar: string,
   network: "main" | "testnet",
   storageUrl: string,
 ): Promise<any> {
-  const { ServerWallet, generatePrivateKey } = await import("@bsv/simple/server");
-
   let key = process.env[envVar];
   if (!key) {
+    const { generatePrivateKey } = await import("@bsv/simple/server");
     key = generatePrivateKey();
     log.info({ envVar }, `No ${envVar} set — generated ephemeral key`);
   }
 
-  const wallet = await ServerWallet.create({
-    privateKey: key,
-    network,
-    storageUrl,
-  });
+  try {
+    const { ServerWallet } = await import("@bsv/simple/server");
 
-  (wallet as any).defaults.registryUrl = IDENTITY_REGISTRY_URL;
-  (wallet as any).defaults.messageBoxHost = MESSAGEBOX_HOST;
+    const walletPromise = ServerWallet.create({
+      privateKey: key,
+      network,
+      storageUrl,
+    });
 
-  return wallet;
+    const timeout = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`ServerWallet.create timed out for ${envVar}`)), 30_000),
+    );
+
+    const wallet = await Promise.race([walletPromise, timeout]);
+
+    (wallet as any).defaults.registryUrl = IDENTITY_REGISTRY_URL;
+    (wallet as any).defaults.messageBoxHost = MESSAGEBOX_HOST;
+
+    return wallet;
+  } catch (err) {
+    log.warn(
+      { envVar, err: (err as Error).message },
+      "ServerWallet creation failed — using stub wallet (direct payments still work)",
+    );
+    return createStubWallet(key);
+  }
 }
 
 async function main(): Promise<void> {

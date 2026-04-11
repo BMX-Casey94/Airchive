@@ -216,6 +216,9 @@ importers:
       '@airchive/types':
         specifier: workspace:*
         version: link:../../packages/types
+      '@bsv/sdk':
+        specifier: ^2.0.13
+        version: 2.0.13
       '@bsv/simple':
         specifier: ^0.3.0
         version: 0.3.0(@types/node@22.19.17)

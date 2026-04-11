@@ -58,7 +58,13 @@ export class DirectPaymentSender {
   }
 
   registerKey(label: string, hexKey: string): void {
-    this.keys.set(label, PrivateKey.fromString(hexKey, 16));
+    if (!hexKey) {
+      log.warn({ label }, "Skipping key registration — empty hex key");
+      return;
+    }
+    const pk = PrivateKey.fromString(hexKey, 16);
+    this.keys.set(label, pk);
+    log.info({ label, address: pk.toAddress() }, "Registered direct-pay key");
   }
 
   getAddress(label: string): string {
