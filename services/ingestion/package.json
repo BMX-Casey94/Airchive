@@ -6,7 +6,7 @@
   "main": "./dist/index.js",
   "scripts": {
     "build": "tsc -b && node ./scripts/copy-demo-data.mjs",
-    "dev": "tsx watch src/index.ts",
+    "dev": "tsx watch --env-file=../../.env src/index.ts",
     "start": "node dist/index.js",
     "clean": "rimraf dist *.tsbuildinfo",
     "typecheck": "tsc --noEmit",
