@@ -223,6 +223,7 @@ export function FleetStatusGrid() {
       originName: null,
       destIcao: null,
       destName: null,
+      walletAddress: null,
     };
   });
 
