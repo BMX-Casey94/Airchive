@@ -71,7 +71,7 @@ export function AnalyticsCharts() {
             colour="text-electric-cyan"
           />
           <StatTile
-            label="Cost Today"
+            label="Miner Fees Today"
             value={fmtSats(summary.totalSats)}
             colour="text-neon-amber"
           />

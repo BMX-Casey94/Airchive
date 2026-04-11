@@ -63,6 +63,12 @@ export const useAgentStore = create<AgentStore>((set) => ({
       let { totalPayments, totalEarnedSats, totalSpentSats } = state;
       const agents = { ...state.agents };
 
+      // Any event from a known agent proves it is alive — promote from offline
+      const sender = agents[event.agent];
+      if (sender && sender.status === "offline") {
+        agents[event.agent] = { ...sender, status: "running" };
+      }
+
       if (event.type === "transaction") {
         totalPayments++;
         const amount = (event.data.amountSats as number) ?? 0;

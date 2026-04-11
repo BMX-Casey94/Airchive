@@ -19,7 +19,7 @@ const services = [
     tag: "Immutable Telemetry",
     title: "Tamper-Proof Data at Source",
     body:
-      "Telemetric payloads are cryptographically signed at the aircraft edge node before transmission. Once written to the BSV blockchain, records cannot be altered, deleted, or back-dated — providing regulators, insurers, and investigators with mathematically verifiable chain-of-custody from sensor to archive.",
+      "Telemetric payloads are cryptographically signed at the aircraft edge node before transmission. Once written to the BSV blockchain, records cannot be altered, deleted, or back-dated. The Analyst agent independently publishes cryptographically signed fleet-analysis summaries as on-chain inscriptions — providing a second, autonomous layer of verifiable evidence beyond raw sensor records.",
     stat: "0",
     statLabel: "Mutable records",
   },
@@ -27,7 +27,7 @@ const services = [
     tag: "Continuous Archival",
     title: "Phase-Aware Write Cadence",
     body:
-      "Adaptive sampling density increases during critical flight phases — take-off, approach, turbulence events, and emergency declarations — whilst throttling during stable cruise to optimise on-chain cost. Every phase transition is timestamped and anchored to an immutable milestone record.",
+      "Adaptive sampling density increases during critical flight phases — take-off, approach, turbulence events, and emergency declarations — whilst throttling during stable cruise to optimise on-chain cost. The Monitor agent cycles through every tracked aircraft at sub-second intervals, querying live telemetry and anchoring phase-milestone inscriptions at each transition.",
     stat: "≤ 1s",
     statLabel: "Critical-phase interval",
   },
@@ -38,6 +38,14 @@ const services = [
       "Full ICAO Annex 6 and EASA Part-CAT alignment. Blockchain-anchored records satisfy data-retention mandates with cryptographic proof of completeness — no gaps, no overwrites. Export flight envelopes, event summaries, and decoded telemetry in regulator-accepted formats at the click of a button.",
     stat: "100%",
     statLabel: "Data completeness",
+  },
+  {
+    tag: "Agent Marketplace",
+    title: "Autonomous Agent Network",
+    body:
+      "Three autonomous BSV agents — Collector, Analyst, and Monitor — operate continuously within the platform. Each holds its own on-chain identity and wallet. Agents discover one another via the BRC-100 identity registry and exchange telemetry data products through peer-to-peer micropayments, creating a self-sustaining, programmable data economy around every tracked flight.",
+    stat: "3",
+    statLabel: "Live agents",
   },
 ] as const;
 
@@ -61,7 +69,7 @@ export function TelemetryServicesSection() {
       <div className="flex items-center gap-4 mb-10">
         <div className="h-px flex-1 bg-gradient-to-r from-transparent via-electric-cyan/20 to-transparent" />
         <span className="hud-label text-electric-cyan/70 whitespace-nowrap">
-          Aircraft Services
+          Platform Capabilities
         </span>
         <div className="h-px flex-1 bg-gradient-to-r from-transparent via-electric-cyan/20 to-transparent" />
       </div>
@@ -85,8 +93,10 @@ export function TelemetryServicesSection() {
         <p className="mt-5 text-xs md:text-sm text-hud-muted leading-relaxed max-w-2xl mx-auto">
           Airchive extends the aircraft black box into the blockchain era.
           Every sensor reading, every flight event, every phase transition —
-          cryptographically sealed and permanently archived on BSV, creating an
-          unbreakable chain of evidence from wheels-up to touchdown.
+          cryptographically sealed and permanently archived on BSV. A network
+          of autonomous agents continuously monitors, analyses, and trades
+          telemetry data on-chain, creating an unbreakable, self-auditing
+          chain of evidence from wheels-up to touchdown.
         </p>
       </motion.div>
 
@@ -95,7 +105,7 @@ export function TelemetryServicesSection() {
         variants={stagger}
         initial="hidden"
         animate={inView ? "visible" : "hidden"}
-        className="grid gap-4 md:grid-cols-2 lg:grid-cols-4"
+        className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5"
       >
         {services.map((s) => (
           <motion.article
@@ -135,11 +145,12 @@ export function TelemetryServicesSection() {
         className="mt-10 panel border border-electric-cyan/20 bg-panel-bg/40 backdrop-blur-xl px-8 py-8 flex flex-col items-center text-center gap-5"
       >
         <h3 className="text-base md:text-lg text-white font-semibold tracking-wide">
-          Aircraft-grade immutability.
+          Aircraft-grade immutability. Autonomous intelligence.
         </h3>
         <p className="text-sm text-hud-muted leading-relaxed max-w-3xl -mt-2">
           Designed for operators, insurers, and aviation regulators who demand
-          tamper-proof telemetric evidence.
+          tamper-proof telemetric evidence — backed by a live network of
+          autonomous agents that never stop watching.
         </p>
 
         <div className="w-16 h-px bg-gradient-to-r from-transparent via-electric-cyan/30 to-transparent" />
@@ -147,10 +158,13 @@ export function TelemetryServicesSection() {
         <p className="text-xs text-hud-muted/80 leading-relaxed max-w-2xl">
           Whether you operate a single aircraft or an entire fleet, Airchive
           integrates seamlessly with your existing avionics, ground stations,
-          and maintenance systems. We work with airlines, MRO providers,
-          charter operators, military organisations, and aviation regulators
-          to deliver immutable telemetry as a service — no hardware changes
-          required.
+          and maintenance systems. Autonomous Collector, Analyst, and Monitor
+          agents operate continuously — ingesting live telemetry, running
+          anomaly detection, and publishing cryptographically signed fleet
+          analyses directly to the BSV blockchain. We work with airlines,
+          MRO providers, charter operators, military organisations, and
+          aviation regulators to deliver immutable telemetry as a service —
+          no hardware changes required.
         </p>
         <p className="text-xs text-white/70 leading-relaxed max-w-2xl">
           Interested in protecting your flight data with blockchain-grade
@@ -163,7 +177,7 @@ export function TelemetryServicesSection() {
         </p>
 
         <span className="hud-label text-[10px] text-electric-cyan/50 mt-1">
-          BSV · MessagePack · Ed25519
+          BSV · MessagePack · Ed25519 · BRC-100
         </span>
       </motion.div>
     </section>

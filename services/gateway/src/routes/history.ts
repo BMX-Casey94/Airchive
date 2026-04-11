@@ -5,6 +5,29 @@ type CountRow = { total: string | number } | undefined;
 
 export async function historyRoutes(app: FastifyInstance): Promise<void> {
   app.get<{
+    Querystring: { limit?: string };
+  }>("/api/transactions/recent", async (request, reply) => {
+    const limit = Math.min(parseInt(request.query.limit ?? "50", 10), 200);
+    const db = getDb();
+    const todayStart = new Date();
+    todayStart.setUTCHours(0, 0, 0, 0);
+
+    const rows = await db("tx_results")
+      .where("timestamp", ">=", todayStart.getTime())
+      .orderBy("timestamp", "desc")
+      .limit(limit);
+
+    const normalised = rows.map((r: Record<string, unknown>) => ({
+      ...r,
+      timestamp: Number(r.timestamp),
+      fee_sats: Number(r.fee_sats),
+      size_bytes: Number(r.size_bytes),
+      record_type: Number(r.record_type),
+    }));
+
+    return reply.send({ success: true, data: normalised });
+  });
+  app.get<{
     Params: { icao: string };
     Querystring: { from?: string; to?: string; limit?: string; offset?: string };
   }>("/api/aircraft/:icao/history", async (request, reply) => {

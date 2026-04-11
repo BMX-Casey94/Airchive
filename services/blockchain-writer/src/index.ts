@@ -130,6 +130,17 @@ async function main(): Promise<void> {
 
   broadcaster.setupCallbackReceiver(config.arcCallbackPort);
 
+  const publisher = new Redis({
+    host: config.redis.host,
+    port: config.redis.port,
+    password: config.redis.password,
+    db: config.redis.db,
+    lazyConnect: true,
+    retryStrategy: (times) => Math.min(times * 500, 5_000),
+  });
+  await publisher.connect();
+  log.info("Redis publisher connected");
+
   const subscriber = new Redis({
     host: config.redis.host,
     port: config.redis.port,
@@ -212,16 +223,18 @@ async function main(): Promise<void> {
         icao,
       );
 
-      await insertTxResult(db, {
+      const txResultRow = {
         txid,
         aircraft_icao: icao,
         record_type: RecordType.TELEMETRY,
-        status: "SEEN_ON_NETWORK",
+        status: "SEEN_ON_NETWORK" as const,
         timestamp: Date.now(),
         fee_sats: Number(utxo.satoshis) - changeOutput.satoshis,
         size_bytes: tx.toBinary().length,
         flight_id: telemetry.flight_id,
-      });
+      };
+      await insertTxResult(db, txResultRow);
+      await publisher.publish("txresult", JSON.stringify(txResultRow)).catch(() => {});
     } catch (err) {
       await utxoManager.releaseUtxo(utxo.txid, utxo.vout).catch(() => {});
       const payload = encodeTelemetryPayload(telemetry);
@@ -280,16 +293,18 @@ async function main(): Promise<void> {
         icao,
       );
 
-      await insertTxResult(db, {
+      const feResultRow = {
         txid,
         aircraft_icao: icao,
         record_type: RecordType.FLIGHT_EVENT,
-        status: "SEEN_ON_NETWORK",
+        status: "SEEN_ON_NETWORK" as const,
         timestamp: Date.now(),
         fee_sats: Number(utxo.satoshis) - changeOutput.satoshis,
         size_bytes: tx.toBinary().length,
         flight_id: event.flight_id,
-      });
+      };
+      await insertTxResult(db, feResultRow);
+      await publisher.publish("txresult", JSON.stringify(feResultRow)).catch(() => {});
     } catch (err) {
       await utxoManager.releaseUtxo(utxo.txid, utxo.vout).catch(() => {});
       const payload = encodeFlightEventPayload(event);
@@ -355,6 +370,12 @@ async function main(): Promise<void> {
       await subscriber.quit();
     } catch {
       subscriber.disconnect();
+    }
+
+    try {
+      await publisher.quit();
+    } catch {
+      publisher.disconnect();
     }
 
     await broadcaster.closeCallbackReceiver();

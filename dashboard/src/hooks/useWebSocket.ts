@@ -13,6 +13,7 @@ import type { AircraftState as GlobeAircraftState } from "@/types/dashboard";
 /* ── Constants ────────────────────────────────────────────────── */
 
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL ?? "ws://localhost:4001";
+const API_URL = process.env.NEXT_PUBLIC_GATEWAY_URL ?? "http://localhost:4000";
 
 /* ── Raw telemetry shape from the gateway ────────────────────── */
 
@@ -250,11 +251,35 @@ export function useWebSocket() {
   useEffect(() => {
     connect();
 
+    // Bootstrap daily summary + recent transactions from REST so the UI isn't empty on late load
+    fetch(`${API_URL}/api/metrics`)
+      .then((r) => r.json())
+      .then((json: { success: boolean; data?: { transactions_today: number; bytes_on_chain_today: number; bsv_cost_today_sats: number } }) => {
+        if (json.success && json.data) {
+          setDailySummary({
+            txCount: json.data.transactions_today,
+            totalBytes: json.data.bytes_on_chain_today,
+            totalSats: json.data.bsv_cost_today_sats,
+          });
+        }
+      })
+      .catch(() => {});
+
+    const setEntries = useBlockchainStore.getState().setEntries;
+    fetch(`${API_URL}/api/transactions/recent?limit=50`)
+      .then((r) => r.json())
+      .then((json: { success: boolean; data?: BlockchainEntry[] }) => {
+        if (json.success && json.data && json.data.length > 0) {
+          setEntries(json.data.reverse());
+        }
+      })
+      .catch(() => {});
+
     return () => {
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
       wsRef.current?.close();
     };
-  }, [connect]);
+  }, [connect, setDailySummary]);
 
   /* ── Subscribe / Unsubscribe ──────────────────────────────── */
 

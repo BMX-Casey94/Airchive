@@ -139,6 +139,14 @@ async function main(): Promise<void> {
     log.info({ port: config.metricsPort }, "Agent metrics server listening");
   });
 
+  // Re-broadcast agent status every 30s so late-connecting dashboards see "running"
+  const STATUS_HEARTBEAT_MS = 30_000;
+  const statusHeartbeat = setInterval(() => {
+    void activityPub.publishStatus("collector", "running");
+    void activityPub.publishStatus("analyst", "running");
+    void activityPub.publishStatus("monitor", "running");
+  }, STATUS_HEARTBEAT_MS);
+
   log.info(
     {
       collector: collectorWallet.getIdentityKey().slice(0, 16) + "...",
@@ -153,6 +161,8 @@ async function main(): Promise<void> {
 
   async function shutdown(signal: string): Promise<void> {
     log.info({ signal }, "Shutting down Agent Marketplace");
+
+    clearInterval(statusHeartbeat);
 
     await monitor.stop();
     await analyst.stop();

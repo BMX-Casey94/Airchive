@@ -8,16 +8,17 @@ export async function metricsRoutes(app: FastifyInstance): Promise<void> {
 
   app.get("/api/metrics", async (_request, reply) => {
     const db = getDb();
-    const todayStart = new Date();
-    todayStart.setUTCHours(0, 0, 0, 0);
+    const todayStartMs = new Date();
+    todayStartMs.setUTCHours(0, 0, 0, 0);
+    const todayEpoch = todayStartMs.getTime();
 
-    const [txToday, totalBytes, aircraftCount, pendingCount] = await Promise.all([
+    const [txToday, totalBytes, aircraftCount, pendingCount, totalSats] = await Promise.all([
       db("tx_results")
-        .where("created_at", ">=", todayStart)
+        .where("timestamp", ">=", todayEpoch)
         .count("* as total")
         .first() as Promise<CountRow>,
       db("tx_results")
-        .where("created_at", ">=", todayStart)
+        .where("timestamp", ">=", todayEpoch)
         .sum("size_bytes as total")
         .first() as Promise<CountRow>,
       db("aircraft_config")
@@ -27,12 +28,11 @@ export async function metricsRoutes(app: FastifyInstance): Promise<void> {
       db("pending_writes")
         .count("* as total")
         .first() as Promise<CountRow>,
+      db("tx_results")
+        .where("timestamp", ">=", todayEpoch)
+        .sum("fee_sats as total")
+        .first() as Promise<CountRow>,
     ]);
-
-    const totalSats = await (db("tx_results")
-      .where("created_at", ">=", todayStart)
-      .sum("fee_sats as total")
-      .first() as Promise<CountRow>);
 
     return reply.send({
       success: true,
