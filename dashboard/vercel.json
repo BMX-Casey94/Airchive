@@ -1,9 +1,9 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": "nextjs",
-  "installCommand": "pnpm install",
-  "buildCommand": "pnpm --filter @airchive/dashboard run build",
-  "outputDirectory": "dashboard/.next",
+  "installCommand": "cd .. && pnpm install",
+  "buildCommand": "cd .. && pnpm --filter @airchive/dashboard run build",
+  "outputDirectory": ".next",
   "headers": [
     {
       "source": "/cesium/(.*)",
