@@ -349,6 +349,7 @@ async function main(): Promise<void> {
   writeBuffer.startRetryLoop();
 
   const confirmationPoller = new ConfirmationPoller(db, config.wocApiUrl);
+  confirmationPoller.setRedisPublisher(publisher);
   confirmationPoller.start();
 
   startMetricsServer();
