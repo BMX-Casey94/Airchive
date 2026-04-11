@@ -16,7 +16,7 @@ interface BlockchainState {
   /** Aggregated daily summary counters. */
   dailySummary: DailySummary;
 
-  /** Append a new blockchain entry. */
+  /** Push a new entry or update an existing entry's status (e.g. SEEN_ON_NETWORK → MINED). */
   pushEntry: (entry: BlockchainEntry) => void;
   /** Bulk-replace entries (e.g. on initial load). */
   setEntries: (entries: BlockchainEntry[]) => void;
@@ -34,20 +34,36 @@ export const useBlockchainStore = create<BlockchainState>((set) => ({
 
   pushEntry: (entry) =>
     set((prev) => {
-      const statusDelta = {
-        minedCount: entry.status === "MINED" ? 1 : 0,
-        failedCount: entry.status === "FAILED" ? 1 : 0,
-        pendingCount: entry.status === "SEEN_ON_NETWORK" ? 1 : 0,
-      };
+      const existingIdx = prev.entries.findIndex((e) => e.txid === entry.txid);
+
+      if (existingIdx !== -1) {
+        const existing = prev.entries[existingIdx];
+        if (existing.status === entry.status) return prev;
+
+        const updated = [...prev.entries];
+        updated[existingIdx] = { ...existing, ...entry };
+
+        const summaryPatch = { ...prev.dailySummary };
+        if (existing.status === "SEEN_ON_NETWORK") summaryPatch.pendingCount = Math.max(0, summaryPatch.pendingCount - 1);
+        else if (existing.status === "MINED") summaryPatch.minedCount = Math.max(0, summaryPatch.minedCount - 1);
+        else if (existing.status === "FAILED") summaryPatch.failedCount = Math.max(0, summaryPatch.failedCount - 1);
+
+        if (entry.status === "MINED") summaryPatch.minedCount++;
+        else if (entry.status === "SEEN_ON_NETWORK") summaryPatch.pendingCount++;
+        else if (entry.status === "FAILED") summaryPatch.failedCount++;
+
+        return { entries: updated, dailySummary: summaryPatch };
+      }
+
       return {
         entries: [...prev.entries, entry].slice(-MAX_FEED_ENTRIES),
         dailySummary: {
           txCount: prev.dailySummary.txCount + 1,
-          totalBytes: prev.dailySummary.totalBytes + entry.size_bytes,
-          totalSats: prev.dailySummary.totalSats + entry.fee_sats,
-          minedCount: prev.dailySummary.minedCount + statusDelta.minedCount,
-          pendingCount: prev.dailySummary.pendingCount + statusDelta.pendingCount,
-          failedCount: prev.dailySummary.failedCount + statusDelta.failedCount,
+          totalBytes: prev.dailySummary.totalBytes + (entry.size_bytes ?? 0),
+          totalSats: prev.dailySummary.totalSats + (entry.fee_sats ?? 0),
+          minedCount: prev.dailySummary.minedCount + (entry.status === "MINED" ? 1 : 0),
+          pendingCount: prev.dailySummary.pendingCount + (entry.status === "SEEN_ON_NETWORK" ? 1 : 0),
+          failedCount: prev.dailySummary.failedCount + (entry.status === "FAILED" ? 1 : 0),
         },
       };
     }),

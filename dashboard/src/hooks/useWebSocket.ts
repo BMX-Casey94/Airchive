@@ -145,6 +145,7 @@ export function useWebSocket() {
 
   const updateAircraft = useAircraftStore((s) => s.updateAircraft);
   const updateFleet = useAircraftStore((s) => s.updateFleet);
+  const setWalletAddresses = useAircraftStore((s) => s.setWalletAddresses);
   const pushEntry = useBlockchainStore((s) => s.pushEntry);
   const setDailySummary = useBlockchainStore((s) => s.setDailySummary);
   const pushAlert = useAlertStore((s) => s.pushAlert);
@@ -282,14 +283,35 @@ export function useWebSocket() {
       })
       .catch(() => {});
 
+    function fetchWalletAddresses() {
+      fetch(`${API_URL}/api/fleet`)
+        .then((r) => r.json())
+        .then((json: { success: boolean; data?: Array<{ icao: string; wallet_address?: string | null }> }) => {
+          if (json.success && json.data) {
+            const mapping: Record<string, string> = {};
+            for (const ac of json.data) {
+              if (ac.wallet_address) mapping[ac.icao.toUpperCase()] = ac.wallet_address;
+            }
+            if (Object.keys(mapping).length > 0) {
+              setWalletAddresses(mapping);
+            }
+          }
+        })
+        .catch(() => {});
+    }
+
+    fetchWalletAddresses();
+    const walletInterval = setInterval(fetchWalletAddresses, 60_000);
+
     const metricsInterval = setInterval(fetchMetrics, 30_000);
 
     return () => {
       clearInterval(metricsInterval);
+      clearInterval(walletInterval);
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
       wsRef.current?.close();
     };
-  }, [connect, setDailySummary]);
+  }, [connect, setDailySummary, setWalletAddresses]);
 
   /* ── Subscribe / Unsubscribe ──────────────────────────────── */
 

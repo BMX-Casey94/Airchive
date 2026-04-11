@@ -53,6 +53,7 @@ export interface AircraftState {
   selectAircraft: (icao: string | null) => void;
   updateAircraft: (record: AircraftTelemetry) => void;
   updateFleet: (records: AircraftTelemetry[]) => void;
+  setWalletAddresses: (mapping: Record<string, string>) => void;
 }
 
 /**
@@ -106,6 +107,18 @@ export const useAircraftStore = create<AircraftState>()((set) => ({
       for (const r of records) {
         const prev = next.get(r.icao);
         next.set(r.icao, prev ? mergeTelemetry(prev, r) : r);
+      }
+      return { fleet: next };
+    }),
+
+  setWalletAddresses: (mapping) =>
+    set((state) => {
+      const next = new Map(state.fleet);
+      for (const [icao, addr] of Object.entries(mapping)) {
+        const existing = next.get(icao);
+        if (existing) {
+          next.set(icao, { ...existing, walletAddress: addr });
+        }
       }
       return { fleet: next };
     }),
