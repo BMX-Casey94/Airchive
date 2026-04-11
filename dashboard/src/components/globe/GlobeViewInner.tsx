@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import "cesium/Build/Cesium/Widgets/widgets.css";
 import { useFleetStore } from "@/stores/fleet";
 import { useAircraftStore } from "@/stores/aircraft-store";
 import type { AircraftState } from "@/types/dashboard";
@@ -61,7 +60,7 @@ export default function GlobeViewInner() {
   const selectGlobeAircraft = useFleetStore((s) => s.selectAircraft);
   const selectPanelAircraft = useAircraftStore((s) => s.selectAircraft);
 
-  /* ── One-time Cesium Viewer (dynamic import — no require() in browser) ─ */
+  /* ── One-time Cesium Viewer (loaded from /cesium/Cesium.js static asset) ─ */
   useEffect(() => {
     if (!CESIUM_TOKEN) {
       setLoadError("missing_token");
@@ -71,35 +70,32 @@ export default function GlobeViewInner() {
 
     let cancelled = false;
 
-    void (async () => {
-      try {
-        (globalThis as unknown as { CESIUM_BASE_URL?: string }).CESIUM_BASE_URL = "/cesium/";
+    function initViewer(Cesium: CesiumNs) {
+      if (cancelled || !containerRef.current) return;
 
-        const Cesium = await import("cesium");
-        if (cancelled || !containerRef.current) return;
+      Cesium.Ion.defaultAccessToken = CESIUM_TOKEN;
 
-        Cesium.Ion.defaultAccessToken = CESIUM_TOKEN;
+      const viewer = new Cesium.Viewer(containerRef.current, {
+        animation: false,
+        timeline: false,
+        baseLayerPicker: false,
+        geocoder: false,
+        homeButton: false,
+        sceneModePicker: false,
+        navigationHelpButton: false,
+        fullscreenButton: false,
+        vrButton: false,
+        scene3DOnly: true,
+        infoBox: false,
+        selectionIndicator: false,
+      });
 
-        const viewer = new Cesium.Viewer(containerRef.current, {
-          animation: false,
-          timeline: false,
-          baseLayerPicker: false,
-          geocoder: false,
-          homeButton: false,
-          sceneModePicker: false,
-          navigationHelpButton: false,
-          fullscreenButton: false,
-          vrButton: false,
-          scene3DOnly: true,
-          infoBox: false,
-          selectionIndicator: false,
-        });
+      viewer.scene.globe.enableLighting = true;
 
-        viewer.scene.globe.enableLighting = true;
+      cesiumRef.current = Cesium;
+      viewerRef.current = viewer;
 
-        cesiumRef.current = Cesium;
-        viewerRef.current = viewer;
-
+      void (async () => {
         try {
           const provider = await Cesium.createWorldImageryAsync({
             style: Cesium.IonWorldImageryStyle.AERIAL,
@@ -113,14 +109,53 @@ export default function GlobeViewInner() {
         } catch {
           /* keep default imagery */
         }
+      })();
 
-        if (!cancelled) setReady(true);
+      if (!cancelled) setReady(true);
+    }
+
+    const win = window as unknown as { Cesium?: CesiumNs };
+    (globalThis as unknown as { CESIUM_BASE_URL?: string }).CESIUM_BASE_URL = "/cesium/";
+
+    if (win.Cesium) {
+      try {
+        initViewer(win.Cesium);
       } catch (e) {
-        console.error("[GlobeViewInner] Cesium load failed:", e);
-        const msg = e instanceof Error ? e.message : String(e);
-        setLoadError(msg || "Failed to initialise CesiumJS");
+        console.error("[GlobeViewInner] Cesium init failed:", e);
+        setLoadError(e instanceof Error ? e.message : String(e));
       }
-    })();
+    } else {
+      const existingScript = document.querySelector('script[src="/cesium/Cesium.js"]');
+      if (existingScript) {
+        existingScript.addEventListener("load", () => {
+          if (win.Cesium && !cancelled) initViewer(win.Cesium);
+          else if (!cancelled) setLoadError("Cesium failed to load from static assets");
+        });
+      } else {
+        const link = document.createElement("link");
+        link.rel = "stylesheet";
+        link.href = "/cesium/Widgets/widgets.css";
+        document.head.appendChild(link);
+
+        const script = document.createElement("script");
+        script.src = "/cesium/Cesium.js";
+        script.async = true;
+        script.onload = () => {
+          if (win.Cesium && !cancelled) {
+            try {
+              initViewer(win.Cesium);
+            } catch (e) {
+              console.error("[GlobeViewInner] Cesium init failed:", e);
+              setLoadError(e instanceof Error ? e.message : String(e));
+            }
+          }
+        };
+        script.onerror = () => {
+          if (!cancelled) setLoadError("Failed to load /cesium/Cesium.js — run postinstall in dashboard");
+        };
+        document.head.appendChild(script);
+      }
+    }
 
     return () => {
       cancelled = true;
