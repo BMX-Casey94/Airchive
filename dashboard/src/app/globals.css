@@ -1,0 +1,108 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Custom Scrollbar ─────────────────────────────────────────── */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #1B2D45 #060B14;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #060B14;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #1B2D45;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #2A4A6B;
+}
+
+/* ── Fixed background (place airchive-background.webp in /public) ─ */
+html {
+  @apply min-h-full;
+}
+
+body {
+  @apply text-white font-sans antialiased min-h-screen;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  position: relative;
+  background: transparent;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-color: #060b14;
+  background-image:
+    linear-gradient(
+      to bottom,
+      rgba(6, 11, 20, 0.75) 0%,
+      rgba(6, 11, 20, 0.68) 40%,
+      rgba(6, 11, 20, 0.82) 100%
+    ),
+    url("/airchive-background.webp");
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+}
+
+body > * {
+  position: relative;
+  z-index: 1;
+}
+
+/* ── Glassmorphism Panel ──────────────────────────────────────── */
+@layer components {
+  .panel {
+    @apply bg-panel-bg/30 backdrop-blur-xl border border-panel-border/40 rounded-xl shadow-glow-cyan;
+  }
+
+  .panel-amber {
+    @apply bg-panel-bg/30 backdrop-blur-xl border border-panel-border/40 rounded-xl shadow-glow-amber;
+  }
+
+  .panel-alert {
+    @apply bg-panel-bg/30 backdrop-blur-xl border border-alert-red/25 rounded-xl shadow-glow-red;
+  }
+
+  /* ── Data Readout ─────────────────────────────────────────── */
+  .data-readout {
+    @apply font-mono text-electric-cyan tabular-nums;
+  }
+
+  /* ── HUD Label (hex must match `hud-muted` in tailwind.config.ts) ─ */
+  .hud-label {
+    @apply uppercase text-xs tracking-widest;
+    color: #6f86a0;
+  }
+}
+
+/* ── Logo Animations ─────────────────────────────────────────── */
+@keyframes sheen {
+  0%, 100% { transform: translateX(-120%); }
+  50%      { transform: translateX(120%); }
+}
+
+@keyframes glowShift {
+  0%   { opacity: 0.1; transform: scale(1); }
+  100% { opacity: 0.25; transform: scale(1.15); }
+}
+
+/* ── Selection Colour ─────────────────────────────────────────── */
+::selection {
+  background: rgba(0, 245, 255, 0.2);
+  color: #fff;
+}

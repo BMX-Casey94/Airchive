@@ -1,0 +1,49 @@
+import {
+  type FlightPhase,
+  DEFAULT_WRITE_RATES,
+  type TelemetryRecord,
+} from "@airchive/types";
+import { isEmergencyCondition } from "./emergency";
+
+export class WriteRateController {
+  private readonly lastWriteMs = new Map<string, number>();
+  private readonly emergencyOverrides = new Set<string>();
+
+  shouldWrite(icao: string, phase: FlightPhase, record: TelemetryRecord): boolean {
+    const key = normaliseIcao(icao);
+    const now = Date.now();
+    const interval = this.getIntervalMs(key, phase, record);
+    const last = this.lastWriteMs.get(key);
+    if (last === undefined) return true;
+    return now - last >= interval;
+  }
+
+  recordWrite(icao: string): void {
+    const key = normaliseIcao(icao);
+    this.lastWriteMs.set(key, Date.now());
+  }
+
+  setEmergencyOverride(icao: string, active: boolean): void {
+    const key = normaliseIcao(icao);
+    if (active) this.emergencyOverrides.add(key);
+    else this.emergencyOverrides.delete(key);
+  }
+
+  getIntervalMs(icao: string, phase: FlightPhase, record?: TelemetryRecord): number {
+    const key = normaliseIcao(icao);
+    if (this.emergencyOverrides.has(key)) return 1_000;
+    if (record !== undefined && isEmergencyCondition(record)) return 1_000;
+    const base = DEFAULT_WRITE_RATES[phase];
+    return Number.isFinite(base) ? base : 1_000;
+  }
+
+  reset(icao: string): void {
+    const key = normaliseIcao(icao);
+    this.lastWriteMs.delete(key);
+    this.emergencyOverrides.delete(key);
+  }
+}
+
+function normaliseIcao(icao: string): string {
+  return icao.trim().toUpperCase();
+}

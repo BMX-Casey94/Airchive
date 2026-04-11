@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blockchain-writer
+  namespace: airchive
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: blockchain-writer
+  template:
+    metadata:
+      labels:
+        app: blockchain-writer
+    spec:
+      containers:
+        - name: blockchain-writer
+          image: airchive/blockchain-writer:latest
+          envFrom:
+            - configMapRef:
+                name: airchive-config
+            - secretRef:
+                name: airchive-secrets
+          env:
+            - name: POSTGRES_HOST
+              value: postgres
+            - name: REDIS_HOST
+              value: redis
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi

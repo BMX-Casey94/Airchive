@@ -1,0 +1,144 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: airchive-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-airchive}
+      POSTGRES_USER: ${POSTGRES_USER:-airchive}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-airchive_dev}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-airchive}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: airchive-redis
+    restart: unless-stopped
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  ingestion:
+    build:
+      context: .
+      dockerfile: services/ingestion/Dockerfile
+    container_name: airchive-ingestion
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      REDIS_HOST: redis
+
+  blockchain-writer:
+    build:
+      context: .
+      dockerfile: services/blockchain-writer/Dockerfile
+    container_name: airchive-blockchain-writer
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      REDIS_HOST: redis
+      POSTGRES_HOST: postgres
+
+  overlay-node:
+    build:
+      context: .
+      dockerfile: services/overlay-node/Dockerfile
+    container_name: airchive-overlay-node
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+    ports:
+      - "${OVERLAY_PORT:-4010}:4010"
+
+  gateway:
+    build:
+      context: .
+      dockerfile: services/gateway/Dockerfile
+    container_name: airchive-gateway
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      REDIS_HOST: redis
+      POSTGRES_HOST: postgres
+    ports:
+      - "${GATEWAY_PORT:-4000}:4000"
+      - "${GATEWAY_WS_PORT:-4001}:4001"
+
+  alert-engine:
+    build:
+      context: .
+      dockerfile: services/alert-engine/Dockerfile
+    container_name: airchive-alert-engine
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      REDIS_HOST: redis
+      POSTGRES_HOST: postgres
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    container_name: airchive-dashboard
+    restart: unless-stopped
+    depends_on:
+      - gateway
+    env_file: .env
+    ports:
+      - "3000:3000"
+
+  nginx:
+    image: nginx:alpine
+    container_name: airchive-nginx
+    restart: unless-stopped
+    depends_on:
+      - gateway
+      - dashboard
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+
+volumes:
+  pgdata:
+  redisdata:

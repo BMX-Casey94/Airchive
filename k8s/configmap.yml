@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: airchive-config
+  namespace: airchive
+data:
+  NODE_ENV: production
+  LOG_LEVEL: info
+  POSTGRES_DB: airchive
+  POSTGRES_PORT: "5432"
+  REDIS_PORT: "6379"
+  BSV_NETWORK: mainnet
+  TAAL_ARC_URL: https://arc.taal.com
+  WOC_API_URL: https://api.whatsonchain.com/v1/bsv/main
+  OPENSKY_API_URL: https://opensky-network.org/api
+  ADSBFI_API_URL: https://opendata.adsb.fi/api/v2
+  POLL_INTERVAL_MS: "1000"
+  GATEWAY_PORT: "4000"
+  GATEWAY_WS_PORT: "4001"
+  OVERLAY_PORT: "4010"
+  OVERLAY_TOPIC: tm_airchive

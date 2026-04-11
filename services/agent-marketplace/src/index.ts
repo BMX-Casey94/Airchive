@@ -1,0 +1,181 @@
+import { createServer as createHttpServer } from "node:http";
+import { Redis } from "ioredis";
+import { createLogger } from "@airchive/logger";
+import { getDb, closeDb } from "@airchive/db";
+import { loadConfig } from "./config.js";
+import { CollectorAgent } from "./collector-agent.js";
+import { AnalystAgent } from "./analyst-agent.js";
+import { MonitorAgent } from "./monitor-agent.js";
+import { AgentActivityPublisher } from "./activity-publisher.js";
+import { registry } from "./metrics.js";
+
+const log = createLogger({ service: "agent-marketplace" });
+
+const IDENTITY_REGISTRY_URL = "https://identity.babbage.systems";
+const MESSAGEBOX_HOST = "https://messagebox.babbage.systems";
+
+async function createAgentWallet(
+  envVar: string,
+  network: "main" | "testnet",
+  storageUrl: string,
+): Promise<any> {
+  const { ServerWallet, generatePrivateKey } = await import("@bsv/simple/server");
+
+  let key = process.env[envVar];
+  if (!key) {
+    key = generatePrivateKey();
+    log.info({ envVar }, `No ${envVar} set — generated ephemeral key`);
+  }
+
+  const wallet = await ServerWallet.create({
+    privateKey: key,
+    network,
+    storageUrl,
+  });
+
+  (wallet as any).defaults.registryUrl = IDENTITY_REGISTRY_URL;
+  (wallet as any).defaults.messageBoxHost = MESSAGEBOX_HOST;
+
+  return wallet;
+}
+
+async function main(): Promise<void> {
+  const config = loadConfig();
+  log.info("Agent Marketplace starting");
+
+  const db = getDb();
+  try {
+    await db.raw("SELECT 1");
+    log.info("PostgreSQL connected");
+  } catch (err) {
+    log.fatal({ err }, "PostgreSQL unreachable");
+    process.exit(1);
+  }
+
+  const redis = new Redis({
+    host: config.redis.host,
+    port: config.redis.port,
+    lazyConnect: true,
+    retryStrategy: (times) => Math.min(times * 500, 5_000),
+  });
+  await redis.connect();
+  log.info("Redis connected");
+
+  const activityPub = new AgentActivityPublisher(redis);
+
+  log.info("Initialising Collector agent wallet...");
+  const collectorWallet = await createAgentWallet(
+    config.collectorKeyEnv,
+    config.network,
+    config.storageUrl,
+  );
+  log.info(
+    { identityKey: collectorWallet.getIdentityKey(), address: collectorWallet.getAddress() },
+    "Collector wallet ready",
+  );
+
+  log.info("Initialising Analyst agent wallet...");
+  const analystWallet = await createAgentWallet(
+    config.analystKeyEnv,
+    config.network,
+    config.storageUrl,
+  );
+  log.info(
+    { identityKey: analystWallet.getIdentityKey(), address: analystWallet.getAddress() },
+    "Analyst wallet ready",
+  );
+
+  log.info("Initialising Monitor agent wallet...");
+  const monitorWallet = await createAgentWallet(
+    config.monitorKeyEnv,
+    config.network,
+    config.storageUrl,
+  );
+  log.info(
+    { identityKey: monitorWallet.getIdentityKey(), address: monitorWallet.getAddress() },
+    "Monitor wallet ready",
+  );
+
+  log.info(
+    {
+      collectorAddress: collectorWallet.getAddress(),
+      analystAddress: analystWallet.getAddress(),
+      monitorAddress: monitorWallet.getAddress(),
+    },
+    "=== AGENT FUNDING ADDRESSES (send BSV here) ===",
+  );
+
+  const collector = new CollectorAgent(redis, db, config.trackedAircraft, activityPub);
+  const analyst = new AnalystAgent(collector, activityPub, config.analysisIntervalMs);
+  const monitor = new MonitorAgent(
+    collector,
+    activityPub,
+    config.trackedAircraft,
+    config.monitorIntervalMs,
+  );
+
+  await collector.start(collectorWallet);
+  await activityPub.publishStatus("collector", "running");
+
+  await analyst.start(analystWallet);
+  await activityPub.publishStatus("analyst", "running");
+
+  await monitor.start(monitorWallet);
+  await activityPub.publishStatus("monitor", "running");
+
+  const metricsServer = createHttpServer((_req, res) => {
+    registry
+      .metrics()
+      .then((metrics) => {
+        res.writeHead(200, { "Content-Type": registry.contentType });
+        res.end(metrics);
+      })
+      .catch(() => {
+        res.writeHead(500);
+        res.end();
+      });
+  });
+  metricsServer.listen(config.metricsPort, () => {
+    log.info({ port: config.metricsPort }, "Agent metrics server listening");
+  });
+
+  log.info(
+    {
+      collector: collectorWallet.getIdentityKey().slice(0, 16) + "...",
+      analyst: analystWallet.getIdentityKey().slice(0, 16) + "...",
+      monitor: monitorWallet.getIdentityKey().slice(0, 16) + "...",
+      analysisInterval: config.analysisIntervalMs,
+      monitorInterval: config.monitorIntervalMs,
+      aircraft: config.trackedAircraft.length,
+    },
+    "Agent Marketplace fully operational — 3 agents running",
+  );
+
+  async function shutdown(signal: string): Promise<void> {
+    log.info({ signal }, "Shutting down Agent Marketplace");
+
+    await monitor.stop();
+    await analyst.stop();
+    await collector.stop();
+
+    metricsServer.close();
+
+    try {
+      await redis.quit();
+    } catch {
+      redis.disconnect();
+    }
+
+    await closeDb();
+    log.info("Shutdown complete");
+    process.exit(0);
+  }
+
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+}
+
+main().catch((err) => {
+  log.fatal({ err }, "Fatal startup error");
+  process.exit(1);
+});

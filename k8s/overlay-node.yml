@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: overlay-node
+  namespace: airchive
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: overlay-node
+  template:
+    metadata:
+      labels:
+        app: overlay-node
+    spec:
+      containers:
+        - name: overlay-node
+          image: airchive/overlay-node:latest
+          ports:
+            - containerPort: 4010
+          envFrom:
+            - configMapRef:
+                name: airchive-config
+            - secretRef:
+                name: airchive-secrets
+          env:
+            - name: POSTGRES_HOST
+              value: postgres
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: overlay-node
+  namespace: airchive
+spec:
+  selector:
+    app: overlay-node
+  ports:
+    - port: 4010
+      targetPort: 4010

@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src",
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "knex/types/tables": ["node_modules/knex/types/tables.d.ts"]
+    }
+  },
+  "include": ["src"],
+  "references": [{ "path": "../types" }]
+}
