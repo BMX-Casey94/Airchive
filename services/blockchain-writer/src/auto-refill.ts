@@ -50,6 +50,15 @@ export class AutoRefillMonitor {
     return Date.now() - ts < this.idleWindowMs;
   }
 
+  private readonly pendingRefills = new Set<string>();
+
+  requestRefill(icao: string): void {
+    const key = icao.toUpperCase();
+    if (this.pendingRefills.has(key)) return;
+    this.pendingRefills.add(key);
+    void this.checkAndRefill(key, true).finally(() => this.pendingRefills.delete(key));
+  }
+
   start(): void {
     if (this.intervalId) return;
 

@@ -1,4 +1,5 @@
 import type { Knex } from "knex";
+import type { Redis } from "ioredis";
 import type { RecordType } from "@airchive/types";
 import type { WalletVault } from "@airchive/crypto";
 import {
@@ -22,6 +23,7 @@ const RETRY_BATCH_SIZE = 50;
 export class WriteBuffer {
   private intervalId: ReturnType<typeof setInterval> | null = null;
   private retrying = false;
+  private redisPublisher: Redis | null = null;
 
   constructor(
     private readonly db: Knex,
@@ -29,6 +31,10 @@ export class WriteBuffer {
     private readonly utxoManager: UtxoManager,
     private readonly vault: WalletVault,
   ) {}
+
+  setRedisPublisher(redis: Redis): void {
+    this.redisPublisher = redis;
+  }
 
   async buffer(
     icao: string,
@@ -105,6 +111,8 @@ export class WriteBuffer {
           const result = await this.broadcaster.broadcast(tx, icao);
 
           if (result.status === "FAILED") {
+            await this.utxoManager.deleteStaleUtxo(utxo.txid, utxo.vout).catch(() => {});
+            utxoAcquired = false;
             throw new Error("Broadcast returned FAILED status");
           }
 
@@ -120,16 +128,18 @@ export class WriteBuffer {
             icao,
           );
 
-          await insertTxResult(this.db, {
+          const retryResultRow = {
             txid,
             aircraft_icao: icao,
             record_type: write.record_type,
-            status: "SEEN_ON_NETWORK",
+            status: "SEEN_ON_NETWORK" as const,
             timestamp: Date.now(),
             fee_sats: Number(utxo.satoshis) - changeOutput.satoshis,
             size_bytes: tx.toBinary().length,
             flight_id: write.flight_id ?? undefined,
-          });
+          };
+          await insertTxResult(this.db, retryResultRow);
+          await this.redisPublisher?.publish("txresult", JSON.stringify(retryResultRow)).catch(() => {});
 
           await deletePendingWrite(this.db, write.id);
           pendingWritesGauge.dec();

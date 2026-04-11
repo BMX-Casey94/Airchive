@@ -84,7 +84,7 @@ export class CollectorAgent {
       log.warn({ err }, "MessageBox certification failed (may already exist)");
     }
 
-    this.subscriber = this.redis.duplicate();
+    this.subscriber = this.redis.duplicate({ lazyConnect: true });
     await this.subscriber.connect();
 
     const channels = this.trackedAircraft.map((icao) => `telemetry:${icao}`);

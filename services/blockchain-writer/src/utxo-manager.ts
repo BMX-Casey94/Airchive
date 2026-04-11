@@ -24,6 +24,8 @@ interface WocUtxo {
   height: number;
 }
 
+const MIN_USABLE_SATS = 120;
+
 export class UtxoManager {
   constructor(
     private readonly db: Knex,
@@ -85,6 +87,7 @@ export class UtxoManager {
     return this.db.transaction(async (trx) => {
       const utxo = await trx("utxo_pool")
         .where({ aircraft_icao: icao, is_locked: false })
+        .where("satoshis", ">=", MIN_USABLE_SATS)
         .orderBy("satoshis", "desc")
         .forUpdate()
         .skipLocked()
@@ -108,6 +111,13 @@ export class UtxoManager {
       .update({ is_locked: false });
   }
 
+  async deleteStaleUtxo(txid: string, vout: number): Promise<void> {
+    const deleted = await this.db("utxo_pool").where({ txid, vout }).delete();
+    if (deleted > 0) {
+      log.warn({ txid: txid.slice(0, 12), vout }, "Purged stale UTXO after broadcast rejection");
+    }
+  }
+
   async recordSpend(
     spentTxid: string,
     spentVout: number,
@@ -122,14 +132,21 @@ export class UtxoManager {
         .where({ txid: spentTxid, vout: spentVout })
         .delete();
 
-      await trx("utxo_pool").insert({
-        aircraft_icao: icao,
-        txid: changeTxid,
-        vout: changeVout,
-        satoshis: changeSats,
-        locking_script: changeLockingScript,
-        is_locked: false,
-      });
+      if (changeSats >= MIN_USABLE_SATS) {
+        await trx("utxo_pool").insert({
+          aircraft_icao: icao,
+          txid: changeTxid,
+          vout: changeVout,
+          satoshis: changeSats,
+          locking_script: changeLockingScript,
+          is_locked: false,
+        });
+      } else {
+        log.debug(
+          { icao, changeSats, txid: changeTxid.slice(0, 12) },
+          "Discarding sub-threshold change UTXO",
+        );
+      }
     });
 
     await this.refreshMetrics(icao);
@@ -217,6 +234,16 @@ export class UtxoManager {
 
     const balance = balanceRaw !== null ? Number(balanceRaw) : 0;
     return { balance, utxoCount };
+  }
+
+  async purgeSubThresholdUtxos(): Promise<number> {
+    const deleted = await this.db("utxo_pool")
+      .where("satoshis", "<", MIN_USABLE_SATS)
+      .delete();
+    if (deleted > 0) {
+      log.info({ deleted, threshold: MIN_USABLE_SATS }, "Purged sub-threshold dust UTXOs from pool");
+    }
+    return deleted;
   }
 
   private deriveLockingScriptHex(address: string): string {

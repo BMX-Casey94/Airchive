@@ -21,6 +21,7 @@ import { ArcBroadcaster, type ArcCallbackPayload } from "./broadcaster.js";
 import { UtxoManager } from "./utxo-manager.js";
 import { AutoRefillMonitor } from "./auto-refill.js";
 import { WriteBuffer } from "./write-buffer.js";
+import { ConfirmationPoller } from "./confirmation-poller.js";
 import { buildFlightEventTx, buildTelemetryTx } from "./tx-builder.js";
 import { registry } from "./metrics.js";
 
@@ -99,6 +100,8 @@ async function main(): Promise<void> {
     await new Promise((r) => setTimeout(r, 350));
   }
 
+  await utxoManager.purgeSubThresholdUtxos();
+
   log.info("Running initial auto-refill check (force=true for bootstrap)");
   await autoRefill.checkAll(true).catch((err) =>
     log.error({ err }, "Initial auto-refill failed"),
@@ -139,6 +142,7 @@ async function main(): Promise<void> {
     retryStrategy: (times) => Math.min(times * 500, 5_000),
   });
   await publisher.connect();
+  writeBuffer.setRedisPublisher(publisher);
   log.info("Redis publisher connected");
 
   const subscriber = new Redis({
@@ -192,6 +196,7 @@ async function main(): Promise<void> {
     try {
       utxo = await utxoManager.acquireUtxo(icao);
     } catch {
+      autoRefill.requestRefill(icao);
       const payload = encodeTelemetryPayload(telemetry);
       await writeBuffer.buffer(icao, RecordType.TELEMETRY, payload, telemetry.flight_id);
       return;
@@ -208,6 +213,8 @@ async function main(): Promise<void> {
       const result = await broadcaster.broadcast(tx, icao);
 
       if (result.status === "FAILED") {
+        // UTXO was likely already spent on-chain (double-spend) — purge it
+        await utxoManager.deleteStaleUtxo(utxo.txid, utxo.vout).catch(() => {});
         throw new Error("Broadcast returned FAILED");
       }
 
@@ -263,6 +270,7 @@ async function main(): Promise<void> {
     try {
       utxo = await utxoManager.acquireUtxo(icao);
     } catch {
+      autoRefill.requestRefill(icao);
       const payload = encodeFlightEventPayload(event);
       await writeBuffer.buffer(icao, RecordType.FLIGHT_EVENT, payload, event.flight_id);
       return;
@@ -278,6 +286,7 @@ async function main(): Promise<void> {
       const result = await broadcaster.broadcast(tx, icao);
 
       if (result.status === "FAILED") {
+        await utxoManager.deleteStaleUtxo(utxo.txid, utxo.vout).catch(() => {});
         throw new Error("Broadcast returned FAILED");
       }
 
@@ -339,6 +348,9 @@ async function main(): Promise<void> {
   autoRefill.start();
   writeBuffer.startRetryLoop();
 
+  const confirmationPoller = new ConfirmationPoller(db, config.wocApiUrl);
+  confirmationPoller.start();
+
   startMetricsServer();
 
   function startMetricsServer(): void {
@@ -365,6 +377,7 @@ async function main(): Promise<void> {
     clearInterval(consolidationInterval);
     autoRefill.stop();
     writeBuffer.stopRetryLoop();
+    confirmationPoller.stop();
 
     try {
       await subscriber.quit();

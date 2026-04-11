@@ -100,6 +100,7 @@ async function main(): Promise<void> {
   const redisOpts = {
     host: config.redis.host,
     port: config.redis.port,
+    lazyConnect: true,
     maxRetriesPerRequest: 3,
     retryStrategy(times: number) {
       if (times > 10) return null;
@@ -108,7 +109,7 @@ async function main(): Promise<void> {
   };
 
   const redis = new Redis(redisOpts);
-  const subscriber = redis.duplicate();
+  const subscriber = new Redis({ ...redisOpts });
 
   redis.on("error", (err: Error) => {
     log.error({ err: err.message }, "Redis client error");

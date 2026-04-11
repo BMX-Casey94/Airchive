@@ -251,19 +251,25 @@ export function useWebSocket() {
   useEffect(() => {
     connect();
 
-    // Bootstrap daily summary + recent transactions from REST so the UI isn't empty on late load
-    fetch(`${API_URL}/api/metrics`)
-      .then((r) => r.json())
-      .then((json: { success: boolean; data?: { transactions_today: number; bytes_on_chain_today: number; bsv_cost_today_sats: number } }) => {
-        if (json.success && json.data) {
-          setDailySummary({
-            txCount: json.data.transactions_today,
-            totalBytes: json.data.bytes_on_chain_today,
-            totalSats: json.data.bsv_cost_today_sats,
-          });
-        }
-      })
-      .catch(() => {});
+    function fetchMetrics() {
+      fetch(`${API_URL}/api/metrics`)
+        .then((r) => r.json())
+        .then((json: { success: boolean; data?: { transactions_today: number; bytes_on_chain_today: number; bsv_cost_today_sats: number; mined_today?: number; pending_today?: number; failed_today?: number } }) => {
+          if (json.success && json.data) {
+            setDailySummary({
+              txCount: json.data.transactions_today,
+              totalBytes: json.data.bytes_on_chain_today,
+              totalSats: json.data.bsv_cost_today_sats,
+              minedCount: json.data.mined_today ?? 0,
+              pendingCount: json.data.pending_today ?? json.data.transactions_today,
+              failedCount: json.data.failed_today ?? 0,
+            });
+          }
+        })
+        .catch(() => {});
+    }
+
+    fetchMetrics();
 
     const setEntries = useBlockchainStore.getState().setEntries;
     fetch(`${API_URL}/api/transactions/recent?limit=50`)
@@ -275,7 +281,10 @@ export function useWebSocket() {
       })
       .catch(() => {});
 
+    const metricsInterval = setInterval(fetchMetrics, 30_000);
+
     return () => {
+      clearInterval(metricsInterval);
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
       wsRef.current?.close();
     };

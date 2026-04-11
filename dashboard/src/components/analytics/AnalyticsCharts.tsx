@@ -32,7 +32,6 @@ function StatTile({
 
 export function AnalyticsCharts() {
   const summary = useBlockchainStore((s) => s.dailySummary);
-  const entries = useBlockchainStore((s) => s.entries);
   const fleet = useAircraftStore((s) => s.fleet);
 
   const aircraftCount = fleet.size;
@@ -40,11 +39,10 @@ export function AnalyticsCharts() {
     (ac) => !ac.onGround,
   ).length;
 
-  const minedCount = entries.filter((e) => e.status === "MINED").length;
-  const pendingCount = entries.filter(
-    (e) => e.status === "SEEN_ON_NETWORK",
-  ).length;
-  const failedCount = entries.filter((e) => e.status === "FAILED").length;
+  const minedCount = summary.minedCount;
+  const pendingCount = summary.pendingCount;
+  const failedCount = summary.failedCount;
+  const totalStatusCount = minedCount + pendingCount + failedCount;
 
   return (
     <Panel title="Analytics">
@@ -87,7 +85,7 @@ export function AnalyticsCharts() {
         </div>
 
         {/* Transaction status breakdown */}
-        {entries.length > 0 && (
+        {totalStatusCount > 0 && (
           <div className="space-y-2">
             <p className="hud-label text-[9px]">Transaction Status</p>
             <div className="flex gap-2 h-2 rounded-full overflow-hidden bg-space-black border border-panel-border">
@@ -95,7 +93,7 @@ export function AnalyticsCharts() {
                 <div
                   className="h-full bg-signal-green rounded-full transition-all duration-500"
                   style={{
-                    width: `${(minedCount / entries.length) * 100}%`,
+                    width: `${(minedCount / totalStatusCount) * 100}%`,
                   }}
                   title={`${minedCount} mined`}
                 />
@@ -104,7 +102,7 @@ export function AnalyticsCharts() {
                 <div
                   className="h-full bg-neon-amber rounded-full transition-all duration-500"
                   style={{
-                    width: `${(pendingCount / entries.length) * 100}%`,
+                    width: `${(pendingCount / totalStatusCount) * 100}%`,
                   }}
                   title={`${pendingCount} pending`}
                 />
@@ -113,7 +111,7 @@ export function AnalyticsCharts() {
                 <div
                   className="h-full bg-alert-red rounded-full transition-all duration-500"
                   style={{
-                    width: `${(failedCount / entries.length) * 100}%`,
+                    width: `${(failedCount / totalStatusCount) * 100}%`,
                   }}
                   title={`${failedCount} failed`}
                 />
@@ -127,7 +125,7 @@ export function AnalyticsCharts() {
           </div>
         )}
 
-        {entries.length === 0 && summary.txCount === 0 && (
+        {totalStatusCount === 0 && summary.txCount === 0 && (
           <div className="flex flex-col items-center justify-center py-4 gap-2">
             <p className="text-[11px] text-hud-muted">
               Analytics will populate once blockchain transactions begin.

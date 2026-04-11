@@ -12,7 +12,7 @@ export async function metricsRoutes(app: FastifyInstance): Promise<void> {
     todayStartMs.setUTCHours(0, 0, 0, 0);
     const todayEpoch = todayStartMs.getTime();
 
-    const [txToday, totalBytes, aircraftCount, pendingCount, totalSats] = await Promise.all([
+    const [txToday, totalBytes, aircraftCount, pendingCount, totalSats, minedToday, failedToday] = await Promise.all([
       db("tx_results")
         .where("timestamp", ">=", todayEpoch)
         .count("* as total")
@@ -32,16 +32,33 @@ export async function metricsRoutes(app: FastifyInstance): Promise<void> {
         .where("timestamp", ">=", todayEpoch)
         .sum("fee_sats as total")
         .first() as Promise<CountRow>,
+      db("tx_results")
+        .where("timestamp", ">=", todayEpoch)
+        .where("status", "MINED")
+        .count("* as total")
+        .first() as Promise<CountRow>,
+      db("tx_results")
+        .where("timestamp", ">=", todayEpoch)
+        .where("status", "FAILED")
+        .count("* as total")
+        .first() as Promise<CountRow>,
     ]);
+
+    const txTodayNum = Number(txToday?.total ?? 0);
+    const minedNum = Number(minedToday?.total ?? 0);
+    const failedNum = Number(failedToday?.total ?? 0);
 
     return reply.send({
       success: true,
       data: {
-        transactions_today: Number(txToday?.total ?? 0),
+        transactions_today: txTodayNum,
         bytes_on_chain_today: Number(totalBytes?.total ?? 0),
         bsv_cost_today_sats: Number(totalSats?.total ?? 0),
         active_aircraft: Number(aircraftCount?.total ?? 0),
         pending_writes: Number(pendingCount?.total ?? 0),
+        mined_today: minedNum,
+        pending_today: txTodayNum - minedNum - failedNum,
+        failed_today: failedNum,
       },
     });
   });

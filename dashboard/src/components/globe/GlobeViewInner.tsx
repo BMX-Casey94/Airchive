@@ -118,9 +118,15 @@ export default function GlobeViewInner() {
         if (!cancelled) setReady(true);
       } catch (e) {
         console.error(e);
-        setLoadError(
-          e instanceof Error ? e.message : "Failed to initialise CesiumJS",
-        );
+        const msg = e instanceof Error ? e.message : "Failed to initialise CesiumJS";
+        if (msg.includes("Loading chunk") || msg.includes("ChunkLoadError")) {
+          setLoadError(
+            "A stale build cache is preventing the globe from loading. " +
+            "Clear your browser cache or, if running locally, delete the dashboard/.next folder and restart.",
+          );
+        } else {
+          setLoadError(msg);
+        }
       }
     })();
 
