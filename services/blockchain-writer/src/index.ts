@@ -62,6 +62,9 @@ async function main(): Promise<void> {
     throw new Error("No aircraft configured. Set TRACKED_AIRCRAFT or populate aircraft_config table.");
   }
 
+  vault.registerFleet(fleet);
+  log.info({ aircraft: fleet.map((a) => a.icao) }, "Fleet registered");
+
   for (const ac of fleet) {
     await upsertAircraftConfig(db, {
       icao: ac.icao,
@@ -74,9 +77,6 @@ async function main(): Promise<void> {
     });
   }
   log.info({ count: fleet.length }, "aircraft_config rows ensured");
-
-  vault.registerFleet(fleet);
-  log.info({ aircraft: fleet.map((a) => a.icao) }, "Fleet registered");
 
   const broadcaster = new ArcBroadcaster(config.arcUrl, config.arcApiKey);
   const utxoManager = new UtxoManager(db, config.wocApiUrl);
