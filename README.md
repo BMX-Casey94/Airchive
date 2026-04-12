@@ -241,9 +241,9 @@ The adaptive write-rate controller adjusts per flight phase:
 |-------|---------------|-----------|
 | PARKED | 120s | Minimal change |
 | TAXI / TAXI_IN | 15s | Ground movement |
-| TAKEOFF / LANDING | 2s | Critical phase — high-resolution data |
-| CLIMB / DESCENT | 2s | Rapid altitude/speed changes |
-| APPROACH | 2s | Final approach precision |
+| TAKEOFF / LANDING | 1s | Critical phase — maximum resolution |
+| CLIMB | 1s | Rapid altitude/speed changes |
+| DESCENT / APPROACH | 2s | Moderate change rate |
 | CRUISE | 3s | Steady state — bulk of flight time |
 | EMERGENCY | 1s | Maximum rate (squawk 7700/7600/7500) |
 
