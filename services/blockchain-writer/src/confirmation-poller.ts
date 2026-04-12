@@ -61,7 +61,7 @@ export class ConfirmationPoller {
         .where("status", "SEEN_ON_NETWORK")
         .orderBy("timestamp", "asc")
         .limit(BATCH_SIZE)
-        .select("txid", "aircraft_icao", "size_bytes", "fee_sats", "timestamp");
+        .select("txid", "aircraft_icao", "size_bytes", "fee_sats", "timestamp", "record_type");
 
       if (pending.length === 0) {
         this.switchToSteadyState();
@@ -99,8 +99,10 @@ export class ConfirmationPoller {
                 txid,
                 status: "MINED",
                 aircraft_icao: row.aircraft_icao,
-                size_bytes: row.size_bytes,
-                fee_sats: row.fee_sats,
+                record_type: Number(row.record_type),
+                timestamp: Number(row.timestamp),
+                size_bytes: Number(row.size_bytes),
+                fee_sats: Number(row.fee_sats),
                 block_height: data.blockheight,
               });
               await this.redisPublisher.publish("txresult", txResultMsg).catch(() => {});

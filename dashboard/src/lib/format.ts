@@ -97,8 +97,12 @@ export function fmtVerticalRate(fpm: number | null | undefined): string {
 }
 
 /** Format a timestamp (epoch ms) to HH:MM:SS. */
-export function fmtTime(epochMs: number): string {
-  return new Date(epochMs).toLocaleTimeString("en-GB", {
+export function fmtTime(epochMs: number | string | null | undefined): string {
+  const ms = typeof epochMs === "string" ? Number(epochMs) : epochMs;
+  if (ms == null || Number.isNaN(ms)) return "—";
+  const d = new Date(ms);
+  if (Number.isNaN(d.getTime())) return "—";
+  return d.toLocaleTimeString("en-GB", {
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
