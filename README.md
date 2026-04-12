@@ -75,7 +75,7 @@ The operator dashboard ([https://airchive.vercel.app](https://airchive.vercel.ap
 | **Agent Marketplace** | Live view of the three AI agents — messages, on-chain inscriptions, micropayment flows |
 | **Flight History** | Paginated completed flight log with origin/destination, duration, phase breakdown, and linked transactions |
 | **Aircraft Explorer** | Per-aircraft transaction history with decoded payload, block height, Merkle path, and flight session context |
-| **Wallet List** | All 15 aircraft + 3 agent wallets with BIP44 index and WhatsonChain links |
+| **Wallet List** | All 15 aircraft wallets with BIP44 index and WhatsonChain links (agent + treasury wallets managed separately) |
 
 ## BSV Chronicle Integration
 
@@ -197,7 +197,15 @@ The **dashboard** is deployed to Vercel (Next.js). All backend services (ingesti
 
 ### Aircraft wallets (HD-derived)
 
-The system currently tracks **15 aircraft**, each with its own deterministic P2PKH wallet derived from the master seed via BIP44 path `m/44'/236'/0'/0/{index}`. The **funding wallet** (`FUNDING_WALLET_WIF`) distributes satoshis to aircraft wallets as needed. Total active wallets: **15 aircraft + 3 agent wallets = 18 wallets**.
+The system currently tracks **15 aircraft**, each with its own deterministic P2PKH wallet derived from the master seed via BIP44 path `m/44'/236'/0'/0/{index}`. Total active wallets: **15 aircraft + 3 agent wallets + 1 treasury/funding wallet = 19 wallets**.
+
+| Wallet | Count | Purpose |
+|--------|-------|---------|
+| Aircraft (HD-derived) | 15 | One per tracked ICAO — holds UTXOs for telemetry broadcasts |
+| Agent (ServerWallet) | 3 | Collector, Analyst, Monitor — micropayments and inscriptions |
+| Treasury / Funding | 1 | Top-level wallet that distributes satoshis to aircraft wallets via auto-refill (`FUNDING_WALLET_WIF`) |
+
+The treasury wallet is a standard P2PKH wallet whose UTXOs are fetched directly from WhatsonChain at refill time — it is not managed in the UTXO pool database.
 
 **On-chain broadcasts only occur during active flight periods.** Parked aircraft write at most every 2 minutes. Once an aircraft is airborne (TAXI onwards), write rates increase to 15s for taxiing, 1s for takeoff/climb/landing, 2s for descent/approach, and 3s for cruise. This means the blockchain is only written to when there is meaningful data to record.
 
