@@ -103,6 +103,13 @@ async function main(): Promise<void> {
 
   await utxoManager.purgeSubThresholdUtxos();
 
+  const stalePurged = await db("pending_writes")
+    .where("retry_count", ">=", 10)
+    .delete();
+  if (stalePurged > 0) {
+    log.info({ purged: stalePurged }, "Purged stale pending writes (retry_count >= 10)");
+  }
+
   log.info("Running initial auto-refill check (force=true for bootstrap)");
   await autoRefill.checkAll(true).catch((err) =>
     log.error({ err }, "Initial auto-refill failed"),

@@ -48,6 +48,7 @@ export interface AircraftTelemetry {
 
 export interface AircraftState {
   fleet: Map<string, AircraftTelemetry>;
+  walletAddressMap: Map<string, string>;
   selectedIcao: string | null;
 
   selectAircraft: (icao: string | null) => void;
@@ -87,8 +88,19 @@ function mergeTelemetry(
 
 /* ── Store ────────────────────────────────────────────────────── */
 
+function applyWalletAddress(
+  ac: AircraftTelemetry,
+  walletMap: Map<string, string>,
+): AircraftTelemetry {
+  if (ac.walletAddress) return ac;
+  const addr = walletMap.get(ac.icao) ?? walletMap.get(ac.icao.toUpperCase());
+  if (addr) return { ...ac, walletAddress: addr };
+  return ac;
+}
+
 export const useAircraftStore = create<AircraftState>()((set) => ({
   fleet: new Map(),
+  walletAddressMap: new Map(),
   selectedIcao: null,
 
   selectAircraft: (icao) => set({ selectedIcao: icao }),
@@ -97,7 +109,8 @@ export const useAircraftStore = create<AircraftState>()((set) => ({
     set((state) => {
       const next = new Map(state.fleet);
       const prev = next.get(record.icao);
-      next.set(record.icao, prev ? mergeTelemetry(prev, record) : record);
+      const merged = prev ? mergeTelemetry(prev, record) : record;
+      next.set(record.icao, applyWalletAddress(merged, state.walletAddressMap));
       return { fleet: next };
     }),
 
@@ -106,20 +119,22 @@ export const useAircraftStore = create<AircraftState>()((set) => ({
       const next = new Map(state.fleet);
       for (const r of records) {
         const prev = next.get(r.icao);
-        next.set(r.icao, prev ? mergeTelemetry(prev, r) : r);
+        const merged = prev ? mergeTelemetry(prev, r) : r;
+        next.set(r.icao, applyWalletAddress(merged, state.walletAddressMap));
       }
       return { fleet: next };
     }),
 
   setWalletAddresses: (mapping) =>
     set((state) => {
-      const next = new Map(state.fleet);
+      const nextMap = new Map(state.walletAddressMap);
       for (const [icao, addr] of Object.entries(mapping)) {
-        const existing = next.get(icao);
-        if (existing) {
-          next.set(icao, { ...existing, walletAddress: addr });
-        }
+        nextMap.set(icao, addr);
       }
-      return { fleet: next };
+      const nextFleet = new Map(state.fleet);
+      for (const [icao, ac] of nextFleet) {
+        nextFleet.set(icao, applyWalletAddress(ac, nextMap));
+      }
+      return { fleet: nextFleet, walletAddressMap: nextMap };
     }),
 }));
