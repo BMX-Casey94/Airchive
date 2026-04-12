@@ -1,13 +1,21 @@
-# Airchive — BSV blockchain aircraft telemetry platform
+# Airchive — BSV Blockchain Aircraft Telemetry Platform
+
+> **BSV Hackathon 2026 Submission** — Chronicle-era on-chain aviation data
 
 Airchive ingests multi-source ADS-B telemetry, normalises it into a canonical record model, and drives phase detection, adaptive on-chain write rates, and operator-facing dashboards backed by Redis, PostgreSQL, and BSV infrastructure.
 
 The goal is an auditable, immutable trail of flight activity suitable for safety analytics, insurers, and fleet operations — without naive "one transaction per second per aircraft" economics.
 
+## Team
+
+| Name | Role |
+|------|------|
+| <!-- TODO: Add team member names --> | Lead Developer |
+
 ## Architecture overview
 
 ```
-  ADS-B Sources                    BSV Blockchain
+  ADS-B Sources                    BSV Blockchain (Chronicle)
   ┌──────────┐                     ┌──────────────┐
   │ adsb.fi  │─┐                   │ TAAL ARC     │
   │ OpenSky  │─┤                   │ Whatsonchain  │
@@ -44,6 +52,50 @@ The goal is an auditable, immutable trail of flight activity suitable for safety
 | **Collector** | Aggregates live telemetry from Redis and historical data from PostgreSQL; sells data products to other agents | Earns sats from data sales |
 | **Analyst** | Purchases fleet snapshots from Collector, runs anomaly detection and fleet statistics, inscribes analysis summaries on-chain | 5 sats/cycle (fleet_snapshot) + inscription fees |
 | **Monitor** | Round-robin queries live telemetry per aircraft from Collector; periodic monitoring inscriptions | 1 sat/query + inscription fees every 100 cycles |
+
+## BSV Chronicle Integration
+
+Airchive is built for the **Chronicle era** of BSV (activated 7 April 2026, block 943,816). All telemetry transactions are broadcast with **`tx.version = 2`**, opting into the Chronicle ruleset.
+
+### What Chronicle enables
+
+The Chronicle upgrade restores original Bitcoin protocol features:
+
+- **Restored opcodes:** `OP_SUBSTR` (0xb3), `OP_LEFT` (0xb4), `OP_RIGHT` (0xb5) for in-script string manipulation; `OP_2MUL`, `OP_2DIV`, `OP_LSHIFTNUM`, `OP_RSHIFTNUM` for arithmetic; `OP_VER`, `OP_VERIF`, `OP_VERNOTIF` for version-gated logic.
+- **Original Transaction Digest Algorithm (OTDA):** Opt-in via the `CHRONICLE` [0x20] sighash flag, restoring the original Bitcoin transaction digest.
+- **Relaxed malleability restrictions** for `tx.version > 1`: Minimal encoding, Low-S, NULLFAIL/NULLDUMMY, MINIMALIF, Clean Stack, and data-only unlocking script requirements are all removed.
+- **Functional opcodes in unlocking scripts:** Allowed for `tx.version > 1`.
+- **32 MB script number limit:** Increased from 750 KB.
+
+### How Airchive uses Chronicle
+
+- **Transaction version 2:** Every telemetry transaction uses `tx.version = 2`, signalling Chronicle-era compliance and opting into the relaxed ruleset.
+- **Chronicle-validated badge:** The dashboard displays a "Chronicle" badge on transactions that were broadcast under Chronicle rules, providing visual confirmation of the protocol version.
+- **Future-ready architecture:** The transaction pipeline is designed to adopt Chronicle opcodes (e.g. `OP_SUBSTR` for in-script ICAO extraction, `OP_VER` for version-gated validation) as the ecosystem tooling matures.
+
+### On-chain telemetry payload format
+
+Every OP_RETURN output contains a structured binary payload:
+
+| Offset | Length | Field | Description |
+|--------|--------|-------|-------------|
+| 0 | 8 | Protocol ID | `"AIRCHIVE"` (ASCII) |
+| 8 | 1 | Version | `0x01` |
+| 9 | 3 | ICAO | Aircraft address (packed hex) |
+| 12 | 8 | Timestamp | Epoch milliseconds (LE uint64) |
+| 20 | 1 | Record type | `0x01` telemetry, `0x02` flight event, `0x03` alert |
+| 21+ | variable | Payload | MessagePack-encoded telemetry data |
+
+## On-chain verifiability
+
+Every aircraft wallet is deterministically derived and publicly verifiable:
+
+- **Derivation path:** `m/44'/236'/0'/0/{index}` (BIP44, coin type 236 for BSV)
+- **Wallet list API:** `GET /api/wallets` returns all aircraft wallet addresses with WhatsonChain links
+- **Per-aircraft explorer:** The dashboard's "View Wallet On-Chain" button links directly to WhatsonChain for each aircraft
+- **Transaction format:** All telemetry is encoded in OP_RETURN outputs with the `AIRCHIVE` protocol prefix, making transactions machine-parseable by any third party
+
+To verify any aircraft's on-chain activity, query the wallet list endpoint and follow the WhatsonChain links to inspect the raw transactions.
 
 ## Quick start
 
@@ -158,6 +210,34 @@ pnpm run db:migrate
 **Dashboard:** `pnpm --filter @airchive/dashboard dev` — requires `NEXT_PUBLIC_GATEWAY_URL` and `NEXT_PUBLIC_WS_URL`.
 
 > **Note:** `next build` with `output: "standalone"` may require symlink privileges on Windows (Developer Mode or elevated rights). Linux/macOS and CI/Docker builds are unaffected.
+
+## Scaling to 1.5M transactions in 24 hours
+
+The hackathon target is **1,500,000 meaningful on-chain transactions within a 24-hour window**. Here's the arithmetic:
+
+| Parameter | Value |
+|-----------|-------|
+| Target transactions | 1,500,000 |
+| Time window | 24 hours (86,400 seconds) |
+| Required throughput | ~17.4 tx/second sustained |
+| Avg write interval per aircraft (cruise) | ~10 seconds |
+| Effective tx/sec per aircraft | ~0.1 |
+| **Aircraft needed** | **~175 active aircraft** |
+
+The adaptive write-rate controller adjusts per flight phase:
+
+| Phase | Write interval | Rationale |
+|-------|---------------|-----------|
+| PARKED | 120s | Minimal change |
+| TAXI | 15s | Ground movement |
+| TAKEOFF / LANDING | 3s | Critical phase |
+| CLIMB / DESCENT | 8s | Moderate change |
+| CRUISE | 10s | Steady state |
+| EMERGENCY | 1s | Maximum rate |
+
+With 175+ aircraft tracked (a mix of active commercial traffic), the system sustains the required throughput. Each aircraft wallet is independently funded and manages its own UTXO chain, enabling fully parallel transaction construction with no contention.
+
+**Cost estimate:** At ~1 sat/tx average fee, 1.5M transactions costs approximately 1.5M sats (~£0.05 at current BSV prices). The auto-refill system distributes funding automatically.
 
 ## Licence
 

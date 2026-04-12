@@ -54,6 +54,29 @@ export async function fleetRoutes(app: FastifyInstance): Promise<void> {
     return reply.send({ success: true, data: fleet });
   });
 
+  app.get("/api/wallets", async (_request, reply) => {
+    const db = getDb();
+    const rows = await db("aircraft_config")
+      .where({ enabled: true })
+      .whereNotNull("wallet_address")
+      .select("icao", "wallet_address", "wallet_index");
+
+    const wallets = rows.map((r) => ({
+      icao: r.icao as string,
+      address: r.wallet_address as string,
+      walletIndex: r.wallet_index as number,
+      wocUrl: `https://whatsonchain.com/address/${r.wallet_address}`,
+    }));
+
+    return reply.send({
+      success: true,
+      data: {
+        derivationPath: "m/44'/236'/0'/0/{index}",
+        wallets,
+      },
+    });
+  });
+
   app.get<{ Params: { icao: string } }>("/api/aircraft/:icao", async (request, reply) => {
     const icao = request.params.icao.toUpperCase();
     const current = aircraftState.get(icao);

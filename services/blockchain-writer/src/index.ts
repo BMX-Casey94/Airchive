@@ -103,6 +103,13 @@ async function main(): Promise<void> {
 
   await utxoManager.purgeSubThresholdUtxos();
 
+  const chroniclePurged = await db("utxo_pool")
+    .where("is_chronicle", true)
+    .delete();
+  if (chroniclePurged > 0) {
+    log.warn({ purged: chroniclePurged }, "Purged UTXOs with custom Chronicle locking scripts (unspendable with standard P2PKH)");
+  }
+
   const stalePurged = await db("pending_writes")
     .where("retry_count", ">=", 10)
     .delete();
@@ -236,7 +243,6 @@ async function main(): Promise<void> {
         changeOutput.satoshis,
         changeOutput.lockingScript,
         icao,
-        changeOutput.isChronicle,
       );
 
       const txResultRow = {

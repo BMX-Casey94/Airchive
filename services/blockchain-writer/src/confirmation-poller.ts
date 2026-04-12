@@ -104,6 +104,7 @@ export class ConfirmationPoller {
                 size_bytes: Number(row.size_bytes),
                 fee_sats: Number(row.fee_sats),
                 block_height: data.blockheight,
+                chronicle_validated: !!row.chronicle_validated,
               });
               await this.redisPublisher.publish("txresult", txResultMsg).catch(() => {});
             }
