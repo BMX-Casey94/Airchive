@@ -236,6 +236,7 @@ async function main(): Promise<void> {
         changeOutput.satoshis,
         changeOutput.lockingScript,
         icao,
+        changeOutput.isChronicle,
       );
 
       const txResultRow = {
@@ -247,6 +248,7 @@ async function main(): Promise<void> {
         fee_sats: Number(utxo.satoshis) - changeOutput.satoshis,
         size_bytes: tx.toBinary().length,
         flight_id: telemetry.flight_id,
+        chronicle_validated: !!changeOutput.isChronicle,
       };
       await insertTxResult(db, txResultRow);
       await publisher.publish("txresult", JSON.stringify(txResultRow)).catch(() => {});

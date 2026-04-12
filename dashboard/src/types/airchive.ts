@@ -118,6 +118,7 @@ export interface TxResult {
   timestamp: number;
   fee_sats: number;
   size_bytes: number;
+  chronicle_validated?: boolean;
 }
 
 export enum AlertSeverity {

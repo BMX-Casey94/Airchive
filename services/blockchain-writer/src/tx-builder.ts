@@ -1,4 +1,4 @@
-import { Hash, P2PKH, PrivateKey, Script, Transaction } from "@bsv/sdk";
+import { Hash, P2PKH, PrivateKey, Script, Transaction, TransactionSignature, UnlockingScript } from "@bsv/sdk";
 import type {
   FlightEventRecord,
   TelemetryRecord,
@@ -7,8 +7,12 @@ import type {
 import { RecordType } from "@airchive/types";
 import {
   buildOpReturnScript,
+  buildOpReturnPayload,
   encodeFlightEventPayload,
   encodeTelemetryPayload,
+  buildChronicleP2PKH,
+  estimateChronicleUnlockSize,
+  CHRONICLE_TX_VERSION,
 } from "@airchive/telemetry-codec";
 
 const SATS_PER_KB = 100;
@@ -23,6 +27,7 @@ export interface BuildResult {
   changeOutput: {
     satoshis: number;
     lockingScript: string;
+    isChronicle?: boolean;
   };
 }
 
@@ -35,21 +40,6 @@ function varintSize(n: number): number {
   if (n <= 0xffff) return 3;
   if (n <= 0xffffffff) return 5;
   return 9;
-}
-
-function estimateTxSize(
-  inputCount: number,
-  opReturnScriptLen: number,
-): number {
-  const inputSize = INPUT_OVERHEAD + P2PKH_UNLOCK_SIZE;
-  const opReturnOutputSize = 8 + varintSize(opReturnScriptLen) + opReturnScriptLen;
-  return (
-    TX_OVERHEAD +
-    varintSize(inputCount) +
-    inputSize * inputCount +
-    opReturnOutputSize +
-    P2PKH_OUTPUT_SIZE
-  );
 }
 
 export function estimateConsolidationSize(inputCount: number): number {
@@ -66,14 +56,94 @@ export function calculateFee(estimatedBytes: number): number {
   return Math.ceil((estimatedBytes / 1000) * SATS_PER_KB * FEE_BUFFER);
 }
 
+interface ChronicleConfig {
+  icao: string;
+  fullPayload: Uint8Array;
+}
+
+function createChronicleUnlockTemplate(
+  privateKey: PrivateKey,
+  fullPayload: Uint8Array,
+  sourceSatoshis: number,
+  lockingScript: Script,
+) {
+  return {
+    sign: async (tx: Transaction, inputIndex: number) => {
+      const signatureScope =
+        TransactionSignature.SIGHASH_FORKID | TransactionSignature.SIGHASH_ALL;
+
+      const input = tx.inputs[inputIndex]!;
+      const otherInputs = tx.inputs.filter((_: unknown, i: number) => i !== inputIndex);
+      const sourceTXID = input.sourceTXID ?? (input as { sourceTransaction?: { id(fmt: string): string } }).sourceTransaction?.id("hex");
+
+      const preimage = TransactionSignature.format({
+        sourceTXID: sourceTXID!,
+        sourceOutputIndex: input.sourceOutputIndex!,
+        sourceSatoshis,
+        transactionVersion: tx.version,
+        otherInputs,
+        inputIndex,
+        outputs: tx.outputs,
+        inputSequence: input.sequence!,
+        subscript: lockingScript,
+        lockTime: tx.lockTime,
+        scope: signatureScope,
+      });
+
+      const rawSig = privateKey.sign(Hash.sha256(preimage));
+      const sig = new TransactionSignature(rawSig.r, rawSig.s, signatureScope);
+      const sigBytes = sig.toChecksigFormat();
+      const pubkeyBytes = privateKey.toPublicKey().encode(true) as number[];
+      const payloadArr = Array.from(fullPayload);
+
+      const payloadChunk = payloadArr.length <= 75
+        ? { op: payloadArr.length, data: payloadArr }
+        : { op: 0x4c, data: payloadArr };
+
+      return new UnlockingScript([
+        { op: sigBytes.length, data: sigBytes },
+        { op: pubkeyBytes.length, data: pubkeyBytes },
+        payloadChunk,
+      ]);
+    },
+    estimateLength: async () => estimateChronicleUnlockSize(fullPayload.length),
+  };
+}
+
+function estimateChronicleChangeOutputSize(chronicleLockScriptLen: number): number {
+  return 8 + varintSize(chronicleLockScriptLen) + chronicleLockScriptLen;
+}
+
 async function buildOpReturnTx(params: {
   utxo: UTXORecord;
   privateKey: PrivateKey;
   scriptBytes: number[];
+  chronicle?: ChronicleConfig;
 }): Promise<BuildResult> {
-  const { utxo, privateKey, scriptBytes } = params;
+  const { utxo, privateKey, scriptBytes, chronicle } = params;
   const inputSats = Number(utxo.satoshis);
-  const fee = calculateFee(estimateTxSize(1, scriptBytes.length));
+  const pkh = derivePubKeyHash(privateKey);
+  const inputLockScript = Script.fromHex(utxo.locking_script);
+
+  let changeLockScript: Script;
+  let changeOutputSize: number;
+
+  if (chronicle) {
+    const chronicleLockBytes = buildChronicleP2PKH(pkh, chronicle.icao);
+    changeLockScript = Script.fromBinary(chronicleLockBytes);
+    changeOutputSize = estimateChronicleChangeOutputSize(chronicleLockBytes.length);
+  } else {
+    changeLockScript = new P2PKH().lock(pkh);
+    changeOutputSize = P2PKH_OUTPUT_SIZE;
+  }
+
+  const inputUnlockSize = utxo.is_chronicle
+    ? estimateChronicleUnlockSize(chronicle?.fullPayload?.length ?? 200)
+    : P2PKH_UNLOCK_SIZE;
+  const inputSize = INPUT_OVERHEAD + inputUnlockSize;
+  const opReturnOutputSize = 8 + varintSize(scriptBytes.length) + scriptBytes.length;
+  const estSize = TX_OVERHEAD + varintSize(1) + inputSize + opReturnOutputSize + changeOutputSize;
+  const fee = calculateFee(estSize);
   const changeSats = inputSats - fee;
 
   if (changeSats < 1) {
@@ -82,24 +152,19 @@ async function buildOpReturnTx(params: {
     );
   }
 
-  const pkh = derivePubKeyHash(privateKey);
-  const changeLockScript = new P2PKH().lock(pkh);
-  const inputLockScript = Script.fromHex(utxo.locking_script);
-
   const tx = new Transaction();
+  tx.version = chronicle ? CHRONICLE_TX_VERSION : 1;
+
+  const unlockTemplate = (utxo.is_chronicle && chronicle)
+    ? createChronicleUnlockTemplate(privateKey, chronicle.fullPayload, inputSats, inputLockScript)
+    : new P2PKH().unlock(privateKey, "all", false, inputSats, inputLockScript);
 
   tx.addInput({
     sourceTXID: utxo.txid,
     sourceOutputIndex: utxo.vout,
     sourceSatoshis: inputSats,
     lockingScript: inputLockScript,
-    unlockingScriptTemplate: new P2PKH().unlock(
-      privateKey,
-      "all",
-      false,
-      inputSats,
-      inputLockScript,
-    ),
+    unlockingScriptTemplate: unlockTemplate,
     sequence: 0xffffffff,
   });
 
@@ -120,6 +185,7 @@ async function buildOpReturnTx(params: {
     changeOutput: {
       satoshis: changeSats,
       lockingScript: changeLockScript.toHex(),
+      isChronicle: !!chronicle,
     },
   };
 }
@@ -137,10 +203,20 @@ export async function buildTelemetryTx(params: {
     params.recordType as 0x01 | 0x02 | 0x03,
     payloadBytes,
   );
+  const fullPayload = buildOpReturnPayload(
+    params.telemetry.icao,
+    params.telemetry.ts,
+    params.recordType as 0x01 | 0x02 | 0x03,
+    payloadBytes,
+  );
   return buildOpReturnTx({
     utxo: params.utxo,
     privateKey: params.privateKey,
     scriptBytes,
+    chronicle: {
+      icao: params.telemetry.icao,
+      fullPayload,
+    },
   });
 }
 

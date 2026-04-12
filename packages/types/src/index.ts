@@ -119,6 +119,7 @@ export interface UTXORecord {
   satoshis: number;
   locking_script: string;
   is_locked: boolean;
+  is_chronicle?: boolean;
   created_at: Date;
 }
 
@@ -142,6 +143,7 @@ export interface TxResult {
   timestamp: number;
   fee_sats: number;
   size_bytes: number;
+  chronicle_validated?: boolean;
 }
 
 export enum AlertSeverity {

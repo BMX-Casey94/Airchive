@@ -126,6 +126,7 @@ export class UtxoManager {
     changeSats: number,
     changeLockingScript: string,
     icao: string,
+    isChronicle = false,
   ): Promise<void> {
     await this.db.transaction(async (trx) => {
       await trx("utxo_pool")
@@ -140,6 +141,7 @@ export class UtxoManager {
           satoshis: changeSats,
           locking_script: changeLockingScript,
           is_locked: false,
+          is_chronicle: isChronicle,
         });
       } else {
         log.debug(

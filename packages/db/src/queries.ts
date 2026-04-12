@@ -244,6 +244,7 @@ export async function insertTxResult(
     fee_sats: result.fee_sats,
     size_bytes: result.size_bytes,
     flight_id: result.flight_id,
+    chronicle_validated: result.chronicle_validated ?? false,
   });
 }
 

@@ -97,6 +97,16 @@ function FeedRow({ entry }: { entry: BlockchainEntry }) {
 
       {!isFlightEvent && <span className="flex-1" />}
 
+      {/* Chronicle badge */}
+      {entry.chronicle_validated && (
+        <span
+          className="flex-shrink-0 rounded px-1 py-0.5 text-[8px] font-bold uppercase tracking-widest border border-violet-500/40 bg-violet-500/10 text-violet-400"
+          title="Validated by Chronicle opcodes (OP_SPLIT) — ICAO and protocol ID verified in Bitcoin script"
+        >
+          Chronicle
+        </span>
+      )}
+
       {/* ARC status */}
       <span
         className={clsx(
