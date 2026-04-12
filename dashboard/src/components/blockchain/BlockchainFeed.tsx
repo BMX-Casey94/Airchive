@@ -101,7 +101,7 @@ function FeedRow({ entry }: { entry: BlockchainEntry }) {
       {entry.chronicle_validated && (
         <span
           className="flex-shrink-0 rounded px-1 py-0.5 text-[8px] font-bold uppercase tracking-widest border border-violet-500/40 bg-violet-500/10 text-violet-400"
-          title="Validated by Chronicle opcodes (OP_SPLIT) — ICAO and protocol ID verified in Bitcoin script"
+          title="Chronicle-era transaction (tx.version = 2) — opts into BSV Chronicle ruleset activated 7 Apr 2026"
         >
           Chronicle
         </span>

@@ -25,25 +25,31 @@ The goal is an auditable, immutable trail of flight activity suitable for safety
   ┌──────────┐    Redis PubSub    ┌───────┴───────┐
   │Ingestion │──────────────────▶│Blockchain     │
   │ + Phase  │                    │Writer + Refill│
-  │  Engine  │                    └───────────────┘
-  └────┬─────┘                           │
-       │ telemetry:{ICAO}                │ write:{ICAO}
-       ▼                                 │
-  ┌──────────┐    WebSocket       ┌──────┴────────┐
-  │ Gateway  │◀──────────────────│Agent          │
-  │ HTTP+WS  │                    │Marketplace    │
-  └────┬─────┘                    │(3 AI agents)  │
+  │  Engine  │                    └───────┬───────┘
+  └────┬─────┘                           │ OP_RETURN txs
+       │ telemetry:{ICAO}                ▼
+       ▼                         ┌───────────────┐
+  ┌──────────┐    WebSocket       │ Overlay Node  │
+  │ Gateway  │◀────────────────── │ tm_airchive   │
+  │ HTTP+WS  │                    │ Lookup API    │
+  └────┬─────┘                    └───────────────┘
+       │                          ┌───────────────┐
+       │                          │Agent          │
+       │                          │Marketplace    │
+       │                          │(3 AI agents)  │
        │                          └───────────────┘
        ▼
   ┌──────────┐
-  │Dashboard │  Next.js + Cesium globe
-  │(Operator)│  Fleet grid, alerts, blockchain feed,
-  └──────────┘  agent marketplace panel
+  │Dashboard │  Next.js + CesiumJS globe
+  │(Operator)│  Fleet grid, blockchain feed, explorer,
+  └──────────┘  alerts, agent marketplace panel
 ```
 
 **Ingestion** polls adsb.fi, OpenSky, and optional RTL-SDR endpoints, merges and deduplicates into `TelemetryRecord` shapes, and publishes to Redis `telemetry:{ICAO}` channels. A **phase engine** subscribes to those channels, runs the flight-phase state machine and adaptive write-rate controller, emits `write:{ICAO}` for the blockchain writer, and broadcasts enriched payloads for real-time consumers.
 
-**Gateway** exposes HTTP APIs and WebSockets for the **dashboard** (globe, fleet grid, alerts, blockchain feed, agent marketplace). **Blockchain writer** consumes `write:{ICAO}` events, builds OP_RETURN transactions with encoded telemetry, and broadcasts via TAAL ARC. An **activity-aware auto-refill** monitor tops up aircraft wallets only when they are actively flying — idle aircraft are skipped to conserve funding.
+**Gateway** exposes HTTP APIs and WebSockets for the **dashboard** (globe, fleet grid, alerts, blockchain feed, agent marketplace). **Blockchain writer** consumes `write:{ICAO}` events, builds OP_RETURN transactions with encoded telemetry, and broadcasts via TAAL ARC. Each aircraft has its own independently funded wallet — **on-chain broadcasts only occur during active flight periods** (TAXI through LANDING phases). Parked aircraft write at most every 2 minutes, conserving both bandwidth and funds. An **activity-aware auto-refill** monitor tops up wallets only for actively flying aircraft.
+
+**Overlay Node** runs a custom BSV overlay node (`services/overlay-node`) with an `AirchiveTopicManager` (`tm_airchive`) that indexes transactions by filtering for the `AIRCHIVE` protocol prefix in OP_RETURN outputs. It exposes a REST + WebSocket API for querying telemetry records by ICAO, transaction ID, time range, or flight session — providing a self-hosted, BSV-native lookup layer independent of third-party explorers.
 
 **Agent Marketplace** runs three autonomous AI agents that discover each other via BRC-100 identity, exchange data products via MessageBox P2P, and settle micropayments on-chain:
 
@@ -52,6 +58,24 @@ The goal is an auditable, immutable trail of flight activity suitable for safety
 | **Collector** | Aggregates live telemetry from Redis and historical data from PostgreSQL; sells data products to other agents | Earns sats from data sales |
 | **Analyst** | Purchases fleet snapshots from Collector, runs anomaly detection and fleet statistics, inscribes analysis summaries on-chain | 5 sats/cycle (fleet_snapshot) + inscription fees |
 | **Monitor** | Round-robin queries live telemetry per aircraft from Collector; periodic monitoring inscriptions | 1 sat/query + inscription fees every 100 cycles |
+
+## Dashboard
+
+The operator dashboard ([https://airchive.vercel.app](https://airchive.vercel.app)) is a real-time Next.js 15 application with the following views:
+
+| View | Description |
+|------|-------------|
+| **3D Globe** | CesiumJS globe with live aircraft positions, trails, and phase-coloured markers updated via WebSocket |
+| **Fleet Status Grid** | Card-per-aircraft showing ICAO, callsign, altitude, speed, heading, flight phase, and live on-chain write activity |
+| **Selected Aircraft Panel** | Deep-dive into a single aircraft: telemetry readouts, altitude/speed charts, flight timeline, and a "View Wallet On-Chain" button linking to WhatsonChain |
+| **Blockchain Feed** | Live stream of OP_RETURN transactions as they are broadcast and mined, with Chronicle badge, phase, size, fee, and timestamp |
+| **Analytics** | Daily transaction counts, bytes on chain, BSV cost, active aircraft, pending buffer size |
+| **Alerts Panel** | Configurable rule-based alerts (squawk codes, altitude deviations, phase anomalies) with acknowledgement |
+| **Emergency Overlay** | Full-screen overlay triggered by squawk 7700/7600/7500 — forces maximum 1s write rate |
+| **Agent Marketplace** | Live view of the three AI agents — messages, on-chain inscriptions, micropayment flows |
+| **Flight History** | Paginated completed flight log with origin/destination, duration, phase breakdown, and linked transactions |
+| **Aircraft Explorer** | Per-aircraft transaction history with decoded payload, block height, Merkle path, and flight session context |
+| **Wallet List** | All 15 aircraft + 3 agent wallets with BIP44 index and WhatsonChain links |
 
 ## BSV Chronicle Integration
 
@@ -83,7 +107,7 @@ Every OP_RETURN output contains a structured binary payload:
 | 8 | 1 | Version | `0x01` |
 | 9 | 3 | ICAO | Aircraft address (packed hex) |
 | 12 | 8 | Timestamp | Epoch milliseconds (LE uint64) |
-| 20 | 1 | Record type | `0x01` telemetry, `0x02` flight event, `0x03` alert |
+| 20 | 1 | Record type | `0x01` telemetry, `0x02` flight event, `0x03` telemetry delta |
 | 21+ | variable | Payload | MessagePack-encoded telemetry data |
 
 ## On-chain verifiability
@@ -119,6 +143,7 @@ pnpm --filter @airchive/ingestion dev
 pnpm --filter @airchive/gateway dev
 pnpm --filter @airchive/blockchain-writer dev
 pnpm --filter @airchive/agent-marketplace dev
+pnpm --filter @airchive/overlay-node dev
 pnpm --filter @airchive/dashboard dev
 ```
 
@@ -132,6 +157,7 @@ pnpm --filter @airchive/dashboard dev
 
 - Dashboard: `http://localhost:3000`
 - Gateway API: `http://localhost:4000`
+- Overlay Node REST API: `http://localhost:4010`
 - Prometheus metrics: Ingestion `:9090`, Blockchain Writer `:9091`, Agent Marketplace `:9093`
 
 ### Deployment architecture
@@ -162,7 +188,7 @@ The **dashboard** is deployed to Vercel (Next.js). All backend services (ingesti
 | `services/gateway` | HTTP REST API + WebSocket hub |
 | `services/blockchain-writer` | On-chain writes from Redis `write:*`, UTXO management, activity-aware auto-refill |
 | `services/agent-marketplace` | Three autonomous AI agents (Collector, Analyst, Monitor) with BSV micropayments |
-| `services/overlay-node` | BSV overlay network node |
+| `services/overlay-node` | BSV overlay node — `tm_airchive` topic manager, `AirchiveLookupService`, REST + WebSocket API |
 | `services/alert-engine` | Configurable alerting (email/SMS via SendGrid/Twilio) |
 | `dashboard` | Next.js operator UI — globe, fleet grid, blockchain feed, agent marketplace panel |
 | `k8s`, `nginx` | Kubernetes manifests and reverse-proxy examples |
@@ -171,14 +197,17 @@ The **dashboard** is deployed to Vercel (Next.js). All backend services (ingesti
 
 ### Aircraft wallets (HD-derived)
 
-Each tracked aircraft gets a deterministic P2PKH wallet derived from the master seed via BIP44 path `m/44'/236'/0'/0/{index}`. The **funding wallet** (`FUNDING_WALLET_WIF`) distributes satoshis to aircraft wallets as needed.
+The system currently tracks **15 aircraft**, each with its own deterministic P2PKH wallet derived from the master seed via BIP44 path `m/44'/236'/0'/0/{index}`. The **funding wallet** (`FUNDING_WALLET_WIF`) distributes satoshis to aircraft wallets as needed. Total active wallets: **15 aircraft + 3 agent wallets = 18 wallets**.
+
+**On-chain broadcasts only occur during active flight periods.** Parked aircraft write at most every 2 minutes. Once an aircraft is airborne (TAXI onwards), write rates increase to 15s for taxiing, 1s for takeoff/climb/landing, 2s for descent/approach, and 3s for cruise. This means the blockchain is only written to when there is meaningful data to record.
 
 ### Activity-aware auto-refill
 
-The auto-refill monitor runs every 5 minutes and checks each aircraft wallet balance against `REFILL_THRESHOLD_SATS`. However, it only refills wallets for **actively flying** aircraft — those that have had write channel activity within `REFILL_IDLE_WINDOW_MS` (default 30 minutes). This prevents idle aircraft from accumulating unnecessary funds.
+The auto-refill monitor runs every 5 minutes and checks each aircraft wallet balance against `REFILL_THRESHOLD_SATS`. It only refills wallets for **actively flying** aircraft — those that have had write channel activity within `REFILL_IDLE_WINDOW_MS` (default 30 minutes). Idle aircraft are skipped to conserve funding.
 
 - **Initial bootstrap** (`force=true`): All aircraft below threshold are refilled regardless of activity.
-- **Subsequent cycles**: Only active aircraft are refilled; idle ones are skipped with a debug log.
+- **Subsequent cycles**: Only active aircraft are refilled; idle ones are skipped.
+- **On-demand refill**: If a UTXO pool is exhausted mid-flight, a refill is requested immediately rather than waiting for the next 5-minute cycle.
 
 ### Agent wallets (`@bsv/simple` ServerWallet)
 
@@ -247,7 +276,7 @@ The adaptive write-rate controller adjusts per flight phase:
 | CRUISE | 3s | Steady state — bulk of flight time |
 | EMERGENCY | 1s | Maximum rate (squawk 7700/7600/7500) |
 
-With the aggressive 3-second cruise interval, far fewer aircraft are needed than a conservative estimate. A fleet of ~53 cruising aircraft sustains the target. In practice, with a mix of phases (takeoff/climb at 2s are even faster), **40–50 active aircraft** should comfortably exceed 1.5M transactions in 24 hours.
+With the aggressive 3-second cruise interval, far fewer aircraft are needed than a conservative estimate. A fleet of ~53 cruising aircraft sustains the target. In practice, with takeoff/climb/landing at 1s, **40–50 active aircraft** should comfortably exceed 1.5M transactions in 24 hours.
 
 Each aircraft wallet is independently funded and manages its own UTXO chain, enabling fully parallel transaction construction with no contention.
 
