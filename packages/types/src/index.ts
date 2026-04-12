@@ -171,15 +171,15 @@ export interface WriteRateConfig {
 }
 
 export const DEFAULT_WRITE_RATES: Record<FlightPhase, number> = {
-  [FlightPhase.PARKED]: 300_000,
-  [FlightPhase.TAXI]: 30_000,
-  [FlightPhase.TAKEOFF]: 1_000,
-  [FlightPhase.CLIMB]: 1_000,
-  [FlightPhase.CRUISE]: 5_000,
-  [FlightPhase.DESCENT]: 1_000,
-  [FlightPhase.APPROACH]: 1_000,
-  [FlightPhase.LANDING]: 1_000,
-  [FlightPhase.TAXI_IN]: 30_000,
+  [FlightPhase.PARKED]: 120_000,
+  [FlightPhase.TAXI]: 15_000,
+  [FlightPhase.TAKEOFF]: 2_000,
+  [FlightPhase.CLIMB]: 2_000,
+  [FlightPhase.CRUISE]: 3_000,
+  [FlightPhase.DESCENT]: 2_000,
+  [FlightPhase.APPROACH]: 2_000,
+  [FlightPhase.LANDING]: 2_000,
+  [FlightPhase.TAXI_IN]: 15_000,
 };
 
 export interface FlightSession {

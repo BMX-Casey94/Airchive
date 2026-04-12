@@ -14,6 +14,7 @@ import type { UtxoManager } from "./utxo-manager.js";
 import { buildRawOpReturnTx } from "./tx-builder.js";
 import { insertTxResult } from "@airchive/db";
 import { pendingWritesGauge } from "./metrics.js";
+import type { AutoRefillMonitor } from "./auto-refill.js";
 
 const log = createLogger({ service: "blockchain-writer:write-buffer" });
 
@@ -24,6 +25,7 @@ export class WriteBuffer {
   private intervalId: ReturnType<typeof setInterval> | null = null;
   private retrying = false;
   private redisPublisher: Redis | null = null;
+  private autoRefill: AutoRefillMonitor | null = null;
 
   constructor(
     private readonly db: Knex,
@@ -31,6 +33,10 @@ export class WriteBuffer {
     private readonly utxoManager: UtxoManager,
     private readonly vault: WalletVault,
   ) {}
+
+  setAutoRefill(refill: AutoRefillMonitor): void {
+    this.autoRefill = refill;
+  }
 
   setRedisPublisher(redis: Redis): void {
     this.redisPublisher = redis;
@@ -79,13 +85,20 @@ export class WriteBuffer {
       const pending = await getPendingWrites(this.db, RETRY_BATCH_SIZE);
       if (pending.length === 0) return 0;
 
-      log.debug({ count: pending.length }, "Processing pending writes");
+      const failedByIcao = new Map<string, number>();
+      const noUtxoIcaos = new Set<string>();
 
       for (const write of pending) {
         const icao = write.aircraft_icao;
         let utxoAcquired = false;
         let utxoTxid = "";
         let utxoVout = 0;
+
+        if (noUtxoIcaos.has(icao)) {
+          await markWriteRetried(this.db, write.id, "No available UTXOs").catch(() => {});
+          failedByIcao.set(icao, (failedByIcao.get(icao) ?? 0) + 1);
+          continue;
+        }
 
         try {
           const privateKey = this.vault.getAircraftPrivateKey(icao);
@@ -151,21 +164,31 @@ export class WriteBuffer {
               .catch(() => {});
           }
 
-          await markWriteRetried(
-            this.db,
-            write.id,
-            (err as Error).message,
-          ).catch(() => {});
+          const msg = (err as Error).message ?? "";
+          if (msg.includes("No available UTXOs")) {
+            noUtxoIcaos.add(icao);
+            this.autoRefill?.requestRefill(icao);
+          }
 
-          log.warn(
-            { err, icao, writeId: write.id },
-            "Pending write retry failed",
-          );
+          await markWriteRetried(this.db, write.id, msg).catch(() => {});
+          failedByIcao.set(icao, (failedByIcao.get(icao) ?? 0) + 1);
         }
       }
 
-      if (successCount > 0) {
-        log.info({ successCount }, "Pending writes retried");
+      if (successCount > 0 || failedByIcao.size > 0) {
+        const failSummary: Record<string, number> = {};
+        for (const [icao, count] of failedByIcao) failSummary[icao] = count;
+
+        log.info(
+          {
+            attempted: pending.length,
+            succeeded: successCount,
+            failed: pending.length - successCount,
+            ...(failedByIcao.size > 0 ? { failedByAircraft: failSummary } : {}),
+            ...(noUtxoIcaos.size > 0 ? { refillRequested: Array.from(noUtxoIcaos) } : {}),
+          },
+          "Write-buffer retry cycle complete",
+        );
       }
     } catch (err) {
       log.error({ err }, "Write-buffer retry cycle error");

@@ -1,16 +1,16 @@
 # Airchive — BSV Blockchain Aircraft Telemetry Platform
 
-> **BSV Hackathon 2026 Submission** — Chronicle-era on-chain aviation data
+> **BSV Hackathon (April) 2026 Submission** — Chronicle-era on-chain aviation data
 
 Airchive ingests multi-source ADS-B telemetry, normalises it into a canonical record model, and drives phase detection, adaptive on-chain write rates, and operator-facing dashboards backed by Redis, PostgreSQL, and BSV infrastructure.
 
 The goal is an auditable, immutable trail of flight activity suitable for safety analytics, insurers, and fleet operations — without naive "one transaction per second per aircraft" economics.
 
-## Team
+## Solo Dev
 
 | Name | Role |
 |------|------|
-| <!-- TODO: Add team member names --> | Lead Developer |
+| @BSVCasey | Lead Developer |
 
 ## Architecture overview
 
@@ -122,10 +122,21 @@ pnpm --filter @airchive/agent-marketplace dev
 pnpm --filter @airchive/dashboard dev
 ```
 
+### Live deployment
+
+- **Dashboard:** [https://airchive.vercel.app](https://airchive.vercel.app)
+- **Demo / pitch landing:** [https://airchive.vercel.app/demo](https://airchive.vercel.app/demo)
+- **Wallet list:** [https://airchive.vercel.app/wallets](https://airchive.vercel.app/wallets)
+
+### Local development URLs
+
 - Dashboard: `http://localhost:3000`
-- Demo / pitch landing: `http://localhost:3000/demo`
 - Gateway API: `http://localhost:4000`
 - Prometheus metrics: Ingestion `:9090`, Blockchain Writer `:9091`, Agent Marketplace `:9093`
+
+### Deployment architecture
+
+The **dashboard** is deployed to Vercel (Next.js). All backend services (ingestion, gateway, blockchain-writer, agent-marketplace) run locally and are exposed to the Vercel frontend via a **Cloudflare Tunnel**, providing a secure HTTPS bridge without port forwarding or static IPs. The gateway WebSocket and REST endpoints are tunnelled so the Vercel-hosted dashboard can communicate with the local backend in real time.
 
 ## Tech stack
 
@@ -220,24 +231,27 @@ The hackathon target is **1,500,000 meaningful on-chain transactions within a 24
 | Target transactions | 1,500,000 |
 | Time window | 24 hours (86,400 seconds) |
 | Required throughput | ~17.4 tx/second sustained |
-| Avg write interval per aircraft (cruise) | ~10 seconds |
-| Effective tx/sec per aircraft | ~0.1 |
-| **Aircraft needed** | **~175 active aircraft** |
+| Avg write interval per aircraft (cruise) | 3 seconds |
+| Effective tx/sec per aircraft | ~0.33 |
+| **Aircraft needed** | **~53 active cruising aircraft** |
 
 The adaptive write-rate controller adjusts per flight phase:
 
 | Phase | Write interval | Rationale |
 |-------|---------------|-----------|
 | PARKED | 120s | Minimal change |
-| TAXI | 15s | Ground movement |
-| TAKEOFF / LANDING | 3s | Critical phase |
-| CLIMB / DESCENT | 8s | Moderate change |
-| CRUISE | 10s | Steady state |
-| EMERGENCY | 1s | Maximum rate |
+| TAXI / TAXI_IN | 15s | Ground movement |
+| TAKEOFF / LANDING | 2s | Critical phase — high-resolution data |
+| CLIMB / DESCENT | 2s | Rapid altitude/speed changes |
+| APPROACH | 2s | Final approach precision |
+| CRUISE | 3s | Steady state — bulk of flight time |
+| EMERGENCY | 1s | Maximum rate (squawk 7700/7600/7500) |
 
-With 175+ aircraft tracked (a mix of active commercial traffic), the system sustains the required throughput. Each aircraft wallet is independently funded and manages its own UTXO chain, enabling fully parallel transaction construction with no contention.
+With the aggressive 3-second cruise interval, far fewer aircraft are needed than a conservative estimate. A fleet of ~53 cruising aircraft sustains the target. In practice, with a mix of phases (takeoff/climb at 2s are even faster), **40–50 active aircraft** should comfortably exceed 1.5M transactions in 24 hours.
 
-**Cost estimate:** At ~1 sat/tx average fee, 1.5M transactions costs approximately 1.5M sats (~£0.05 at current BSV prices). The auto-refill system distributes funding automatically.
+Each aircraft wallet is independently funded and manages its own UTXO chain, enabling fully parallel transaction construction with no contention.
+
+**Cost estimate:** At ~1 sat/tx average fee, 1.5M transactions costs approximately 1.5M sats (~£0.05 at current BSV prices). The auto-refill system distributes funding automatically from the funding wallet.
 
 ## Licence
 

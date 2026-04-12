@@ -89,6 +89,7 @@ async function main(): Promise<void> {
     fleet,
     config.refillIdleWindowMs,
   );
+  writeBuffer.setAutoRefill(autoRefill);
 
   log.info("Bootstrapping UTXO pools");
   for (const aircraft of fleet) {
