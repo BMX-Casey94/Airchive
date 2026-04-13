@@ -12,6 +12,7 @@ import {
   getAllAircraft,
   getDb,
   insertTxResult,
+  unlockAllAircraftUtxos,
   updateTxStatus,
   upsertAircraftConfig,
 } from "@airchive/db";
@@ -19,6 +20,7 @@ import { createLogger } from "@airchive/logger";
 import { loadConfig } from "./config.js";
 import { ArcBroadcaster, type ArcCallbackPayload } from "./broadcaster.js";
 import { UtxoManager } from "./utxo-manager.js";
+import { FundingUtxoManager } from "./funding-utxo-manager.js";
 import { AutoRefillMonitor } from "./auto-refill.js";
 import { WriteBuffer } from "./write-buffer.js";
 import { ConfirmationPoller } from "./confirmation-poller.js";
@@ -80,6 +82,7 @@ async function main(): Promise<void> {
 
   const broadcaster = new ArcBroadcaster(config.arcUrl, config.arcApiKey);
   const utxoManager = new UtxoManager(db, config.wocApiUrl);
+  const fundingUtxoManager = new FundingUtxoManager(db, config.wocApiUrl);
   const writeBuffer = new WriteBuffer(db, broadcaster, utxoManager, vault);
   const autoRefill = new AutoRefillMonitor(
     config,
@@ -87,10 +90,19 @@ async function main(): Promise<void> {
     utxoManager,
     vault,
     fleet,
+    fundingUtxoManager,
     config.refillIdleWindowMs,
   );
   writeBuffer.setAutoRefill(autoRefill);
 
+  /* ── Startup: unlock stale locks from previous unclean shutdown ── */
+  const unlockedAircraft = await unlockAllAircraftUtxos(db);
+  if (unlockedAircraft > 0) {
+    log.info({ unlocked: unlockedAircraft }, "Unlocked stale aircraft UTXOs from previous run");
+  }
+  await fundingUtxoManager.unlockAll();
+
+  /* ── Bootstrap aircraft UTXO pools ── */
   log.info("Bootstrapping UTXO pools");
   for (const aircraft of fleet) {
     try {
@@ -117,6 +129,12 @@ async function main(): Promise<void> {
   if (stalePurged > 0) {
     log.info({ purged: stalePurged }, "Purged stale pending writes (retry_count >= 10)");
   }
+
+  /* ── Bootstrap funding/treasury UTXO pool ── */
+  log.info("Bootstrapping funding UTXO pool");
+  await fundingUtxoManager.bootstrap(config.fundingWalletWif).catch((err) =>
+    log.error({ err }, "Funding UTXO bootstrap failed"),
+  );
 
   log.info("Running initial auto-refill check (force=true for bootstrap)");
   await autoRefill.checkAll(true).catch((err) =>

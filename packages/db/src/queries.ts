@@ -69,10 +69,13 @@ export async function lockUtxo(
 }
 
 export async function insertUtxo(db: Knex, record: NewUtxo): Promise<void> {
-  await db("utxo_pool").insert({
-    ...record,
-    is_locked: record.is_locked ?? false,
-  });
+  await db("utxo_pool")
+    .insert({
+      ...record,
+      is_locked: record.is_locked ?? false,
+    })
+    .onConflict(["txid", "vout"])
+    .ignore();
 }
 
 export async function deleteUtxo(
@@ -328,6 +331,99 @@ export async function acknowledgeAlert(
   id: string,
 ): Promise<number> {
   return db("alerts").where({ id }).update({ acknowledged: true });
+}
+
+/* ── Funding UTXO Pool ──────────────────────────────────────── */
+
+export interface FundingUtxoRow {
+  txid: string;
+  vout: number;
+  satoshis: number;
+  locking_script: string;
+  is_locked: boolean;
+  created_at: Date;
+}
+
+export async function getFundingUtxoCount(db: Knex): Promise<number> {
+  const row = await db("funding_utxo_pool")
+    .count<{ count: string | number }>("* as count")
+    .first();
+  const n = row?.count;
+  if (n === undefined || n === null) return 0;
+  return typeof n === "number" ? n : Number(n);
+}
+
+export async function getFundingUtxoBalance(db: Knex): Promise<number> {
+  const row = await db("funding_utxo_pool")
+    .where({ is_locked: false })
+    .sum({ sum: "satoshis" })
+    .first();
+  const raw = row?.sum;
+  if (raw === null || raw === undefined || raw === "") return 0;
+  return Number(raw);
+}
+
+export async function insertFundingUtxo(
+  db: Knex,
+  record: { txid: string; vout: number; satoshis: number; locking_script: string },
+): Promise<void> {
+  await db("funding_utxo_pool")
+    .insert({ ...record, is_locked: false })
+    .onConflict(["txid", "vout"])
+    .ignore();
+}
+
+export async function acquireFundingUtxo(
+  db: Knex,
+  minSats: number,
+): Promise<FundingUtxoRow | undefined> {
+  return db.transaction(async (trx) => {
+    const utxo = await trx("funding_utxo_pool")
+      .where({ is_locked: false })
+      .where("satoshis", ">=", minSats)
+      .orderBy("satoshis", "desc")
+      .forUpdate()
+      .skipLocked()
+      .first<FundingUtxoRow | undefined>();
+
+    if (!utxo) return undefined;
+
+    await trx("funding_utxo_pool")
+      .where({ txid: utxo.txid, vout: utxo.vout })
+      .update({ is_locked: true });
+
+    return utxo;
+  });
+}
+
+export async function releaseFundingUtxo(
+  db: Knex,
+  txid: string,
+  vout: number,
+): Promise<void> {
+  await db("funding_utxo_pool")
+    .where({ txid, vout })
+    .update({ is_locked: false });
+}
+
+export async function deleteFundingUtxo(
+  db: Knex,
+  txid: string,
+  vout: number,
+): Promise<number> {
+  return db("funding_utxo_pool").where({ txid, vout }).delete();
+}
+
+export async function unlockAllFundingUtxos(db: Knex): Promise<number> {
+  return db("funding_utxo_pool")
+    .where({ is_locked: true })
+    .update({ is_locked: false });
+}
+
+export async function unlockAllAircraftUtxos(db: Knex): Promise<number> {
+  return db("utxo_pool")
+    .where({ is_locked: true })
+    .update({ is_locked: false });
 }
 
 export async function getAircraftConfig(

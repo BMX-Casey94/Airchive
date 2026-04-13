@@ -76,6 +76,7 @@ The operator dashboard ([https://airchive.vercel.app](https://airchive.vercel.ap
 | **Flight History** | Paginated completed flight log with origin/destination, duration, phase breakdown, and linked transactions |
 | **Aircraft Explorer** | Per-aircraft transaction history with decoded payload, block height, Merkle path, and flight session context |
 | **Wallet List** | All 15 aircraft wallets with BIP44 index and WhatsonChain links (agent + treasury wallets managed separately) |
+| **Pitch / Cost Calculator** (`/demo`) | Interactive chain-write economics calculator — compare naive 1 tx/s vs Airchive's adaptive rate, adjust fleet size and flight hours, view phase-by-phase write rate breakdown |
 
 ## BSV Chronicle Integration
 
@@ -150,7 +151,7 @@ pnpm --filter @airchive/dashboard dev
 ### Live deployment
 
 - **Dashboard:** [https://airchive.vercel.app](https://airchive.vercel.app)
-- **Demo / pitch landing:** [https://airchive.vercel.app/demo](https://airchive.vercel.app/demo)
+- **Pitch / cost calculator:** [https://airchive.vercel.app/demo](https://airchive.vercel.app/demo)
 - **Wallet list:** [https://airchive.vercel.app/wallets](https://airchive.vercel.app/wallets)
 
 ### Local development URLs
@@ -251,7 +252,7 @@ Database migrations:
 pnpm run db:migrate
 ```
 
-**Ingestion (live feeds):** set `TRACKED_AIRCRAFT` to a comma-separated ICAO list and ensure Redis/Postgres are reachable.
+**Ingestion (live feeds):** set `TRACKED_AIRCRAFT` to a comma-separated ICAO list and ensure Redis/Postgres are reachable. Ingestion polls **adsb.fi** using your hex list (`GET /api/v2/hex/...`, batched by 20 ICAOs per request), merges optional OpenSky/RTL-SDR, then publishes to Redis. It does **not** pull a worldwide aircraft dump and filter locally. The **WebSocket** (`/ws`) only forwards Redis messages to subscribed clients; it is unrelated to ADS-B ingestion. To build a long list from live traffic, run `node scripts/fetch-tracked-aircraft-from-opensky.mjs --max 200` (OpenSky snapshot; Qatar-first, then other long-haul callsigns).
 
 **Ingestion (demo replay):** set `DEMO_MODE=true`. ICAO addresses are taken from the demo JSON plus any `TRACKED_AIRCRAFT` entries. Optional: `DEMO_REPLAY_PATH`, `DEMO_SPEED_MULTIPLIER`.
 
@@ -261,34 +262,37 @@ pnpm run db:migrate
 
 ## Scaling to 1.5M transactions in 24 hours
 
-The hackathon target is **1,500,000 meaningful on-chain transactions within a 24-hour window**. Here's the arithmetic:
+The hackathon target is **1,500,000 meaningful on-chain transactions within a 24-hour window**. Aircraft are not airborne 24 hours a day — commercial fleet utilisation averages **8–10 hours of active flight per aircraft per day** (short-haul fleets ~8h, long-haul ~12–16h). The maths below uses a conservative 9-hour average.
 
 | Parameter | Value |
 |-----------|-------|
 | Target transactions | 1,500,000 |
 | Time window | 24 hours (86,400 seconds) |
 | Required throughput | ~17.4 tx/second sustained |
-| Avg write interval per aircraft (cruise) | 3 seconds |
-| Effective tx/sec per aircraft | ~0.33 |
-| **Aircraft needed** | **~53 active cruising aircraft** |
+| Avg active flight hours / aircraft / day | ~9 hours |
+| Weighted-avg tx/s per aircraft (in-flight) | ~0.39 (phase-weighted) |
+| Effective tx/s per aircraft over 24h | 0.39 × (9 / 24) ≈ 0.146 |
+| **Aircraft needed** | **~120 active aircraft** |
 
 The adaptive write-rate controller adjusts per flight phase:
 
-| Phase | Write interval | Rationale |
-|-------|---------------|-----------|
-| PARKED | 120s | Minimal change |
-| TAXI / TAXI_IN | 15s | Ground movement |
-| TAKEOFF / LANDING | 1s | Critical phase — maximum resolution |
-| CLIMB | 1s | Rapid altitude/speed changes |
-| DESCENT / APPROACH | 2s | Moderate change rate |
-| CRUISE | 3s | Steady state — bulk of flight time |
-| EMERGENCY | 1s | Maximum rate (squawk 7700/7600/7500) |
+| Phase | Write interval | tx/s | Typical % of flight |
+|-------|---------------|------|---------------------|
+| TAKEOFF / LANDING | 1s | 1.00 | ~4% |
+| CLIMB | 1s | 1.00 | ~8% |
+| DESCENT / APPROACH | 2s | 0.50 | ~12% |
+| CRUISE | 3s | 0.33 | ~70% |
+| TAXI / TAXI_IN | 15s | 0.07 | ~6% |
+| EMERGENCY | 1s | 1.00 | rare |
+| PARKED | 120s | 0.008 | n/a (not in-flight) |
 
-With the aggressive 3-second cruise interval, far fewer aircraft are needed than a conservative estimate. A fleet of ~53 cruising aircraft sustains the target. In practice, with takeoff/climb/landing at 1s, **40–50 active aircraft** should comfortably exceed 1.5M transactions in 24 hours.
+With ~120 aircraft each flying ~9 hours/day, the fleet produces approximately **120 × 9 × 3,600 × 0.39 ≈ 1.52M transactions** within 24 hours. Fleets with higher utilisation (e.g. long-haul at 12+ hours) would need fewer aircraft.
 
 Each aircraft wallet is independently funded and manages its own UTXO chain, enabling fully parallel transaction construction with no contention.
 
-**Cost estimate:** At ~1 sat/tx average fee, 1.5M transactions costs approximately 1.5M sats (~£0.05 at current BSV prices). The auto-refill system distributes funding automatically from the funding wallet.
+**Cost estimate:** At the current fee rate of 110 sats/KB, a typical 738-byte aircraft telemetry transaction costs ~82 sats. 1.5M transactions therefore costs approximately 1.23 BSV (~£14.64 at £11.90/BSV). The auto-refill system distributes funding automatically from the treasury wallet.
+
+> The `/demo` route on the dashboard includes an interactive cost calculator where stakeholders can adjust fleet size and flight hours to model their own economics.
 
 ## Licence
 

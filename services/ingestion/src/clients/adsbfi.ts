@@ -2,7 +2,7 @@ import type { TelemetryRecord, EmergencyString } from "@airchive/types";
 import { errorsTotal, pollDuration, pollsTotal } from "../metrics.js";
 
 const TIMEOUT_MS = 5_000;
-const MAX_BATCH = 20;
+const MAX_BATCH = 300;
 
 interface AdsbFiAircraft {
   hex?: string;

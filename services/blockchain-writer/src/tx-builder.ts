@@ -226,12 +226,20 @@ export async function buildConsolidationTx(
   };
 }
 
+export interface RefillResult {
+  tx: Transaction;
+  recipientVout: number;
+  changeVout: number | null;
+  changeSats: number;
+  changeLockingScript: string | null;
+}
+
 export async function buildRefillTx(params: {
   fundingUtxo: { txid: string; vout: number; satoshis: number; lockingScript: string };
   fundingKey: PrivateKey;
   recipientPkh: number[];
   amountSats: number;
-}): Promise<{ tx: Transaction; recipientVout: number; changeVout: number | null }> {
+}): Promise<RefillResult> {
   const { fundingUtxo, fundingKey, recipientPkh, amountSats } = params;
   const inputSats = fundingUtxo.satoshis;
 
@@ -252,6 +260,7 @@ export async function buildRefillTx(params: {
   }
 
   const fundingPkh = derivePubKeyHash(fundingKey);
+  const changeLockScript = new P2PKH().lock(fundingPkh);
   const tx = new Transaction();
 
   const fundingLockScript = Script.fromHex(fundingUtxo.lockingScript);
@@ -278,15 +287,23 @@ export async function buildRefillTx(params: {
 
   const DUST_LIMIT = 546;
   let changeVout: number | null = null;
+  let changeLockingScriptHex: string | null = null;
   if (changeSats >= DUST_LIMIT) {
     tx.addOutput({
-      lockingScript: new P2PKH().lock(fundingPkh),
+      lockingScript: changeLockScript,
       satoshis: changeSats,
     });
     changeVout = 1;
+    changeLockingScriptHex = changeLockScript.toHex();
   }
 
   await tx.sign();
 
-  return { tx, recipientVout: 0, changeVout };
+  return {
+    tx,
+    recipientVout: 0,
+    changeVout,
+    changeSats: changeVout !== null ? changeSats : 0,
+    changeLockingScript: changeLockingScriptHex,
+  };
 }

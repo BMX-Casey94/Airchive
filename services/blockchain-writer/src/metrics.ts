@@ -50,3 +50,15 @@ export const pendingWritesGauge = new Gauge({
   help: "Pending writes awaiting broadcast",
   registers: [registry],
 });
+
+export const fundingPoolBalance = new Gauge({
+  name: "airchive_funding_pool_balance_sats",
+  help: "Treasury/funding UTXO pool balance in satoshis",
+  registers: [registry],
+});
+
+export const fundingPoolCount = new Gauge({
+  name: "airchive_funding_pool_count",
+  help: "Number of UTXOs in the treasury/funding pool",
+  registers: [registry],
+});

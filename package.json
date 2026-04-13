@@ -25,6 +25,7 @@
     "db:rollback": "pnpm --filter @airchive/db run migrate:rollback",
     "docker:up": "docker compose up -d",
     "docker:down": "docker compose down",
-    "docker:logs": "docker compose logs -f"
+    "docker:logs": "docker compose logs -f",
+    "track-list:opensky": "node scripts/fetch-tracked-aircraft-from-opensky.mjs"
   }
 }

@@ -158,6 +158,29 @@ export function useWebSocket() {
     }
   }, []);
 
+  const backfillRecentTransactions = useCallback(() => {
+    const setEntries = useBlockchainStore.getState().setEntries;
+    const existingEntries = useBlockchainStore.getState().entries;
+    fetch(`${API_URL}/api/transactions/recent?limit=50`)
+      .then((r) => r.json())
+      .then((json: { success: boolean; data?: BlockchainEntry[] }) => {
+        if (json.success && json.data && json.data.length > 0) {
+          const reversed = json.data.reverse();
+          if (existingEntries.length === 0) {
+            setEntries(reversed);
+          } else {
+            const existingTxids = new Set(existingEntries.map((e) => e.txid));
+            const newEntries = reversed.filter((e) => !existingTxids.has(e.txid));
+            if (newEntries.length > 0) {
+              const merged = [...existingEntries, ...newEntries];
+              setEntries(merged.slice(-200));
+            }
+          }
+        }
+      })
+      .catch(() => {});
+  }, []);
+
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
@@ -174,6 +197,8 @@ export function useWebSocket() {
           icaos: Array.from(subscriptionsRef.current),
         });
       }
+
+      backfillRecentTransactions();
     };
 
     ws.onmessage = (event) => {
@@ -234,7 +259,7 @@ export function useWebSocket() {
       ws.close();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [updateAircraft, updateFleet, pushEntry, setDailySummary, pushAlert, updateGlobeAircraft, pushAgentEvent, sendMessage]);
+  }, [updateAircraft, updateFleet, pushEntry, setDailySummary, pushAlert, updateGlobeAircraft, pushAgentEvent, sendMessage, backfillRecentTransactions]);
 
   const scheduleReconnect = useCallback(() => {
     if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
@@ -272,16 +297,6 @@ export function useWebSocket() {
     }
 
     fetchMetrics();
-
-    const setEntries = useBlockchainStore.getState().setEntries;
-    fetch(`${API_URL}/api/transactions/recent?limit=50`)
-      .then((r) => r.json())
-      .then((json: { success: boolean; data?: BlockchainEntry[] }) => {
-        if (json.success && json.data && json.data.length > 0) {
-          setEntries(json.data.reverse());
-        }
-      })
-      .catch(() => {});
 
     function fetchWalletAddresses() {
       fetch(`${API_URL}/api/fleet`)

@@ -12,3 +12,5 @@ tmp/
 dashboard/public/cesium/
 test-results/
 playwright-report/
+scripts/generated-tracked-aircraft-hex.txt
+scripts/_opensky*.json
