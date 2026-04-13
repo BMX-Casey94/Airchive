@@ -131,8 +131,6 @@ export class DirectPaymentSender {
     tx.addInput({
       sourceTXID: suitable.tx_hash,
       sourceOutputIndex: suitable.tx_pos,
-      sourceSatoshis: suitable.value,
-      lockingScript: senderLock,
       unlockingScriptTemplate: new P2PKH().unlock(
         senderKey, "all", false, suitable.value, senderLock,
       ),
@@ -198,8 +196,6 @@ export class DirectPaymentSender {
     tx.addInput({
       sourceTXID: suitable.tx_hash,
       sourceOutputIndex: suitable.tx_pos,
-      sourceSatoshis: suitable.value,
-      lockingScript: senderLock,
       unlockingScriptTemplate: new P2PKH().unlock(
         senderKey, "all", false, suitable.value, senderLock,
       ),

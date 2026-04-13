@@ -27,6 +27,8 @@ export interface Config {
   refillMinOutputSats: number;
   consolidationThreshold: number;
   refillIdleWindowMs: number;
+  refillCheckIntervalMs: number;
+  refillMaxOutputsPerTx: number;
 }
 
 function requireEnv(name: string): string {
@@ -87,9 +89,9 @@ export function loadConfig(): Config {
     refillThresholdSats: Number(
       optionalEnv("REFILL_THRESHOLD_SATS", "200000"),
     ),
-    refillAmountSats: Number(optionalEnv("REFILL_AMOUNT_SATS", "1000000")),
+    refillAmountSats: Number(optionalEnv("REFILL_AMOUNT_SATS", "320000")),
     activeAircraftUtxoTarget: Number(
-      optionalEnv("ACTIVE_AIRCRAFT_UTXO_TARGET", "8"),
+      optionalEnv("ACTIVE_AIRCRAFT_UTXO_TARGET", "32"),
     ),
     refillMinOutputSats: Number(
       optionalEnv("REFILL_MIN_OUTPUT_SATS", "10000"),
@@ -99,6 +101,12 @@ export function loadConfig(): Config {
     ),
     refillIdleWindowMs: Number(
       optionalEnv("REFILL_IDLE_WINDOW_MS", "1800000"),
+    ),
+    refillCheckIntervalMs: Number(
+      optionalEnv("REFILL_CHECK_INTERVAL_MS", "60000"),
+    ),
+    refillMaxOutputsPerTx: Number(
+      optionalEnv("REFILL_MAX_OUTPUTS_PER_TX", "32"),
     ),
   };
 }

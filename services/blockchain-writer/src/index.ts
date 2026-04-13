@@ -1,5 +1,5 @@
 import { createServer as createHttpServer } from "node:http";
-import Redis from "ioredis";
+import { Redis } from "ioredis";
 import {
   RecordType,
   type FlightEventRecord,

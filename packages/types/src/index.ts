@@ -31,6 +31,8 @@ export interface TelemetryRecord {
   reg: string;
   squawk: string;
   aircraft_type: string;
+  /** Human-readable aircraft type description when available from the source. */
+  aircraft_desc?: string;
   category: string;
   ts: number;
   ts_pos: number;

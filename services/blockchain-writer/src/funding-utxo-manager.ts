@@ -95,7 +95,7 @@ export class FundingUtxoManager {
     changeSats: number | null,
     changeLockingScript: string | null,
   ): Promise<void> {
-    await this.db.transaction(async (trx) => {
+    await this.db.transaction(async (trx: Knex.Transaction) => {
       await trx("funding_utxo_pool")
         .where({ txid: spentTxid, vout: spentVout })
         .delete();

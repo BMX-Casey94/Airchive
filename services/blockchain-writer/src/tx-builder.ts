@@ -83,8 +83,6 @@ async function buildOpReturnTx(params: {
   tx.addInput({
     sourceTXID: utxo.txid,
     sourceOutputIndex: utxo.vout,
-    sourceSatoshis: inputSats,
-    lockingScript: inputLockScript,
     unlockingScriptTemplate: new P2PKH().unlock(privateKey, "all", false, inputSats, inputLockScript),
     sequence: 0xffffffff,
   });
@@ -197,8 +195,6 @@ export async function buildConsolidationTx(
     tx.addInput({
       sourceTXID: utxo.txid,
       sourceOutputIndex: utxo.vout,
-      sourceSatoshis: sats,
-      lockingScript: lockScript,
       unlockingScriptTemplate: new P2PKH().unlock(
         privateKey,
         "all",
@@ -289,8 +285,6 @@ export async function buildRefillTx(params: {
   tx.addInput({
     sourceTXID: fundingUtxo.txid,
     sourceOutputIndex: fundingUtxo.vout,
-    sourceSatoshis: inputSats,
-    lockingScript: fundingLockScript,
     unlockingScriptTemplate: new P2PKH().unlock(
       fundingKey,
       "all",

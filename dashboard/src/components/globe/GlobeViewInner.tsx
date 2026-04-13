@@ -15,6 +15,7 @@ const AIRCRAFT_ICON_SIZE = 22;
 const AIRCRAFT_ICON_SIZE_SELECTED = 28;
 const AIRCRAFT_LABEL_OFFSET_Y = -20;
 const FLY_TO_ALTITUDE = 800_000;
+const GLOBE_OCCLUSION_DEPTH_TEST_DISTANCE = 0;
 
 type CesiumNs = typeof import("cesium");
 
@@ -106,6 +107,8 @@ export default function GlobeViewInner() {
       });
 
       viewer.scene.globe.enableLighting = true;
+      // Allow the globe itself to occlude aircraft on the far side.
+      viewer.scene.globe.depthTestAgainstTerrain = true;
 
       cesiumRef.current = Cesium;
       viewerRef.current = viewer;
@@ -265,7 +268,7 @@ export default function GlobeViewInner() {
               alignedAxis: C.Cartesian3.UNIT_Z,
               horizontalOrigin: C.HorizontalOrigin.CENTER,
               verticalOrigin: C.VerticalOrigin.CENTER,
-              disableDepthTestDistance: Number.POSITIVE_INFINITY,
+              disableDepthTestDistance: GLOBE_OCCLUSION_DEPTH_TEST_DISTANCE,
             });
             entity.point = undefined;
           } else {
@@ -273,11 +276,18 @@ export default function GlobeViewInner() {
             entity.billboard.height = new C.ConstantProperty(iconSize) as unknown as import("cesium").Property;
             entity.billboard.color = new C.ConstantProperty(colour) as unknown as import("cesium").Property;
             entity.billboard.rotation = new C.ConstantProperty(rotation) as unknown as import("cesium").Property;
+            entity.billboard.disableDepthTestDistance =
+              new C.ConstantProperty(
+                GLOBE_OCCLUSION_DEPTH_TEST_DISTANCE,
+              ) as unknown as import("cesium").Property;
           }
           entity.label!.text = new C.ConstantProperty(ac.callsign || ac.icao) as unknown as import("cesium").Property;
           entity.label!.fillColor = new C.ConstantProperty(colour) as unknown as import("cesium").Property;
           entity.label!.pixelOffset = new C.ConstantProperty(
             new C.Cartesian2(0, AIRCRAFT_LABEL_OFFSET_Y),
+          ) as unknown as import("cesium").Property;
+          entity.label!.disableDepthTestDistance = new C.ConstantProperty(
+            GLOBE_OCCLUSION_DEPTH_TEST_DISTANCE,
           ) as unknown as import("cesium").Property;
         } else {
           v.entities.add({
@@ -292,7 +302,7 @@ export default function GlobeViewInner() {
               alignedAxis: C.Cartesian3.UNIT_Z,
               horizontalOrigin: C.HorizontalOrigin.CENTER,
               verticalOrigin: C.VerticalOrigin.CENTER,
-              disableDepthTestDistance: Number.POSITIVE_INFINITY,
+              disableDepthTestDistance: GLOBE_OCCLUSION_DEPTH_TEST_DISTANCE,
             },
             label: {
               text: ac.callsign || ac.icao,
@@ -305,7 +315,7 @@ export default function GlobeViewInner() {
               pixelOffset: new C.Cartesian2(0, AIRCRAFT_LABEL_OFFSET_Y),
               showBackground: true,
               backgroundColor: C.Color.BLACK.withAlpha(0.6),
-              disableDepthTestDistance: Number.POSITIVE_INFINITY,
+              disableDepthTestDistance: GLOBE_OCCLUSION_DEPTH_TEST_DISTANCE,
             },
           });
         }

@@ -14,7 +14,6 @@ import { buildRefillTx, derivePubKeyHash, estimateRefillFee } from "./tx-builder
 
 const log = createLogger({ service: "blockchain-writer:auto-refill" });
 
-const CHECK_INTERVAL_MS = 5 * 60 * 1_000;
 const DEFAULT_IDLE_WINDOW_MS = 30 * 60 * 1_000;
 const REFILL_COOLDOWN_MS = 30_000;
 const TREASURY_FAILURE_COOLDOWN_MS = 60_000;
@@ -80,17 +79,20 @@ export class AutoRefillMonitor {
   start(): void {
     if (this.intervalId) return;
 
+    const checkIntervalMs = Math.max(5_000, this.config.refillCheckIntervalMs);
+
     this.intervalId = setInterval(() => {
       void this.checkAll();
-    }, CHECK_INTERVAL_MS);
+    }, checkIntervalMs);
 
     log.info(
       {
-        intervalMs: CHECK_INTERVAL_MS,
+        intervalMs: checkIntervalMs,
         threshold: this.config.refillThresholdSats,
         idleWindowMs: this.idleWindowMs,
         activeUtxoTarget: this.config.activeAircraftUtxoTarget,
         minOutputSats: this.config.refillMinOutputSats,
+        maxOutputsPerTx: this.config.refillMaxOutputsPerTx,
       },
       "Auto-refill monitor started (activity-aware, pool-count aware)",
     );
@@ -146,9 +148,10 @@ export class AutoRefillMonitor {
     force: boolean,
   ): Promise<"refilled" | "skipped_idle" | "sufficient"> {
     const pool = await this.utxoManager.checkBalance(icao);
+    const activeAircraft = this.isActive(icao);
     const targetUtxoCount = this.getTargetUtxoCount(icao, force);
     const enforceCountTarget =
-      force || pool.balance < this.config.refillThresholdSats;
+      force || activeAircraft;
 
     if (
       pool.balance >= this.config.refillThresholdSats
@@ -157,10 +160,11 @@ export class AutoRefillMonitor {
       return "sufficient";
     }
 
-    if (!force && !this.isActive(icao)) {
+    if (!force && !activeAircraft) {
       log.debug(
         {
           icao,
+          activeAircraft,
           balance: pool.balance,
           unlockedUtxos: pool.unlockedUtxoCount,
           readyUtxos: pool.readyUtxoCount,
@@ -187,6 +191,7 @@ export class AutoRefillMonitor {
         unlockedUtxos: pool.unlockedUtxoCount,
         readyUtxos: pool.readyUtxoCount,
         coolingUtxos: pool.coolingUtxoCount,
+        activeAircraft,
         threshold: this.config.refillThresholdSats,
         targetUtxoCount,
         enforceCountTarget,
@@ -325,7 +330,8 @@ export class AutoRefillMonitor {
       this.config.refillMinOutputSats,
     );
     const maxByAmount = Math.max(1, Math.floor(refillAmountSats / minOutputSats));
-    return Math.max(1, Math.min(desiredByGap, maxByAmount));
+    const maxOutputsPerTx = Math.max(1, Math.floor(this.config.refillMaxOutputsPerTx));
+    return Math.max(1, Math.min(desiredByGap, maxByAmount, maxOutputsPerTx));
   }
 
   private async runSerialRefill<T>(op: () => Promise<T>): Promise<T> {
