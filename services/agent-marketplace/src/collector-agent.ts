@@ -5,6 +5,7 @@ import { createLogger } from "@airchive/logger";
 import { PRODUCTS, getPrice } from "./data-products.js";
 import { agentPaymentsTotal, agentMessagesTotal, dataRequestLatency } from "./metrics.js";
 import type { AgentActivityPublisher } from "./activity-publisher.js";
+import { identityRegistryUnavailable } from "./identity-utils.js";
 
 const log = createLogger({ service: "collector-agent" });
 
@@ -13,6 +14,7 @@ export interface CollectorWallet {
   getAddress(): string;
   registerIdentityTag(tag: string): Promise<{ tag: string }>;
   certifyForMessageBox(handle: string): Promise<{ txid: string; handle: string }>;
+  getBalance?(): Promise<{ spendableSatoshis?: number; totalSatoshis?: number; spendableOutputs?: number }>;
   listIncomingPayments(): Promise<any[]>;
   acceptIncomingPayment(payment: any): Promise<any>;
   inscribeText(text: string): Promise<{ txid: string }>;
@@ -35,6 +37,8 @@ export interface DataResponse {
 }
 
 export class CollectorAgent {
+  private static readonly MIN_MESSAGEBOX_CERT_SATS = 500;
+
   private readonly redis: Redis;
   private readonly db: Knex;
   private readonly trackedAircraft: string[];
@@ -74,12 +78,25 @@ export class CollectorAgent {
         "Registered identity tag: airchive-collector",
       );
     } catch (err) {
-      log.warn({ err }, "Identity tag registration failed (may already exist)");
+      if (identityRegistryUnavailable(err)) {
+        log.info("Identity registry unavailable — skipping collector tag registration");
+      } else {
+        log.warn({ err }, "Identity tag registration failed (may already exist)");
+      }
     }
 
     try {
-      const cert = await wallet.certifyForMessageBox("airchive-collector");
-      log.info({ txid: cert.txid }, "Certified for MessageBox");
+      const balance = wallet.getBalance ? await wallet.getBalance() : null;
+      const spendable = balance?.spendableSatoshis ?? 0;
+      if (balance && spendable < CollectorAgent.MIN_MESSAGEBOX_CERT_SATS) {
+        log.info(
+          { spendableSats: spendable, minRequired: CollectorAgent.MIN_MESSAGEBOX_CERT_SATS },
+          "Skipping MessageBox certification until collector wallet has sufficient balance",
+        );
+      } else {
+        const cert = await wallet.certifyForMessageBox("airchive-collector");
+        log.info({ txid: cert.txid }, "Certified for MessageBox");
+      }
     } catch (err) {
       log.warn({ err }, "MessageBox certification failed (may already exist)");
     }

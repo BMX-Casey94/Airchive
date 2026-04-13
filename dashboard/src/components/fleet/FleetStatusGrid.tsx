@@ -1,8 +1,9 @@
 "use client";
 
+import { useState } from "react";
 import { useAircraftStore } from "@/stores/aircraft-store";
 import type { AircraftTelemetry } from "@/stores/aircraft-store";
-import { TRACKED_AIRCRAFT, TRACKED_AIRCRAFT_MAP } from "@/lib/tracked-aircraft";
+import { TRACKED_AIRCRAFT_MAP } from "@/lib/tracked-aircraft";
 import { refinePhase } from "@/lib/refine-phase";
 import PhaseBadge from "@/components/ui/PhaseBadge";
 import { FlightPhase } from "@/types/airchive";
@@ -19,6 +20,12 @@ function isLive(ac: AircraftTelemetry): boolean {
   return ac.lastSeen > 0 && Date.now() - ac.lastSeen < 120_000;
 }
 
+function hasBeenSeen(ac: AircraftTelemetry): boolean {
+  return ac.lastSeen > 0;
+}
+
+type FleetFilter = "all" | "live" | "offline";
+
 function FleetCard({
   ac,
   selected,
@@ -29,6 +36,7 @@ function FleetCard({
   onClick: () => void;
 }) {
   const live = isLive(ac);
+  const seenBefore = hasBeenSeen(ac);
   const info = TRACKED_AIRCRAFT_MAP.get(ac.icao);
 
   return (
@@ -67,7 +75,7 @@ function FleetCard({
         {live && <PhaseBadge phase={phaseFromString(refinePhase(ac))} />}
         {!live && (
           <span className="text-[9px] font-mono text-hud-muted/60 uppercase tracking-wider">
-            Offline
+            {seenBefore ? "Offline" : "Never seen"}
           </span>
         )}
       </div>
@@ -144,7 +152,9 @@ function FleetCard({
         </>
       ) : (
         <p className="text-[10px] text-hud-muted/50 mt-1">
-          Transponder inactive — no ADS-B signal
+          {seenBefore
+            ? "Transponder inactive - no recent ADS-B signal"
+            : "Awaiting first ADS-B sighting"}
         </p>
       )}
     </motion.button>
@@ -176,76 +186,71 @@ function MiniReadout({
 }
 
 export function FleetStatusGrid() {
+  const [filter, setFilter] = useState<FleetFilter>("all");
   const fleet = useAircraftStore((s) => s.fleet);
   const selectedIcao = useAircraftStore((s) => s.selectedIcao);
   const selectAircraft = useAircraftStore((s) => s.selectAircraft);
 
-  const merged: AircraftTelemetry[] = TRACKED_AIRCRAFT.map((info) => {
-    const live = fleet.get(info.icao);
-    if (live) return live;
-    return {
-      icao: info.icao,
-      callsign: null,
-      reg: info.reg,
-      aircraftType: info.type,
-      aircraftDesc: info.desc,
-      category: null,
-      latitude: null,
-      longitude: null,
-      altitude: null,
-      altGeom: null,
-      groundSpeed: null,
-      ias: null,
-      tas: null,
-      mach: null,
-      heading: null,
-      trueHeading: null,
-      magHeading: null,
-      verticalRate: null,
-      geomRate: null,
-      roll: null,
-      squawk: null,
-      emergency: "none",
-      onGround: false,
-      phase: "UNKNOWN" as AircraftTelemetry["phase"],
-      flightId: null,
-      lastSeen: 0,
-      windDir: null,
-      windSpeed: null,
-      oat: null,
-      tat: null,
-      navQnh: null,
-      navAltMcp: null,
-      navAltFms: null,
-      navHeading: null,
-      navModes: [],
-      originIcao: null,
-      originName: null,
-      destIcao: null,
-      destName: null,
-      walletAddress: null,
-    };
-  });
-
-  const liveFirst = merged.sort((a, b) => {
+  const aircraft = Array.from(fleet.values());
+  const liveFirst = [...aircraft].sort((a, b) => {
     const aLive = isLive(a);
     const bLive = isLive(b);
     if (aLive !== bLive) return aLive ? -1 : 1;
+    const aSeen = hasBeenSeen(a);
+    const bSeen = hasBeenSeen(b);
+    if (aSeen !== bSeen) return aSeen ? -1 : 1;
     return (a.callsign ?? a.icao).localeCompare(b.callsign ?? b.icao);
   });
 
   const liveCount = liveFirst.filter(isLive).length;
+  const offlineCount = Math.max(0, aircraft.length - liveCount);
+  const filteredAircraft = liveFirst.filter((ac) => {
+    if (filter === "live") return isLive(ac);
+    if (filter === "offline") return !isLive(ac);
+    return true;
+  });
 
   const activeBadge = (
     <span className="font-mono text-[10px] text-electric-cyan tabular-nums">
-      {liveCount} / {TRACKED_AIRCRAFT.length} live
+      {liveCount} / {aircraft.length} live
     </span>
   );
 
   return (
     <Panel title="Fleet Status" headerAction={activeBadge}>
+      <div className="mb-3 flex flex-wrap gap-2">
+        <FilterChip
+          label="All"
+          count={aircraft.length}
+          active={filter === "all"}
+          onClick={() => setFilter("all")}
+        />
+        <FilterChip
+          label="Live"
+          count={liveCount}
+          active={filter === "live"}
+          onClick={() => setFilter("live")}
+        />
+        <FilterChip
+          label="Offline"
+          count={offlineCount}
+          active={filter === "offline"}
+          onClick={() => setFilter("offline")}
+        />
+      </div>
+
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3 max-h-[500px] overflow-y-auto pr-1">
-        {liveFirst.map((ac) => (
+        {aircraft.length === 0 && (
+          <div className="sm:col-span-2 xl:col-span-3 rounded-xl border border-panel-border bg-panel-bg/20 px-4 py-8 text-center text-sm text-hud-muted">
+            Loading tracked aircraft...
+          </div>
+        )}
+        {aircraft.length > 0 && filteredAircraft.length === 0 && (
+          <div className="sm:col-span-2 xl:col-span-3 rounded-xl border border-panel-border bg-panel-bg/20 px-4 py-8 text-center text-sm text-hud-muted">
+            No aircraft match the current filter.
+          </div>
+        )}
+        {filteredAircraft.map((ac) => (
           <FleetCard
             key={ac.icao}
             ac={ac}
@@ -257,5 +262,32 @@ export function FleetStatusGrid() {
         ))}
       </div>
     </Panel>
+  );
+}
+
+function FilterChip({
+  label,
+  count,
+  active,
+  onClick,
+}: {
+  label: string;
+  count: number;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={clsx(
+        "rounded-full border px-3 py-1.5 font-mono text-[10px] uppercase tracking-wider transition-colors",
+        active
+          ? "border-electric-cyan/60 bg-electric-cyan/10 text-electric-cyan"
+          : "border-panel-border bg-panel-bg/20 text-hud-muted hover:border-muted-blue/60 hover:text-white",
+      )}
+    >
+      {label} ({count})
+    </button>
   );
 }

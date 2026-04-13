@@ -30,13 +30,25 @@ function StatTile({
   );
 }
 
+function isLiveAircraft(lastSeen: number): boolean {
+  return lastSeen > 0 && Date.now() - lastSeen < 120_000;
+}
+
+function formatTxRate(rate: number): string {
+  if (rate >= 10) return rate.toFixed(1);
+  if (rate >= 1) return rate.toFixed(2);
+  return rate.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
+}
+
 export function AnalyticsCharts() {
   const summary = useBlockchainStore((s) => s.dailySummary);
   const fleet = useAircraftStore((s) => s.fleet);
 
-  const aircraftCount = fleet.size;
-  const airborneCount = Array.from(fleet.values()).filter(
-    (ac) => !ac.onGround,
+  const aircraft = Array.from(fleet.values());
+  const trackedCount = summary.trackedAircraftCount || aircraft.length;
+  const liveCount = aircraft.filter((ac) => isLiveAircraft(ac.lastSeen)).length;
+  const airborneCount = aircraft.filter(
+    (ac) => isLiveAircraft(ac.lastSeen) && !ac.onGround,
   ).length;
 
   const minedCount = summary.minedCount;
@@ -48,11 +60,17 @@ export function AnalyticsCharts() {
     <Panel title="Analytics">
       <div className="space-y-4">
         {/* Fleet overview */}
-        <div className="grid grid-cols-2 gap-2">
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
           <StatTile
-            label="Active Aircraft"
-            value={aircraftCount.toString()}
-            sub={`${airborneCount} airborne`}
+            label="Tracked Aircraft"
+            value={trackedCount.toString()}
+            sub={`${liveCount} live / ${airborneCount} airborne`}
+          />
+          <StatTile
+            label="TX/s"
+            value={formatTxRate(summary.txPerSecond)}
+            sub="rolling 60s avg"
+            colour="text-neon-amber"
           />
           <StatTile
             label="Transactions Today"
@@ -62,7 +80,7 @@ export function AnalyticsCharts() {
         </div>
 
         {/* Blockchain metrics */}
-        <div className="grid grid-cols-3 gap-2">
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
           <StatTile
             label="On-Chain Data"
             value={fmtBytes(summary.totalBytes)}

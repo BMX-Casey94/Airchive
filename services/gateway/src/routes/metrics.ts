@@ -11,8 +11,9 @@ export async function metricsRoutes(app: FastifyInstance): Promise<void> {
     const todayStartMs = new Date();
     todayStartMs.setUTCHours(0, 0, 0, 0);
     const todayEpoch = todayStartMs.getTime();
+    const recentWindowEpoch = Date.now() - 60_000;
 
-    const [txToday, totalBytes, aircraftCount, pendingCount, totalSats, minedToday, failedToday] = await Promise.all([
+    const [txToday, totalBytes, aircraftCount, pendingCount, totalSats, minedToday, failedToday, pendingToday, recentTxCount] = await Promise.all([
       db("tx_results")
         .where("timestamp", ">=", todayEpoch)
         .count("* as total")
@@ -42,11 +43,22 @@ export async function metricsRoutes(app: FastifyInstance): Promise<void> {
         .where("status", "FAILED")
         .count("* as total")
         .first() as Promise<CountRow>,
+      db("tx_results")
+        .where("timestamp", ">=", todayEpoch)
+        .where("status", "SEEN_ON_NETWORK")
+        .count("* as total")
+        .first() as Promise<CountRow>,
+      db("tx_results")
+        .where("timestamp", ">=", recentWindowEpoch)
+        .count("* as total")
+        .first() as Promise<CountRow>,
     ]);
 
     const txTodayNum = Number(txToday?.total ?? 0);
     const minedNum = Number(minedToday?.total ?? 0);
     const failedNum = Number(failedToday?.total ?? 0);
+    const pendingTodayNum = Number(pendingToday?.total ?? 0);
+    const txPerSecond = Number(recentTxCount?.total ?? 0) / 60;
 
     return reply.send({
       success: true,
@@ -57,8 +69,9 @@ export async function metricsRoutes(app: FastifyInstance): Promise<void> {
         active_aircraft: Number(aircraftCount?.total ?? 0),
         pending_writes: Number(pendingCount?.total ?? 0),
         mined_today: minedNum,
-        pending_today: txTodayNum - minedNum - failedNum,
+        pending_today: pendingTodayNum,
         failed_today: failedNum,
+        tx_per_second: txPerSecond,
       },
     });
   });

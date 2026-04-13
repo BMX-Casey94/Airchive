@@ -9,7 +9,7 @@ import { WalletVault } from "@airchive/crypto";
 import { encodeTelemetryPayload, encodeFlightEventPayload } from "@airchive/telemetry-codec";
 import {
   closeDb,
-  getAllAircraft,
+  getAllAircraftConfig,
   getDb,
   insertTxResult,
   unlockAllAircraftUtxos,
@@ -40,20 +40,28 @@ async function main(): Promise<void> {
 
   const db = getDb();
 
-  const dbAircraft = await getAllAircraft(db);
+  const allDbAircraft = await getAllAircraftConfig(db);
+  const dbAircraft = allDbAircraft.filter((ac) => ac.enabled);
   const envIcaos = new Set(config.trackedAircraft);
   const fleetMap = new Map<string, { icao: string; wallet_index: number }>();
+  const existingByIcao = new Map(allDbAircraft.map((ac) => [ac.icao, ac]));
 
+  // Preserve existing wallet indexes so deterministic aircraft wallets never drift between services.
   for (const ac of dbAircraft) {
     fleetMap.set(ac.icao, { icao: ac.icao, wallet_index: ac.wallet_index });
     envIcaos.delete(ac.icao);
   }
 
-  let autoIndex = dbAircraft.length > 0
-    ? Math.max(...dbAircraft.map((a) => a.wallet_index)) + 1
+  let autoIndex = allDbAircraft.length > 0
+    ? Math.max(...allDbAircraft.map((a) => a.wallet_index)) + 1
     : 0;
 
   for (const icao of envIcaos) {
+    const existing = existingByIcao.get(icao);
+    if (existing) {
+      fleetMap.set(icao, { icao, wallet_index: existing.wallet_index });
+      continue;
+    }
     if (!fleetMap.has(icao)) {
       fleetMap.set(icao, { icao, wallet_index: autoIndex++ });
     }
@@ -94,6 +102,7 @@ async function main(): Promise<void> {
     config.refillIdleWindowMs,
   );
   writeBuffer.setAutoRefill(autoRefill);
+  let confirmationPoller: ConfirmationPoller | null = null;
 
   /* ── Startup: unlock stale locks from previous unclean shutdown ── */
   const unlockedAircraft = await unlockAllAircraftUtxos(db);
@@ -134,11 +143,6 @@ async function main(): Promise<void> {
   log.info("Bootstrapping funding UTXO pool");
   await fundingUtxoManager.bootstrap(config.fundingWalletWif).catch((err) =>
     log.error({ err }, "Funding UTXO bootstrap failed"),
-  );
-
-  log.info("Running initial auto-refill check (force=true for bootstrap)");
-  await autoRefill.checkAll(true).catch((err) =>
-    log.error({ err }, "Initial auto-refill failed"),
   );
 
   broadcaster.on("status-update", (payload: ArcCallbackPayload) => {
@@ -277,6 +281,7 @@ async function main(): Promise<void> {
       };
       await insertTxResult(db, txResultRow);
       await publisher.publish("txresult", JSON.stringify(txResultRow)).catch(() => {});
+      confirmationPoller?.nudge();
     } catch (err) {
       await utxoManager.releaseUtxo(utxo.txid, utxo.vout).catch(() => {});
       const payload = encodeTelemetryPayload(telemetry);
@@ -349,6 +354,7 @@ async function main(): Promise<void> {
       };
       await insertTxResult(db, feResultRow);
       await publisher.publish("txresult", JSON.stringify(feResultRow)).catch(() => {});
+      confirmationPoller?.nudge();
     } catch (err) {
       await utxoManager.releaseUtxo(utxo.txid, utxo.vout).catch(() => {});
       const payload = encodeFlightEventPayload(event);
@@ -383,9 +389,14 @@ async function main(): Promise<void> {
   autoRefill.start();
   writeBuffer.startRetryLoop();
 
-  const confirmationPoller = new ConfirmationPoller(db, config.wocApiUrl);
+  confirmationPoller = new ConfirmationPoller(db, config.wocApiUrl);
   confirmationPoller.setRedisPublisher(publisher);
   confirmationPoller.start();
+
+  log.info("Running initial auto-refill check (force=true for bootstrap)");
+  void autoRefill.checkAll(true).catch((err) =>
+    log.error({ err }, "Initial auto-refill failed"),
+  );
 
   startMetricsServer();
 
@@ -413,7 +424,7 @@ async function main(): Promise<void> {
     clearInterval(consolidationInterval);
     autoRefill.stop();
     writeBuffer.stopRetryLoop();
-    confirmationPoller.stop();
+    confirmationPoller?.stop();
 
     try {
       await subscriber.quit();

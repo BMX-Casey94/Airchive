@@ -30,6 +30,7 @@ interface RawTelemetry {
   on_ground?: boolean;
   flight_phase?: string;
   flight_id?: string;
+  ts?: number;
   timestamp?: number;
   [key: string]: unknown;
 }
@@ -281,7 +282,7 @@ export function useWebSocket() {
     function fetchMetrics() {
       fetch(`${API_URL}/api/metrics`)
         .then((r) => r.json())
-        .then((json: { success: boolean; data?: { transactions_today: number; bytes_on_chain_today: number; bsv_cost_today_sats: number; mined_today?: number; pending_today?: number; failed_today?: number } }) => {
+        .then((json: { success: boolean; data?: { transactions_today: number; bytes_on_chain_today: number; bsv_cost_today_sats: number; mined_today?: number; pending_today?: number; failed_today?: number; active_aircraft?: number; tx_per_second?: number } }) => {
           if (json.success && json.data) {
             setDailySummary({
               txCount: json.data.transactions_today,
@@ -290,6 +291,8 @@ export function useWebSocket() {
               minedCount: json.data.mined_today ?? 0,
               pendingCount: json.data.pending_today ?? json.data.transactions_today,
               failedCount: json.data.failed_today ?? 0,
+              trackedAircraftCount: json.data.active_aircraft ?? 0,
+              txPerSecond: json.data.tx_per_second ?? 0,
             });
           }
         })
@@ -298,14 +301,17 @@ export function useWebSocket() {
 
     fetchMetrics();
 
-    function fetchWalletAddresses() {
+    function fetchFleetSnapshot() {
       fetch(`${API_URL}/api/fleet`)
         .then((r) => r.json())
-        .then((json: { success: boolean; data?: Array<{ icao: string; wallet_address?: string | null }> }) => {
+        .then((json: { success: boolean; data?: RawTelemetry[] }) => {
           if (json.success && json.data) {
+            updateFleet(json.data.map(mapTelemetry));
             const mapping: Record<string, string> = {};
             for (const ac of json.data) {
-              if (ac.wallet_address) mapping[ac.icao.toUpperCase()] = ac.wallet_address;
+              if (typeof ac.wallet_address === "string" && ac.wallet_address) {
+                mapping[ac.icao.toUpperCase()] = ac.wallet_address;
+              }
             }
             if (Object.keys(mapping).length > 0) {
               setWalletAddresses(mapping);
@@ -315,10 +321,10 @@ export function useWebSocket() {
         .catch(() => {});
     }
 
-    fetchWalletAddresses();
-    const walletInterval = setInterval(fetchWalletAddresses, 60_000);
+    fetchFleetSnapshot();
+    const walletInterval = setInterval(fetchFleetSnapshot, 60_000);
 
-    const metricsInterval = setInterval(fetchMetrics, 30_000);
+    const metricsInterval = setInterval(fetchMetrics, 10_000);
 
     return () => {
       clearInterval(metricsInterval);
@@ -326,7 +332,7 @@ export function useWebSocket() {
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
       wsRef.current?.close();
     };
-  }, [connect, setDailySummary, setWalletAddresses]);
+  }, [connect, setDailySummary, setWalletAddresses, updateFleet]);
 
   /* ── Subscribe / Unsubscribe ──────────────────────────────── */
 

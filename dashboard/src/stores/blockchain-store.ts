@@ -8,6 +8,8 @@ interface DailySummary {
   minedCount: number;
   pendingCount: number;
   failedCount: number;
+  trackedAircraftCount: number;
+  txPerSecond: number;
 }
 
 interface BlockchainState {
@@ -30,7 +32,16 @@ const MAX_FEED_ENTRIES = 200;
 
 export const useBlockchainStore = create<BlockchainState>((set) => ({
   entries: [],
-  dailySummary: { txCount: 0, totalBytes: 0, totalSats: 0, minedCount: 0, pendingCount: 0, failedCount: 0 },
+  dailySummary: {
+    txCount: 0,
+    totalBytes: 0,
+    totalSats: 0,
+    minedCount: 0,
+    pendingCount: 0,
+    failedCount: 0,
+    trackedAircraftCount: 0,
+    txPerSecond: 0,
+  },
 
   pushEntry: (entry) =>
     set((prev) => {
@@ -58,6 +69,7 @@ export const useBlockchainStore = create<BlockchainState>((set) => ({
       return {
         entries: [...prev.entries, entry].slice(-MAX_FEED_ENTRIES),
         dailySummary: {
+          ...prev.dailySummary,
           txCount: prev.dailySummary.txCount + 1,
           totalBytes: prev.dailySummary.totalBytes + (entry.size_bytes ?? 0),
           totalSats: prev.dailySummary.totalSats + (entry.fee_sats ?? 0),

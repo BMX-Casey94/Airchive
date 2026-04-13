@@ -129,7 +129,7 @@ export interface AircraftConfig {
   reg: string;
   aircraft_type: string;
   wallet_index: number;
-  wallet_address: string;
+  wallet_address?: string | null;
   enabled: boolean;
 }
 

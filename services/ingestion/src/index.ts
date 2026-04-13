@@ -1,7 +1,7 @@
 import { Redis } from "ioredis";
 import { createLogger } from "@airchive/logger";
 import { loadAirports } from "@airchive/airports";
-import { createDb, upsertAircraftConfig } from "@airchive/db";
+import { createDb, getAllAircraftConfig, upsertAircraftConfig } from "@airchive/db";
 import { getConfig } from "./config.js";
 import { PhaseEngine } from "./phase-engine.js";
 import { fetchOpenSky } from "./clients/opensky.js";
@@ -100,18 +100,41 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  for (let i = 0; i < trackedAircraft.length; i++) {
-    const icao = trackedAircraft[i]!;
+  const allDbAircraft = await getAllAircraftConfig(db);
+  const fleetMap = new Map<string, { icao: string; wallet_index: number }>();
+  const existingByIcao = new Map(allDbAircraft.map((ac) => [ac.icao, ac]));
+
+  // Preserve existing wallet indexes so HD-derived aircraft addresses stay stable across restarts.
+  for (const ac of allDbAircraft) {
+    if (ac.enabled) {
+      fleetMap.set(ac.icao, { icao: ac.icao, wallet_index: ac.wallet_index });
+    }
+  }
+
+  let autoIndex = allDbAircraft.length > 0
+    ? Math.max(...allDbAircraft.map((a) => a.wallet_index)) + 1
+    : 0;
+
+  for (const icao of trackedAircraft) {
+    const existing = existingByIcao.get(icao);
+    if (existing) {
+      fleetMap.set(icao, { icao, wallet_index: existing.wallet_index });
+      continue;
+    }
+    fleetMap.set(icao, { icao, wallet_index: autoIndex++ });
+  }
+
+  for (const aircraft of fleetMap.values()) {
     await upsertAircraftConfig(db, {
-      icao,
-      callsign: icao,
+      icao: aircraft.icao,
+      callsign: aircraft.icao,
       reg: "",
       aircraft_type: "",
-      wallet_index: i,
+      wallet_index: aircraft.wallet_index,
       enabled: true,
     });
   }
-  log.info({ count: trackedAircraft.length }, "aircraft_config rows ensured");
+  log.info({ count: fleetMap.size }, "aircraft_config rows ensured");
 
   const publisher = new TelemetryPublisher(redis);
   const dedup = new DedupFilter();

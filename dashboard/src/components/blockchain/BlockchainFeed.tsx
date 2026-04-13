@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import { motion, AnimatePresence } from "framer-motion";
 import clsx from "clsx";
 import { useBlockchainStore } from "@/stores/blockchain-store";
 import { RecordType } from "@/types/airchive";
@@ -13,12 +12,23 @@ export default function BlockchainFeed() {
   const entries = useBlockchainStore((s) => s.entries);
   const summary = useBlockchainStore((s) => s.dailySummary);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
+  const stickToBottomRef = useRef(true);
 
   useEffect(() => {
+    if (!stickToBottomRef.current) return;
+    const frame = requestAnimationFrame(() => {
+      bottomRef.current?.scrollIntoView({ block: "end" });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [entries.length]);
+
+  function handleScroll(): void {
     const el = scrollRef.current;
     if (!el) return;
-    el.scrollTop = el.scrollHeight;
-  }, [entries.length]);
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    stickToBottomRef.current = distanceFromBottom < 48;
+  }
 
   const summaryBadge = (
     <span className="font-mono text-[10px] text-hud-muted tabular-nums">
@@ -34,19 +44,20 @@ export default function BlockchainFeed() {
     <Panel title="Blockchain Feed" headerAction={summaryBadge}>
       <div
         ref={scrollRef}
+        onScroll={handleScroll}
         className="max-h-[420px] overflow-y-auto -mx-4 -mb-4 px-4 pb-4"
       >
-        <AnimatePresence initial={false}>
-          {entries.map((entry) => (
-            <FeedRow key={entry.txid} entry={entry} />
-          ))}
-        </AnimatePresence>
+        {entries.map((entry) => (
+          <FeedRow key={entry.txid} entry={entry} />
+        ))}
 
         {entries.length === 0 && (
           <div className="flex items-center justify-center py-12 text-hud-muted text-sm">
             Awaiting blockchain transactions…
           </div>
         )}
+
+        <div ref={bottomRef} className="h-px" />
       </div>
     </Panel>
   );
@@ -58,11 +69,7 @@ function FeedRow({ entry }: { entry: BlockchainEntry }) {
   const isFailed = entry.status === "FAILED";
 
   return (
-    <motion.div
-      initial={{ opacity: 0, x: -24 }}
-      animate={{ opacity: 1, x: 0 }}
-      exit={{ opacity: 0, x: -12 }}
-      transition={{ type: "spring", stiffness: 300, damping: 30 }}
+    <div
       className={clsx(
         "flex items-center gap-3 py-2 border-b border-panel-border last:border-b-0",
         isFlightEvent && "bg-neon-amber/5 -mx-4 px-4",
@@ -126,6 +133,6 @@ function FeedRow({ entry }: { entry: BlockchainEntry }) {
         />
         {entry.status === "SEEN_ON_NETWORK" ? "SEEN" : entry.status}
       </span>
-    </motion.div>
+    </div>
   );
 }

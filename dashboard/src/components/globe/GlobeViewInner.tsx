@@ -9,7 +9,11 @@ import type { AircraftState } from "@/types/dashboard";
 const CESIUM_TOKEN = process.env.NEXT_PUBLIC_CESIUM_ION_TOKEN ?? "";
 
 const ALT_EXAGGERATION = 6;
-const AUTO_ROTATE_SPEED = 0.05;
+const AUTO_ROTATE_SPEED = 0.025;
+const AIRCRAFT_ICON_URL = "/250px-White_plane_icon.svg.png";
+const AIRCRAFT_ICON_SIZE = 22;
+const AIRCRAFT_ICON_SIZE_SELECTED = 28;
+const AIRCRAFT_LABEL_OFFSET_Y = -20;
 const FLY_TO_ALTITUDE = 800_000;
 
 type CesiumNs = typeof import("cesium");
@@ -23,6 +27,17 @@ function aircraftColour(
   }
   if (ac.onGround) return Cesium.Color.fromCssColorString("#FFB800");
   return Cesium.Color.fromCssColorString("#00F5FF");
+}
+
+function aircraftIconSize(isSelected: boolean): number {
+  return isSelected ? AIRCRAFT_ICON_SIZE_SELECTED : AIRCRAFT_ICON_SIZE;
+}
+
+const IMAGE_HEADING_OFFSET_RAD = Math.PI / 2;
+
+/** Convert aviation track (0°=N, CW) to Cesium billboard rotation (CCW, radians). */
+function trackToRotation(trackDeg: number): number {
+  return -(trackDeg * Math.PI) / 180 + IMAGE_HEADING_OFFSET_RAD;
 }
 
 function GlobeFallback({ reason }: { reason: string }) {
@@ -229,6 +244,8 @@ export default function GlobeViewInner() {
 
         const colour = aircraftColour(C, ac);
         const isSelected = selectedIcao === ac.icao;
+        const iconSize = aircraftIconSize(isSelected);
+        const rotation = trackToRotation(ac.track);
         const position = C.Cartesian3.fromDegrees(
           ac.lon,
           ac.lat,
@@ -238,19 +255,43 @@ export default function GlobeViewInner() {
         let entity = v.entities.getById(ac.icao);
         if (entity) {
           (entity.position as import("cesium").ConstantPositionProperty).setValue(position);
-          entity.point!.pixelSize = new C.ConstantProperty(isSelected ? 14 : 10) as unknown as import("cesium").Property;
-          entity.point!.color = new C.ConstantProperty(colour) as unknown as import("cesium").Property;
+          if (!entity.billboard) {
+            entity.billboard = new C.BillboardGraphics({
+              image: AIRCRAFT_ICON_URL,
+              width: iconSize,
+              height: iconSize,
+              color: colour,
+              rotation,
+              alignedAxis: C.Cartesian3.UNIT_Z,
+              horizontalOrigin: C.HorizontalOrigin.CENTER,
+              verticalOrigin: C.VerticalOrigin.CENTER,
+              disableDepthTestDistance: Number.POSITIVE_INFINITY,
+            });
+            entity.point = undefined;
+          } else {
+            entity.billboard.width = new C.ConstantProperty(iconSize) as unknown as import("cesium").Property;
+            entity.billboard.height = new C.ConstantProperty(iconSize) as unknown as import("cesium").Property;
+            entity.billboard.color = new C.ConstantProperty(colour) as unknown as import("cesium").Property;
+            entity.billboard.rotation = new C.ConstantProperty(rotation) as unknown as import("cesium").Property;
+          }
           entity.label!.text = new C.ConstantProperty(ac.callsign || ac.icao) as unknown as import("cesium").Property;
           entity.label!.fillColor = new C.ConstantProperty(colour) as unknown as import("cesium").Property;
+          entity.label!.pixelOffset = new C.ConstantProperty(
+            new C.Cartesian2(0, AIRCRAFT_LABEL_OFFSET_Y),
+          ) as unknown as import("cesium").Property;
         } else {
           v.entities.add({
             id: ac.icao,
             position,
-            point: {
-              pixelSize: isSelected ? 14 : 10,
+            billboard: {
+              image: AIRCRAFT_ICON_URL,
+              width: iconSize,
+              height: iconSize,
               color: colour,
-              outlineColor: C.Color.BLACK,
-              outlineWidth: 1,
+              rotation,
+              alignedAxis: C.Cartesian3.UNIT_Z,
+              horizontalOrigin: C.HorizontalOrigin.CENTER,
+              verticalOrigin: C.VerticalOrigin.CENTER,
               disableDepthTestDistance: Number.POSITIVE_INFINITY,
             },
             label: {
@@ -261,7 +302,7 @@ export default function GlobeViewInner() {
               outlineWidth: 3,
               style: C.LabelStyle.FILL_AND_OUTLINE,
               verticalOrigin: C.VerticalOrigin.BOTTOM,
-              pixelOffset: new C.Cartesian2(0, -16),
+              pixelOffset: new C.Cartesian2(0, AIRCRAFT_LABEL_OFFSET_Y),
               showBackground: true,
               backgroundColor: C.Color.BLACK.withAlpha(0.6),
               disableDepthTestDistance: Number.POSITIVE_INFINITY,

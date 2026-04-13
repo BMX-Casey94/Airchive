@@ -6,6 +6,7 @@ import {
 } from "./metrics.js";
 import type { CollectorAgent } from "./collector-agent.js";
 import type { AgentActivityPublisher } from "./activity-publisher.js";
+import { identityRegistryUnavailable } from "./identity-utils.js";
 
 const log = createLogger({ service: "monitor-agent" });
 
@@ -60,7 +61,11 @@ export class MonitorAgent {
         "Registered identity tag: airchive-monitor",
       );
     } catch (err) {
-      log.warn({ err }, "Identity tag registration failed (may already exist)");
+      if (identityRegistryUnavailable(err)) {
+        log.info("Identity registry unavailable — skipping monitor tag registration");
+      } else {
+        log.warn({ err }, "Identity tag registration failed (may already exist)");
+      }
     }
 
     await this.discoverCollector();
@@ -114,7 +119,11 @@ export class MonitorAgent {
       }
     } catch (err) {
       this.collectorKey = this.collector.getIdentityKey();
-      log.warn({ err }, "Identity lookup failed — using direct collector reference");
+      if (identityRegistryUnavailable(err)) {
+        log.info("Identity registry unavailable — using direct collector reference");
+      } else {
+        log.warn({ err }, "Identity lookup failed — using direct collector reference");
+      }
     }
   }
 

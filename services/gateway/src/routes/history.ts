@@ -17,7 +17,7 @@ export async function historyRoutes(app: FastifyInstance): Promise<void> {
       .orderBy("timestamp", "desc")
       .limit(limit);
 
-    const normalised = rows.map((r: Record<string, unknown>) => ({
+    const normalised = rows.map((r) => ({
       ...r,
       timestamp: Number(r.timestamp),
       fee_sats: Number(r.fee_sats),

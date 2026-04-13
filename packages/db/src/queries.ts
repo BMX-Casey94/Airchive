@@ -433,24 +433,46 @@ export async function getAircraftConfig(
   return db("aircraft_config").where({ icao }).first();
 }
 
+export async function getAllAircraftConfig(db: Knex): Promise<DbAircraftConfigRow[]> {
+  return db("aircraft_config")
+    .orderBy("wallet_index", "asc")
+    .orderBy("icao", "asc");
+}
+
 export async function getAllAircraft(db: Knex): Promise<DbAircraftConfigRow[]> {
-  return db("aircraft_config").where({ enabled: true }).orderBy("icao", "asc");
+  return db("aircraft_config")
+    .where({ enabled: true })
+    .orderBy("wallet_index", "asc")
+    .orderBy("icao", "asc");
 }
 
 export async function upsertAircraftConfig(
   db: Knex,
   config: AircraftConfig,
 ): Promise<void> {
+  const insertRow: Record<string, string | number | boolean | null> = {
+    icao: config.icao,
+    callsign: config.callsign,
+    reg: config.reg,
+    aircraft_type: config.aircraft_type,
+    wallet_index: config.wallet_index,
+    enabled: config.enabled,
+  };
+  const mergeRow: Record<string, string | number | boolean | null> = {
+    callsign: config.callsign,
+    reg: config.reg,
+    aircraft_type: config.aircraft_type,
+    wallet_index: config.wallet_index,
+    enabled: config.enabled,
+  };
+
+  if (config.wallet_address !== undefined) {
+    insertRow.wallet_address = config.wallet_address;
+    mergeRow.wallet_address = config.wallet_address;
+  }
+
   await db("aircraft_config")
-    .insert({
-      icao: config.icao,
-      callsign: config.callsign,
-      reg: config.reg,
-      aircraft_type: config.aircraft_type,
-      wallet_index: config.wallet_index,
-      wallet_address: config.wallet_address,
-      enabled: config.enabled,
-    })
+    .insert(insertRow)
     .onConflict("icao")
-    .merge();
+    .merge(mergeRow);
 }
