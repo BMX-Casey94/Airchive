@@ -22,8 +22,13 @@ interface WocUtxo {
 }
 
 const MIN_USABLE_SATS = 120;
+const ORPHAN_SPEND_COOLDOWN_MS = 15_000;
+const CHAIN_PROPAGATION_COOLDOWN_MS = 10_000;
+const REFILL_PROPAGATION_COOLDOWN_MS = 20_000;
 
 export class UtxoManager {
+  private readonly spendBackoffUntil = new Map<string, number>();
+
   constructor(
     private readonly db: Knex,
     private readonly wocApiUrl: string,
@@ -81,6 +86,12 @@ export class UtxoManager {
   }
 
   async acquireUtxo(icao: string): Promise<UTXORecord> {
+    const key = icao.toUpperCase();
+    const backoffUntil = this.spendBackoffUntil.get(key) ?? 0;
+    if (Date.now() < backoffUntil) {
+      throw new Error(`UTXO spend cooling down for aircraft ${key}`);
+    }
+
     return this.db.transaction(async (trx) => {
       const utxo = await trx("utxo_pool")
         .where({ aircraft_icao: icao, is_locked: false })
@@ -100,6 +111,16 @@ export class UtxoManager {
 
       return utxo;
     });
+  }
+
+  delaySpendRetries(
+    icao: string,
+    ms = ORPHAN_SPEND_COOLDOWN_MS,
+    reason = "dependency pending",
+  ): void {
+    const key = icao.toUpperCase();
+    this.setSpendBackoff(key, ms);
+    log.info({ icao: key, cooldownMs: ms, reason }, "Deferring aircraft UTXO reuse");
   }
 
   async releaseUtxo(txid: string, vout: number): Promise<void> {
@@ -146,6 +167,7 @@ export class UtxoManager {
       }
     });
 
+    this.deferFreshOutputReuse(icao, CHAIN_PROPAGATION_COOLDOWN_MS);
     await this.refreshMetrics(icao);
   }
 
@@ -163,6 +185,7 @@ export class UtxoManager {
       satoshis,
       locking_script: lockingScript,
     });
+    this.deferFreshOutputReuse(icao, REFILL_PROPAGATION_COOLDOWN_MS);
     await this.refreshMetrics(icao);
   }
 
@@ -264,6 +287,17 @@ export class UtxoManager {
     }
     // Strip version byte (1) and checksum (4), return 20-byte pubkey hash
     return bytes.slice(1, 21);
+  }
+
+  private deferFreshOutputReuse(icao: string, ms: number): void {
+    this.setSpendBackoff(icao, ms);
+  }
+
+  private setSpendBackoff(icao: string, ms: number): void {
+    const key = icao.toUpperCase();
+    const nextUntil = Date.now() + ms;
+    const currentUntil = this.spendBackoffUntil.get(key) ?? 0;
+    this.spendBackoffUntil.set(key, Math.max(currentUntil, nextUntil));
   }
 
   private async refreshMetrics(icao: string): Promise<void> {

@@ -1,15 +1,23 @@
 import type { Knex } from "knex";
 import type { Redis } from "ioredis";
 import type { RecordType } from "@airchive/types";
+import { RecordType as RecordTypeEnum } from "@airchive/types";
 import type { WalletVault } from "@airchive/crypto";
 import {
+  coalescePendingTelemetryWrites,
   deletePendingWrite,
+  getPendingWriteCount,
   getPendingWrites,
   insertPendingWrite,
+  markWriteDeferred,
   markWriteRetried,
+  upsertPendingTelemetryWrite,
 } from "@airchive/db";
 import { createLogger } from "@airchive/logger";
-import type { ArcBroadcaster } from "./broadcaster.js";
+import {
+  isDependencyPendingBroadcastFailure,
+  type ArcBroadcaster,
+} from "./broadcaster.js";
 import type { UtxoManager } from "./utxo-manager.js";
 import { buildRawOpReturnTx } from "./tx-builder.js";
 import { insertTxResult } from "@airchive/db";
@@ -18,8 +26,14 @@ import type { AutoRefillMonitor } from "./auto-refill.js";
 
 const log = createLogger({ service: "blockchain-writer:write-buffer" });
 
-const RETRY_INTERVAL_MS = 30_000;
-const RETRY_BATCH_SIZE = 50;
+const RETRY_INTERVAL_MS = 5_000;
+const RETRY_BATCH_SIZE = 100;
+
+function isTransientWriteDeferral(message: string): boolean {
+  return message.includes("Broadcast dependency pending")
+    || message.includes("UTXO spend cooling down")
+    || message.includes("No available UTXOs");
+}
 
 export class WriteBuffer {
   private intervalId: ReturnType<typeof setInterval> | null = null;
@@ -48,6 +62,20 @@ export class WriteBuffer {
     payload: Uint8Array,
     flightId?: string,
   ): Promise<void> {
+    if (recordType === RecordTypeEnum.TELEMETRY) {
+      const result = await upsertPendingTelemetryWrite(this.db, {
+        aircraft_icao: icao,
+        record_type: recordType,
+        payload: Buffer.from(payload),
+        flight_id: flightId,
+      });
+      if (result === "inserted") {
+        pendingWritesGauge.inc();
+      }
+      log.debug({ icao, recordType, mode: result }, "Telemetry write buffered for retry");
+      return;
+    }
+
     await insertPendingWrite(this.db, {
       aircraft_icao: icao,
       record_type: recordType,
@@ -66,7 +94,19 @@ export class WriteBuffer {
       void this.retry();
     }, RETRY_INTERVAL_MS);
 
+    void this.syncPendingGauge().catch((err) =>
+      log.warn({ err }, "Pending write gauge sync failed"),
+    );
     log.info({ intervalMs: RETRY_INTERVAL_MS }, "Write-buffer retry loop started");
+  }
+
+  async coalesceTelemetryBacklog(): Promise<number> {
+    const removed = await coalescePendingTelemetryWrites(this.db);
+    if (removed > 0) {
+      await this.syncPendingGauge();
+      log.info({ removed }, "Coalesced superseded telemetry writes from retry backlog");
+    }
+    return removed;
   }
 
   stopRetryLoop(): void {
@@ -86,7 +126,9 @@ export class WriteBuffer {
       if (pending.length === 0) return 0;
 
       const failedByIcao = new Map<string, number>();
+      const deferredByIcao = new Map<string, number>();
       const noUtxoIcaos = new Set<string>();
+      let deferredCount = 0;
 
       for (const write of pending) {
         const icao = write.aircraft_icao;
@@ -95,8 +137,9 @@ export class WriteBuffer {
         let utxoVout = 0;
 
         if (noUtxoIcaos.has(icao)) {
-          await markWriteRetried(this.db, write.id, "No available UTXOs").catch(() => {});
-          failedByIcao.set(icao, (failedByIcao.get(icao) ?? 0) + 1);
+          await markWriteDeferred(this.db, write.id, "No available UTXOs").catch(() => {});
+          deferredByIcao.set(icao, (deferredByIcao.get(icao) ?? 0) + 1);
+          deferredCount++;
           continue;
         }
 
@@ -124,9 +167,13 @@ export class WriteBuffer {
           const result = await this.broadcaster.broadcast(tx, icao);
 
           if (result.status === "FAILED") {
+            if (isDependencyPendingBroadcastFailure(result)) {
+              this.utxoManager.delaySpendRetries(icao, undefined, result.code);
+              throw new Error(`Broadcast dependency pending: ${result.code ?? "unknown"}`);
+            }
             await this.utxoManager.deleteStaleUtxo(utxo.txid, utxo.vout).catch(() => {});
             utxoAcquired = false;
-            throw new Error("Broadcast returned FAILED status");
+            throw new Error(`Broadcast returned FAILED status: ${result.code ?? "unknown"}`);
           }
 
           const txid = result.txid;
@@ -170,21 +217,31 @@ export class WriteBuffer {
             this.autoRefill?.requestRefill(icao);
           }
 
-          await markWriteRetried(this.db, write.id, msg).catch(() => {});
-          failedByIcao.set(icao, (failedByIcao.get(icao) ?? 0) + 1);
+          if (isTransientWriteDeferral(msg)) {
+            await markWriteDeferred(this.db, write.id, msg).catch(() => {});
+            deferredByIcao.set(icao, (deferredByIcao.get(icao) ?? 0) + 1);
+            deferredCount++;
+          } else {
+            await markWriteRetried(this.db, write.id, msg).catch(() => {});
+            failedByIcao.set(icao, (failedByIcao.get(icao) ?? 0) + 1);
+          }
         }
       }
 
-      if (successCount > 0 || failedByIcao.size > 0) {
+      if (successCount > 0 || failedByIcao.size > 0 || deferredByIcao.size > 0) {
         const failSummary: Record<string, number> = {};
         for (const [icao, count] of failedByIcao) failSummary[icao] = count;
+        const deferredSummary: Record<string, number> = {};
+        for (const [icao, count] of deferredByIcao) deferredSummary[icao] = count;
 
         log.info(
           {
             attempted: pending.length,
             succeeded: successCount,
-            failed: pending.length - successCount,
+            deferred: deferredCount,
+            failed: pending.length - successCount - deferredCount,
             ...(failedByIcao.size > 0 ? { failedByAircraft: failSummary } : {}),
+            ...(deferredByIcao.size > 0 ? { deferredByAircraft: deferredSummary } : {}),
             ...(noUtxoIcaos.size > 0 ? { refillRequested: Array.from(noUtxoIcaos) } : {}),
           },
           "Write-buffer retry cycle complete",
@@ -197,5 +254,10 @@ export class WriteBuffer {
     }
 
     return successCount;
+  }
+
+  private async syncPendingGauge(): Promise<void> {
+    const count = await getPendingWriteCount(this.db);
+    pendingWritesGauge.set(count);
   }
 }

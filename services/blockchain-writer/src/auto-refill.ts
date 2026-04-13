@@ -2,7 +2,10 @@ import { P2PKH, PrivateKey } from "@bsv/sdk";
 import { createLogger } from "@airchive/logger";
 import type { WalletVault } from "@airchive/crypto";
 import type { Config } from "./config.js";
-import type { ArcBroadcaster } from "./broadcaster.js";
+import {
+  isDependencyPendingBroadcastFailure,
+  type ArcBroadcaster,
+} from "./broadcaster.js";
 import type { UtxoManager } from "./utxo-manager.js";
 import type { FundingUtxoManager } from "./funding-utxo-manager.js";
 import { buildRefillTx, derivePubKeyHash } from "./tx-builder.js";
@@ -13,6 +16,12 @@ const CHECK_INTERVAL_MS = 5 * 60 * 1_000;
 const DEFAULT_IDLE_WINDOW_MS = 30 * 60 * 1_000;
 const REFILL_COOLDOWN_MS = 30_000;
 const TREASURY_FAILURE_COOLDOWN_MS = 60_000;
+const ORPHAN_MEMPOOL_COOLDOWN_MS = 20_000;
+const SERIAL_REFILL_GAP_MS = 1_000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 export class AutoRefillMonitor {
   private intervalId: ReturnType<typeof setInterval> | null = null;
@@ -21,6 +30,7 @@ export class AutoRefillMonitor {
   private readonly idleWindowMs: number;
   private readonly refillCooldowns = new Map<string, number>();
   private treasuryFailedAt = 0;
+  private refillSerialTail: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly config: Config,
@@ -59,7 +69,8 @@ export class AutoRefillMonitor {
     }
 
     this.pendingRefills.add(key);
-    void this.checkAndRefill(key, true).finally(() => this.pendingRefills.delete(key));
+    void this.runSerialRefill(() => this.checkAndRefill(key, true))
+      .finally(() => this.pendingRefills.delete(key));
   }
 
   start(): void {
@@ -103,7 +114,7 @@ export class AutoRefillMonitor {
         }
         this.pendingRefills.add(key);
         try {
-          const result = await this.checkAndRefill(aircraft.icao, force);
+          const result = await this.runSerialRefill(() => this.checkAndRefill(aircraft.icao, force));
           if (result === "refilled") refilled++;
           else if (result === "skipped_idle") skippedIdle++;
           else sufficientBalance++;
@@ -185,9 +196,18 @@ export class AutoRefillMonitor {
 
         const result = await this.broadcaster.broadcast(tx, icao);
         if (result.status === "FAILED") {
-          log.error({ icao }, "Refill broadcast failed");
+          if (isDependencyPendingBroadcastFailure(result)) {
+            log.info({ icao, code: result.code }, "Refill dependency not yet propagated; backing off");
+            await this.fundingUtxoManager.release(fundingUtxo.txid.trim(), fundingUtxo.vout);
+            this.refillCooldowns.set(icao.toUpperCase(), Date.now() + ORPHAN_MEMPOOL_COOLDOWN_MS);
+            this.treasuryFailedAt = Date.now();
+            await sleep(SERIAL_REFILL_GAP_MS);
+            return "skipped_idle";
+          }
+          log.error({ icao, code: result.code }, "Refill broadcast failed");
           await this.fundingUtxoManager.deleteStale(fundingUtxo.txid.trim(), fundingUtxo.vout);
           this.refillCooldowns.set(icao.toUpperCase(), Date.now() + REFILL_COOLDOWN_MS);
+          await sleep(SERIAL_REFILL_GAP_MS);
           return "skipped_idle";
         }
 
@@ -214,6 +234,7 @@ export class AutoRefillMonitor {
           { icao, txid, amount: refillAmount, changeReturned: changeSats > 0 },
           "Refill transaction broadcast (local funding pool)",
         );
+        await sleep(SERIAL_REFILL_GAP_MS);
         return "refilled";
       } catch (err) {
         await this.fundingUtxoManager.release(fundingUtxo.txid.trim(), fundingUtxo.vout);
@@ -223,6 +244,21 @@ export class AutoRefillMonitor {
       log.error({ err, icao }, "Refill failed");
       this.refillCooldowns.set(icao.toUpperCase(), Date.now() + REFILL_COOLDOWN_MS);
       return "skipped_idle";
+    }
+  }
+
+  private async runSerialRefill<T>(op: () => Promise<T>): Promise<T> {
+    const previous = this.refillSerialTail;
+    let release = () => {};
+    this.refillSerialTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    await previous;
+    try {
+      return await op();
+    } finally {
+      release();
     }
   }
 }

@@ -1,6 +1,5 @@
 "use client";
 
-import { useEffect, useRef } from "react";
 import clsx from "clsx";
 import { useBlockchainStore } from "@/stores/blockchain-store";
 import { RecordType } from "@/types/airchive";
@@ -11,24 +10,7 @@ import Panel from "@/components/ui/Panel";
 export default function BlockchainFeed() {
   const entries = useBlockchainStore((s) => s.entries);
   const summary = useBlockchainStore((s) => s.dailySummary);
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const bottomRef = useRef<HTMLDivElement>(null);
-  const stickToBottomRef = useRef(true);
-
-  useEffect(() => {
-    if (!stickToBottomRef.current) return;
-    const frame = requestAnimationFrame(() => {
-      bottomRef.current?.scrollIntoView({ block: "end" });
-    });
-    return () => cancelAnimationFrame(frame);
-  }, [entries.length]);
-
-  function handleScroll(): void {
-    const el = scrollRef.current;
-    if (!el) return;
-    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-    stickToBottomRef.current = distanceFromBottom < 48;
-  }
+  const visibleEntries = entries.slice(-36);
 
   const summaryBadge = (
     <span className="font-mono text-[10px] text-hud-muted tabular-nums">
@@ -42,22 +24,26 @@ export default function BlockchainFeed() {
 
   return (
     <Panel title="Blockchain Feed" headerAction={summaryBadge}>
-      <div
-        ref={scrollRef}
-        onScroll={handleScroll}
-        className="max-h-[420px] overflow-y-auto -mx-4 -mb-4 px-4 pb-4"
-      >
-        {entries.map((entry) => (
-          <FeedRow key={entry.txid} entry={entry} />
-        ))}
+      <div className="relative -mx-4 -mb-4 h-[420px] overflow-hidden px-4 pb-4">
+        <div className="pointer-events-none absolute inset-x-0 top-0 h-10 bg-gradient-to-b from-panel-bg via-panel-bg/80 to-transparent" />
+        <div className="flex min-h-full flex-col justify-end">
+          {visibleEntries.map((entry) => (
+            <FeedRow key={entry.txid} entry={entry} />
+          ))}
 
-        {entries.length === 0 && (
-          <div className="flex items-center justify-center py-12 text-hud-muted text-sm">
-            Awaiting blockchain transactions…
+          {visibleEntries.length === 0 && (
+            <div className="flex h-full items-center justify-center py-12 text-hud-muted text-sm">
+              Awaiting blockchain transactions…
+            </div>
+          )}
+        </div>
+        {entries.length > visibleEntries.length && (
+          <div className="pointer-events-none absolute inset-x-0 top-0 px-4 pt-2">
+            <div className="inline-flex rounded-full border border-panel-border bg-space-black/80 px-2 py-1 font-mono text-[9px] text-hud-muted backdrop-blur">
+              Live view showing latest {visibleEntries.length} transactions
+            </div>
           </div>
         )}
-
-        <div ref={bottomRef} className="h-px" />
       </div>
     </Panel>
   );

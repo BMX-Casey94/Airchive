@@ -18,7 +18,12 @@ import {
 } from "@airchive/db";
 import { createLogger } from "@airchive/logger";
 import { loadConfig } from "./config.js";
-import { ArcBroadcaster, type ArcCallbackPayload } from "./broadcaster.js";
+import {
+  ArcBroadcaster,
+  isDependencyPendingBroadcastFailure,
+  type ArcCallbackPayload,
+  type BroadcastOutcome,
+} from "./broadcaster.js";
 import { UtxoManager } from "./utxo-manager.js";
 import { FundingUtxoManager } from "./funding-utxo-manager.js";
 import { AutoRefillMonitor } from "./auto-refill.js";
@@ -31,6 +36,32 @@ const log = createLogger({ service: "blockchain-writer" });
 
 const CONSOLIDATION_INTERVAL_MS = 24 * 60 * 60 * 1_000;
 const METRICS_PORT = Number(process.env.METRICS_PORT ?? "9091");
+
+function shouldRequestRefillForAcquireError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err ?? "");
+  return message.includes("No available UTXOs");
+}
+
+function isHandledBackpressureError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err ?? "");
+  return message.includes("Broadcast dependency pending")
+    || message.includes("UTXO spend cooling down");
+}
+
+async function handleFailedAircraftBroadcast(
+  icao: string,
+  utxoManager: UtxoManager,
+  utxo: { txid: string; vout: number },
+  result: BroadcastOutcome,
+): Promise<Error> {
+  if (isDependencyPendingBroadcastFailure(result)) {
+    utxoManager.delaySpendRetries(icao, undefined, result.code);
+    return new Error(`Broadcast dependency pending: ${result.code ?? "unknown"}`);
+  }
+
+  await utxoManager.deleteStaleUtxo(utxo.txid, utxo.vout).catch(() => {});
+  return new Error(`Broadcast returned FAILED status: ${result.code ?? "unknown"}`);
+}
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -138,6 +169,9 @@ async function main(): Promise<void> {
   if (stalePurged > 0) {
     log.info({ purged: stalePurged }, "Purged stale pending writes (retry_count >= 10)");
   }
+  await writeBuffer.coalesceTelemetryBacklog().catch((err) =>
+    log.error({ err }, "Telemetry backlog coalescing failed"),
+  );
 
   /* ── Bootstrap funding/treasury UTXO pool ── */
   log.info("Bootstrapping funding UTXO pool");
@@ -233,8 +267,10 @@ async function main(): Promise<void> {
 
     try {
       utxo = await utxoManager.acquireUtxo(icao);
-    } catch {
-      autoRefill.requestRefill(icao);
+    } catch (err) {
+      if (shouldRequestRefillForAcquireError(err)) {
+        autoRefill.requestRefill(icao);
+      }
       const payload = encodeTelemetryPayload(telemetry);
       await writeBuffer.buffer(icao, RecordType.TELEMETRY, payload, telemetry.flight_id);
       return;
@@ -251,9 +287,7 @@ async function main(): Promise<void> {
       const result = await broadcaster.broadcast(tx, icao);
 
       if (result.status === "FAILED") {
-        // UTXO was likely already spent on-chain (double-spend) — purge it
-        await utxoManager.deleteStaleUtxo(utxo.txid, utxo.vout).catch(() => {});
-        throw new Error("Broadcast returned FAILED");
+        throw await handleFailedAircraftBroadcast(icao, utxoManager, utxo, result);
       }
 
       const txid = result.txid;
@@ -288,7 +322,11 @@ async function main(): Promise<void> {
       await writeBuffer
         .buffer(icao, RecordType.TELEMETRY, payload, telemetry.flight_id)
         .catch(() => {});
-      log.error({ err, icao }, "Telemetry write failed");
+      if (isHandledBackpressureError(err)) {
+        log.warn({ err, icao }, "Telemetry write deferred");
+      } else {
+        log.error({ err, icao }, "Telemetry write failed");
+      }
     }
   }
 
@@ -309,8 +347,10 @@ async function main(): Promise<void> {
 
     try {
       utxo = await utxoManager.acquireUtxo(icao);
-    } catch {
-      autoRefill.requestRefill(icao);
+    } catch (err) {
+      if (shouldRequestRefillForAcquireError(err)) {
+        autoRefill.requestRefill(icao);
+      }
       const payload = encodeFlightEventPayload(event);
       await writeBuffer.buffer(icao, RecordType.FLIGHT_EVENT, payload, event.flight_id);
       return;
@@ -326,8 +366,7 @@ async function main(): Promise<void> {
       const result = await broadcaster.broadcast(tx, icao);
 
       if (result.status === "FAILED") {
-        await utxoManager.deleteStaleUtxo(utxo.txid, utxo.vout).catch(() => {});
-        throw new Error("Broadcast returned FAILED");
+        throw await handleFailedAircraftBroadcast(icao, utxoManager, utxo, result);
       }
 
       const txid = result.txid;
@@ -361,7 +400,11 @@ async function main(): Promise<void> {
       await writeBuffer
         .buffer(icao, RecordType.FLIGHT_EVENT, payload, event.flight_id)
         .catch(() => {});
-      log.error({ err, icao }, "Flight-event write failed");
+      if (isHandledBackpressureError(err)) {
+        log.warn({ err, icao }, "Flight-event write deferred");
+      } else {
+        log.error({ err, icao }, "Flight-event write failed");
+      }
     }
   }
 
@@ -393,8 +436,8 @@ async function main(): Promise<void> {
   confirmationPoller.setRedisPublisher(publisher);
   confirmationPoller.start();
 
-  log.info("Running initial auto-refill check (force=true for bootstrap)");
-  void autoRefill.checkAll(true).catch((err) =>
+  log.info("Running initial auto-refill check (activity-aware bootstrap)");
+  void autoRefill.checkAll(false).catch((err) =>
     log.error({ err }, "Initial auto-refill failed"),
   );
 

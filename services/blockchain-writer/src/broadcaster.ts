@@ -1,7 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { EventEmitter } from "node:events";
 import { ARC, type Transaction } from "@bsv/sdk";
-import type { TxResult } from "@airchive/types";
 import { createLogger } from "@airchive/logger";
 import { txBroadcastFailures, txBroadcastLatency, txBroadcastTotal } from "./metrics.js";
 
@@ -27,6 +26,14 @@ const log = createLogger({ service: "blockchain-writer:broadcaster" });
 export interface BroadcastOutcome {
   txid: string;
   status: "SEEN_ON_NETWORK" | "FAILED";
+  code?: string;
+  description?: string;
+}
+
+export function isDependencyPendingBroadcastFailure(
+  result: Pick<BroadcastOutcome, "status" | "code">,
+): boolean {
+  return result.status === "FAILED" && result.code === "SEEN_IN_ORPHAN_MEMPOOL";
 }
 
 export interface ArcCallbackPayload {
@@ -59,13 +66,20 @@ export class ArcBroadcaster extends EventEmitter {
       txBroadcastLatency.observe({ icao: label }, latency);
 
       if (response.status === "error" || !response.txid) {
-        const desc = "description" in response ? (response as Record<string, unknown>).description : "";
+        const failure = response as unknown as { code?: unknown; description?: unknown };
+        const code = String(failure.code ?? "");
+        const desc = String(failure.description ?? "");
+        const dependencyPending = code === "SEEN_IN_ORPHAN_MEMPOOL";
         txBroadcastFailures.inc({
           icao: label,
-          error_type: "ARC_REJECTED",
+          error_type: dependencyPending ? "DEPENDENCY_PENDING" : "ARC_REJECTED",
         });
-        log.error({ icao: label, response, latency }, `Broadcast rejected: ${desc}`);
-        return { txid: "", status: "FAILED" };
+        if (dependencyPending) {
+          log.warn({ icao: label, response, latency }, `Broadcast dependency pending: ${desc}`);
+        } else {
+          log.error({ icao: label, response, latency }, `Broadcast rejected: ${desc}`);
+        }
+        return { txid: "", status: "FAILED", code: code || undefined, description: desc || undefined };
       }
 
       txBroadcastTotal.inc({
@@ -93,6 +107,8 @@ export class ArcBroadcaster extends EventEmitter {
       return {
         txid: "",
         status: "FAILED",
+        code: (err as Error).name,
+        description: (err as Error).message,
       };
     }
   }

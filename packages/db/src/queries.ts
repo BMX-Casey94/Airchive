@@ -1,6 +1,7 @@
 import type { Knex } from "knex";
 import {
   FlightPhase,
+  RecordType,
   type AircraftConfig,
   type AlertRecord,
   type AlertSeverity,
@@ -200,6 +201,68 @@ export async function insertPendingWrite(
   });
 }
 
+export async function upsertPendingTelemetryWrite(
+  db: Knex,
+  write: NewPendingWrite,
+): Promise<"inserted" | "replaced"> {
+  return db.transaction(async (trx) => {
+    const payload = Buffer.isBuffer(write.payload)
+      ? write.payload
+      : Buffer.from(write.payload);
+
+    const existing = await trx("pending_writes")
+      .where({
+        aircraft_icao: write.aircraft_icao,
+        record_type: RecordType.TELEMETRY,
+      })
+      .orderBy("id", "desc")
+      .first<PendingWriteRow | undefined>();
+
+    if (!existing) {
+      await trx("pending_writes").insert({
+        aircraft_icao: write.aircraft_icao,
+        record_type: RecordType.TELEMETRY,
+        payload,
+        flight_id: write.flight_id,
+      });
+      return "inserted";
+    }
+
+    await trx("pending_writes")
+      .where({ id: existing.id })
+      .update({
+        payload,
+        flight_id: write.flight_id,
+        created_at: trx.fn.now(),
+        retry_count: 0,
+        last_error: trx.raw("NULL"),
+      });
+
+    await trx("pending_writes")
+      .where({
+        aircraft_icao: write.aircraft_icao,
+        record_type: RecordType.TELEMETRY,
+      })
+      .whereNot({ id: existing.id })
+      .delete();
+
+    return "replaced";
+  });
+}
+
+export async function coalescePendingTelemetryWrites(db: Knex): Promise<number> {
+  return db("pending_writes as older")
+    .where("older.record_type", RecordType.TELEMETRY)
+    .whereExists(
+      db("pending_writes as newer")
+        .select(db.raw("1"))
+        .whereRaw("newer.record_type = older.record_type")
+        .whereRaw("newer.aircraft_icao = older.aircraft_icao")
+        .whereRaw("newer.id > older.id"),
+    )
+    .delete();
+}
+
 export async function getPendingWrites(
   db: Knex,
   limit: number,
@@ -208,6 +271,15 @@ export async function getPendingWrites(
     .where("retry_count", "<", 10)
     .orderBy("created_at", "asc")
     .limit(limit);
+}
+
+export async function getPendingWriteCount(db: Knex): Promise<number> {
+  const row = await db("pending_writes")
+    .count<{ count: string | number }>("* as count")
+    .first();
+  const n = row?.count;
+  if (n === undefined || n === null) return 0;
+  return typeof n === "number" ? n : Number(n);
 }
 
 export async function markWriteRetried(
@@ -220,6 +292,18 @@ export async function markWriteRetried(
     .update({
       last_error: error,
       retry_count: db.raw("retry_count + 1"),
+    });
+}
+
+export async function markWriteDeferred(
+  db: Knex,
+  id: number,
+  error: string,
+): Promise<number> {
+  return db("pending_writes")
+    .where({ id })
+    .update({
+      last_error: error,
     });
 }
 
