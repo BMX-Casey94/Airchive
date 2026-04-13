@@ -20,7 +20,10 @@ import { createLogger } from "@airchive/logger";
 import { loadConfig } from "./config.js";
 import {
   ArcBroadcaster,
+  BroadcastPriority,
   isDependencyPendingBroadcastFailure,
+  isLocalBackpressureBroadcastFailure,
+  isTransientBroadcastFailure,
   type ArcCallbackPayload,
   type BroadcastOutcome,
 } from "./broadcaster.js";
@@ -36,27 +39,56 @@ const log = createLogger({ service: "blockchain-writer" });
 
 const CONSOLIDATION_INTERVAL_MS = 24 * 60 * 60 * 1_000;
 const METRICS_PORT = Number(process.env.METRICS_PORT ?? "9091");
+const TRANSIENT_BROADCAST_COOLDOWN_MS = 45_000;
 
 function shouldRequestRefillForAcquireError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err ?? "");
-  return message.includes("No available UTXOs");
+  return message.includes("No available UTXOs")
+    || message.includes("UTXO spend cooling down");
 }
 
 function isHandledBackpressureError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err ?? "");
   return message.includes("Broadcast dependency pending")
-    || message.includes("UTXO spend cooling down");
+    || message.includes("Broadcast local backpressure")
+    || message.includes("UTXO spend cooling down")
+    || message.includes("Broadcast transient failure");
 }
 
 async function handleFailedAircraftBroadcast(
   icao: string,
   utxoManager: UtxoManager,
   utxo: { txid: string; vout: number },
+  walletAddress: string,
   result: BroadcastOutcome,
 ): Promise<Error> {
   if (isDependencyPendingBroadcastFailure(result)) {
-    utxoManager.delaySpendRetries(icao, undefined, result.code);
+    utxoManager.delaySpendRetries(
+      icao,
+      utxo.txid,
+      utxo.vout,
+      undefined,
+      result.code,
+    );
     return new Error(`Broadcast dependency pending: ${result.code ?? "unknown"}`);
+  }
+
+  if (isLocalBackpressureBroadcastFailure(result)) {
+    return new Error(`Broadcast local backpressure: ${result.code ?? "unknown"}`);
+  }
+
+  if (isTransientBroadcastFailure(result)) {
+    utxoManager.delaySpendRetries(
+      icao,
+      utxo.txid,
+      utxo.vout,
+      TRANSIENT_BROADCAST_COOLDOWN_MS,
+      result.code ?? result.description ?? "transient upstream failure",
+    );
+    void utxoManager.reconcile(icao, walletAddress).catch((err) =>
+      log.warn({ err, icao }, "Aircraft UTXO reconcile failed after transient broadcast error"),
+    );
+    return new Error(`Broadcast transient failure: ${result.code ?? "unknown"}`);
   }
 
   await utxoManager.deleteStaleUtxo(utxo.txid, utxo.vout).catch(() => {});
@@ -119,7 +151,15 @@ async function main(): Promise<void> {
   }
   log.info({ count: fleet.length }, "aircraft_config rows ensured");
 
-  const broadcaster = new ArcBroadcaster(config.arcUrl, config.arcApiKey);
+  const broadcaster = new ArcBroadcaster(config.arcUrl, config.arcApiKey, {
+    maxConcurrentBroadcasts: config.arcMaxConcurrentBroadcasts,
+    maxQueueDepth: config.arcMaxQueueDepth,
+    transientRetryAttempts: config.arcTransientRetryAttempts,
+    transientRetryBaseMs: config.arcTransientRetryBaseMs,
+    circuitFailureThreshold: config.arcCircuitFailureThreshold,
+    circuitWindowMs: config.arcCircuitWindowMs,
+    circuitOpenMs: config.arcCircuitOpenMs,
+  });
   const utxoManager = new UtxoManager(db, config.wocApiUrl);
   const fundingUtxoManager = new FundingUtxoManager(db, config.wocApiUrl);
   const writeBuffer = new WriteBuffer(db, broadcaster, utxoManager, vault);
@@ -147,11 +187,13 @@ async function main(): Promise<void> {
   for (const aircraft of fleet) {
     try {
       const address = vault.getAircraftAddress(aircraft.icao);
-      await utxoManager.bootstrap(aircraft.icao, address);
+      const touchedChain = await utxoManager.bootstrap(aircraft.icao, address);
+      if (touchedChain) {
+        await new Promise((r) => setTimeout(r, 350));
+      }
     } catch (err) {
       log.error({ err, icao: aircraft.icao }, "UTXO bootstrap failed");
     }
-    await new Promise((r) => setTimeout(r, 350));
   }
 
   await utxoManager.purgeSubThresholdUtxos();
@@ -262,7 +304,20 @@ async function main(): Promise<void> {
       return;
     }
 
+    const broadcasterState = broadcaster.getState();
+    const liveTelemetryQueueReserve = Math.max(1, config.arcMaxConcurrentBroadcasts);
+    const shouldDeferTelemetry =
+      broadcasterState.circuitOpen
+      || broadcasterState.queueDepth >= Math.max(1, config.arcMaxQueueDepth - liveTelemetryQueueReserve);
+
+    if (shouldDeferTelemetry) {
+      const payload = encodeTelemetryPayload(telemetry);
+      await writeBuffer.buffer(icao, RecordType.TELEMETRY, payload, telemetry.flight_id);
+      return;
+    }
+
     const privateKey = vault.getAircraftPrivateKey(icao);
+    const walletAddress = vault.getAircraftAddress(icao);
     let utxo;
 
     try {
@@ -284,10 +339,19 @@ async function main(): Promise<void> {
         recordType: RecordType.TELEMETRY,
       });
 
-      const result = await broadcaster.broadcast(tx, icao);
+      const result = await broadcaster.broadcast(tx, icao, {
+        kind: "telemetry",
+        priority: BroadcastPriority.LIVE_TELEMETRY,
+      });
 
       if (result.status === "FAILED") {
-        throw await handleFailedAircraftBroadcast(icao, utxoManager, utxo, result);
+        throw await handleFailedAircraftBroadcast(
+          icao,
+          utxoManager,
+          utxo,
+          walletAddress,
+          result,
+        );
       }
 
       const txid = result.txid;
@@ -342,7 +406,14 @@ async function main(): Promise<void> {
       return;
     }
 
+    if (broadcaster.getState().circuitOpen) {
+      const payload = encodeFlightEventPayload(event);
+      await writeBuffer.buffer(icao, RecordType.FLIGHT_EVENT, payload, event.flight_id);
+      return;
+    }
+
     const privateKey = vault.getAircraftPrivateKey(icao);
+    const walletAddress = vault.getAircraftAddress(icao);
     let utxo;
 
     try {
@@ -363,10 +434,19 @@ async function main(): Promise<void> {
         event,
       });
 
-      const result = await broadcaster.broadcast(tx, icao);
+      const result = await broadcaster.broadcast(tx, icao, {
+        kind: "flight_event",
+        priority: BroadcastPriority.FLIGHT_EVENT,
+      });
 
       if (result.status === "FAILED") {
-        throw await handleFailedAircraftBroadcast(icao, utxoManager, utxo, result);
+        throw await handleFailedAircraftBroadcast(
+          icao,
+          utxoManager,
+          utxo,
+          walletAddress,
+          result,
+        );
       }
 
       const txid = result.txid;

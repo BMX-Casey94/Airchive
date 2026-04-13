@@ -15,7 +15,10 @@ import {
 } from "@airchive/db";
 import { createLogger } from "@airchive/logger";
 import {
+  BroadcastPriority,
   isDependencyPendingBroadcastFailure,
+  isLocalBackpressureBroadcastFailure,
+  isTransientBroadcastFailure,
   type ArcBroadcaster,
 } from "./broadcaster.js";
 import type { UtxoManager } from "./utxo-manager.js";
@@ -28,9 +31,12 @@ const log = createLogger({ service: "blockchain-writer:write-buffer" });
 
 const RETRY_INTERVAL_MS = 5_000;
 const RETRY_BATCH_SIZE = 100;
+const TRANSIENT_BROADCAST_COOLDOWN_MS = 45_000;
 
 function isTransientWriteDeferral(message: string): boolean {
   return message.includes("Broadcast dependency pending")
+    || message.includes("Broadcast local backpressure")
+    || message.includes("Broadcast transient failure")
     || message.includes("UTXO spend cooling down")
     || message.includes("No available UTXOs");
 }
@@ -122,6 +128,20 @@ export class WriteBuffer {
     let successCount = 0;
 
     try {
+      const broadcasterState = this.broadcaster.getState();
+      if (this.broadcaster.isDegraded()) {
+        log.debug(
+          {
+            inFlight: broadcasterState.inFlight,
+            queueDepth: broadcasterState.queueDepth,
+            circuitOpen: broadcasterState.circuitOpen,
+            breakerRemainingMs: broadcasterState.circuitOpenRemainingMs,
+          },
+          "Skipping retry cycle — broadcaster currently degraded",
+        );
+        return 0;
+      }
+
       const pending = await getPendingWrites(this.db, RETRY_BATCH_SIZE);
       if (pending.length === 0) return 0;
 
@@ -145,6 +165,7 @@ export class WriteBuffer {
 
         try {
           const privateKey = this.vault.getAircraftPrivateKey(icao);
+          const walletAddress = this.vault.getAircraftAddress(icao);
           const utxo = await this.utxoManager.acquireUtxo(icao);
           utxoAcquired = true;
           utxoTxid = utxo.txid;
@@ -164,12 +185,41 @@ export class WriteBuffer {
             payload,
           });
 
-          const result = await this.broadcaster.broadcast(tx, icao);
+          const retryPriority =
+            write.record_type === RecordTypeEnum.FLIGHT_EVENT
+              ? BroadcastPriority.RETRY_EVENT
+              : BroadcastPriority.RETRY_TELEMETRY;
+          const result = await this.broadcaster.broadcast(tx, icao, {
+            kind: "retry",
+            priority: retryPriority,
+          });
 
           if (result.status === "FAILED") {
             if (isDependencyPendingBroadcastFailure(result)) {
-              this.utxoManager.delaySpendRetries(icao, undefined, result.code);
+              this.utxoManager.delaySpendRetries(
+                icao,
+                utxo.txid,
+                utxo.vout,
+                undefined,
+                result.code,
+              );
               throw new Error(`Broadcast dependency pending: ${result.code ?? "unknown"}`);
+            }
+            if (isLocalBackpressureBroadcastFailure(result)) {
+              throw new Error(`Broadcast local backpressure: ${result.code ?? "unknown"}`);
+            }
+            if (isTransientBroadcastFailure(result)) {
+              this.utxoManager.delaySpendRetries(
+                icao,
+                utxo.txid,
+                utxo.vout,
+                TRANSIENT_BROADCAST_COOLDOWN_MS,
+                result.code ?? result.description ?? "transient upstream failure",
+              );
+              void this.utxoManager.reconcile(icao, walletAddress).catch((err) =>
+                log.warn({ err, icao }, "Aircraft UTXO reconcile failed after transient broadcast error"),
+              );
+              throw new Error(`Broadcast transient failure: ${result.code ?? "unknown"}`);
             }
             await this.utxoManager.deleteStaleUtxo(utxo.txid, utxo.vout).catch(() => {});
             utxoAcquired = false;
@@ -212,7 +262,10 @@ export class WriteBuffer {
           }
 
           const msg = (err as Error).message ?? "";
-          if (msg.includes("No available UTXOs")) {
+          if (
+            msg.includes("No available UTXOs")
+            || msg.includes("UTXO spend cooling down")
+          ) {
             noUtxoIcaos.add(icao);
             this.autoRefill?.requestRefill(icao);
           }

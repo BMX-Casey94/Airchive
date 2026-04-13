@@ -228,10 +228,30 @@ export async function buildConsolidationTx(
 
 export interface RefillResult {
   tx: Transaction;
-  recipientVout: number;
+  recipientOutputs: Array<{
+    vout: number;
+    satoshis: number;
+    lockingScript: string;
+  }>;
   changeVout: number | null;
   changeSats: number;
   changeLockingScript: string | null;
+}
+
+const REFILL_OUTPUT_DUST_LIMIT = 546;
+
+export function estimateRefillFee(
+  recipientOutputCount: number,
+  includeChange = true,
+): number {
+  const safeRecipientCount = Math.max(1, Math.floor(recipientOutputCount));
+  const outputCount = safeRecipientCount + (includeChange ? 1 : 0);
+  const estSize =
+    TX_OVERHEAD +
+    varintSize(1) +
+    (INPUT_OVERHEAD + P2PKH_UNLOCK_SIZE) +
+    (P2PKH_OUTPUT_SIZE * outputCount);
+  return calculateFee(estSize);
 }
 
 export async function buildRefillTx(params: {
@@ -239,18 +259,18 @@ export async function buildRefillTx(params: {
   fundingKey: PrivateKey;
   recipientPkh: number[];
   amountSats: number;
+  recipientOutputCount?: number;
 }): Promise<RefillResult> {
-  const { fundingUtxo, fundingKey, recipientPkh, amountSats } = params;
+  const {
+    fundingUtxo,
+    fundingKey,
+    recipientPkh,
+    amountSats,
+    recipientOutputCount = 1,
+  } = params;
   const inputSats = fundingUtxo.satoshis;
-
-  const hasChange = inputSats > amountSats + 200;
-  const outputCount = hasChange ? 2 : 1;
-  const estSize =
-    TX_OVERHEAD +
-    1 +
-    (INPUT_OVERHEAD + P2PKH_UNLOCK_SIZE) +
-    P2PKH_OUTPUT_SIZE * outputCount;
-  const fee = calculateFee(estSize);
+  const safeRecipientCount = Math.max(1, Math.floor(recipientOutputCount));
+  const fee = estimateRefillFee(safeRecipientCount);
 
   const changeSats = inputSats - amountSats - fee;
   if (changeSats < 0) {
@@ -261,6 +281,7 @@ export async function buildRefillTx(params: {
 
   const fundingPkh = derivePubKeyHash(fundingKey);
   const changeLockScript = new P2PKH().lock(fundingPkh);
+  const recipientLockScript = new P2PKH().lock(recipientPkh);
   const tx = new Transaction();
 
   const fundingLockScript = Script.fromHex(fundingUtxo.lockingScript);
@@ -280,20 +301,36 @@ export async function buildRefillTx(params: {
     sequence: 0xffffffff,
   });
 
-  tx.addOutput({
-    lockingScript: new P2PKH().lock(recipientPkh),
-    satoshis: amountSats,
-  });
+  const baseRecipientSats = Math.floor(amountSats / safeRecipientCount);
+  const remainder = amountSats % safeRecipientCount;
+  if (baseRecipientSats < REFILL_OUTPUT_DUST_LIMIT) {
+    throw new Error(
+      `Refill split would create dust outputs: ${amountSats} sats across ${safeRecipientCount} outputs`,
+    );
+  }
 
-  const DUST_LIMIT = 546;
+  const recipientOutputs: RefillResult["recipientOutputs"] = [];
+  for (let i = 0; i < safeRecipientCount; i++) {
+    const recipientSats = baseRecipientSats + (i < remainder ? 1 : 0);
+    tx.addOutput({
+      lockingScript: recipientLockScript,
+      satoshis: recipientSats,
+    });
+    recipientOutputs.push({
+      vout: i,
+      satoshis: recipientSats,
+      lockingScript: recipientLockScript.toHex(),
+    });
+  }
+
   let changeVout: number | null = null;
   let changeLockingScriptHex: string | null = null;
-  if (changeSats >= DUST_LIMIT) {
+  if (changeSats >= REFILL_OUTPUT_DUST_LIMIT) {
     tx.addOutput({
       lockingScript: changeLockScript,
       satoshis: changeSats,
     });
-    changeVout = 1;
+    changeVout = recipientOutputs.length;
     changeLockingScriptHex = changeLockScript.toHex();
   }
 
@@ -301,7 +338,7 @@ export async function buildRefillTx(params: {
 
   return {
     tx,
-    recipientVout: 0,
+    recipientOutputs,
     changeVout,
     changeSats: changeVout !== null ? changeSats : 0,
     changeLockingScript: changeLockingScriptHex,

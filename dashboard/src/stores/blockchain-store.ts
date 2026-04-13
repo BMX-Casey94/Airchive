@@ -30,6 +30,32 @@ interface BlockchainState {
 
 const MAX_FEED_ENTRIES = 200;
 
+function resolveEntryTime(entry: BlockchainEntry): number {
+  const timestamp = Number(entry.timestamp);
+  const createdAt = entry.created_at == null ? NaN : new Date(entry.created_at).getTime();
+
+  if (Number.isFinite(createdAt)) {
+    const now = Date.now();
+    const timestampLooksFuture = Number.isFinite(timestamp) && timestamp > now + 60_000;
+    const timestampLooksSkewed = Number.isFinite(timestamp) && Math.abs(timestamp - createdAt) > 10 * 60_000;
+    if (timestampLooksFuture || timestampLooksSkewed) {
+      return createdAt;
+    }
+  }
+
+  return Number.isFinite(timestamp) ? timestamp : createdAt;
+}
+
+function normaliseEntries(entries: BlockchainEntry[]): BlockchainEntry[] {
+  return [...entries]
+    .sort((a, b) => {
+      const timeDelta = resolveEntryTime(a) - resolveEntryTime(b);
+      if (timeDelta !== 0) return timeDelta;
+      return a.txid.localeCompare(b.txid);
+    })
+    .slice(-MAX_FEED_ENTRIES);
+}
+
 export const useBlockchainStore = create<BlockchainState>((set) => ({
   entries: [],
   dailySummary: {
@@ -63,11 +89,11 @@ export const useBlockchainStore = create<BlockchainState>((set) => ({
         else if (entry.status === "SEEN_ON_NETWORK") summaryPatch.pendingCount++;
         else if (entry.status === "FAILED") summaryPatch.failedCount++;
 
-        return { entries: updated, dailySummary: summaryPatch };
+        return { entries: normaliseEntries(updated), dailySummary: summaryPatch };
       }
 
       return {
-        entries: [...prev.entries, entry].slice(-MAX_FEED_ENTRIES),
+        entries: normaliseEntries([...prev.entries, entry]),
         dailySummary: {
           ...prev.dailySummary,
           txCount: prev.dailySummary.txCount + 1,
@@ -81,7 +107,7 @@ export const useBlockchainStore = create<BlockchainState>((set) => ({
     }),
 
   setEntries: (entries) =>
-    set({ entries: entries.slice(-MAX_FEED_ENTRIES) }),
+    set({ entries: normaliseEntries(entries) }),
 
   setDailySummary: (summary) =>
     set((prev) => ({ dailySummary: { ...prev.dailySummary, ...summary } })),

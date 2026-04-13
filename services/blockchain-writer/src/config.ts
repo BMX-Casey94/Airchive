@@ -14,8 +14,17 @@ export interface Config {
   fundingWalletWif: string;
   trackedAircraft: string[];
   redis: RedisConfig;
+  arcMaxConcurrentBroadcasts: number;
+  arcMaxQueueDepth: number;
+  arcTransientRetryAttempts: number;
+  arcTransientRetryBaseMs: number;
+  arcCircuitFailureThreshold: number;
+  arcCircuitWindowMs: number;
+  arcCircuitOpenMs: number;
   refillThresholdSats: number;
   refillAmountSats: number;
+  activeAircraftUtxoTarget: number;
+  refillMinOutputSats: number;
   consolidationThreshold: number;
   refillIdleWindowMs: number;
 }
@@ -54,10 +63,37 @@ export function loadConfig(): Config {
       password: process.env.REDIS_PASSWORD || undefined,
       db: Number(optionalEnv("REDIS_DB", "0")),
     },
+    arcMaxConcurrentBroadcasts: Number(
+      optionalEnv("ARC_MAX_CONCURRENT_BROADCASTS", "4"),
+    ),
+    arcMaxQueueDepth: Number(
+      optionalEnv("ARC_MAX_QUEUE_DEPTH", "12"),
+    ),
+    arcTransientRetryAttempts: Number(
+      optionalEnv("ARC_TRANSIENT_RETRY_ATTEMPTS", "2"),
+    ),
+    arcTransientRetryBaseMs: Number(
+      optionalEnv("ARC_TRANSIENT_RETRY_BASE_MS", "250"),
+    ),
+    arcCircuitFailureThreshold: Number(
+      optionalEnv("ARC_CIRCUIT_FAILURE_THRESHOLD", "8"),
+    ),
+    arcCircuitWindowMs: Number(
+      optionalEnv("ARC_CIRCUIT_WINDOW_MS", "10000"),
+    ),
+    arcCircuitOpenMs: Number(
+      optionalEnv("ARC_CIRCUIT_OPEN_MS", "8000"),
+    ),
     refillThresholdSats: Number(
       optionalEnv("REFILL_THRESHOLD_SATS", "200000"),
     ),
     refillAmountSats: Number(optionalEnv("REFILL_AMOUNT_SATS", "1000000")),
+    activeAircraftUtxoTarget: Number(
+      optionalEnv("ACTIVE_AIRCRAFT_UTXO_TARGET", "8"),
+    ),
+    refillMinOutputSats: Number(
+      optionalEnv("REFILL_MIN_OUTPUT_SATS", "10000"),
+    ),
     consolidationThreshold: Number(
       optionalEnv("CONSOLIDATION_THRESHOLD", "20"),
     ),

@@ -7,6 +7,22 @@ import type { BlockchainEntry } from "@/types/airchive";
 import { truncateTxid, fmtTime, fmtBytes, fmtSats } from "@/lib/format";
 import Panel from "@/components/ui/Panel";
 
+function getDisplayTimestamp(entry: BlockchainEntry): number {
+  const timestamp = Number(entry.timestamp);
+  const createdAt = entry.created_at == null ? NaN : new Date(entry.created_at).getTime();
+
+  if (Number.isFinite(createdAt)) {
+    const now = Date.now();
+    const timestampLooksFuture = Number.isFinite(timestamp) && timestamp > now + 60_000;
+    const timestampLooksSkewed = Number.isFinite(timestamp) && Math.abs(timestamp - createdAt) > 10 * 60_000;
+    if (timestampLooksFuture || timestampLooksSkewed) {
+      return createdAt;
+    }
+  }
+
+  return Number.isFinite(timestamp) ? timestamp : createdAt;
+}
+
 export default function BlockchainFeed() {
   const entries = useBlockchainStore((s) => s.entries);
   const summary = useBlockchainStore((s) => s.dailySummary);
@@ -63,7 +79,7 @@ function FeedRow({ entry }: { entry: BlockchainEntry }) {
     >
       {/* Timestamp */}
       <span className="flex-shrink-0 font-mono text-[11px] text-hud-muted tabular-nums w-[70px]">
-        {fmtTime(entry.timestamp)}
+        {fmtTime(getDisplayTimestamp(entry))}
       </span>
 
       {/* Aircraft ICAO badge */}

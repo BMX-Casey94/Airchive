@@ -1,14 +1,16 @@
-import { P2PKH, PrivateKey } from "@bsv/sdk";
+import { PrivateKey } from "@bsv/sdk";
 import { createLogger } from "@airchive/logger";
 import type { WalletVault } from "@airchive/crypto";
 import type { Config } from "./config.js";
 import {
+  BroadcastPriority,
   isDependencyPendingBroadcastFailure,
+  isTransientBroadcastFailure,
   type ArcBroadcaster,
 } from "./broadcaster.js";
 import type { UtxoManager } from "./utxo-manager.js";
 import type { FundingUtxoManager } from "./funding-utxo-manager.js";
-import { buildRefillTx, derivePubKeyHash } from "./tx-builder.js";
+import { buildRefillTx, derivePubKeyHash, estimateRefillFee } from "./tx-builder.js";
 
 const log = createLogger({ service: "blockchain-writer:auto-refill" });
 
@@ -17,7 +19,9 @@ const DEFAULT_IDLE_WINDOW_MS = 30 * 60 * 1_000;
 const REFILL_COOLDOWN_MS = 30_000;
 const TREASURY_FAILURE_COOLDOWN_MS = 60_000;
 const ORPHAN_MEMPOOL_COOLDOWN_MS = 20_000;
+const TRANSIENT_REFILL_COOLDOWN_MS = 45_000;
 const SERIAL_REFILL_GAP_MS = 1_000;
+const REFILL_OUTPUT_DUST_LIMIT = 546;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -85,8 +89,10 @@ export class AutoRefillMonitor {
         intervalMs: CHECK_INTERVAL_MS,
         threshold: this.config.refillThresholdSats,
         idleWindowMs: this.idleWindowMs,
+        activeUtxoTarget: this.config.activeAircraftUtxoTarget,
+        minOutputSats: this.config.refillMinOutputSats,
       },
-      "Auto-refill monitor started (activity-aware, local funding pool)",
+      "Auto-refill monitor started (activity-aware, pool-count aware)",
     );
   }
 
@@ -139,28 +145,61 @@ export class AutoRefillMonitor {
     icao: string,
     force: boolean,
   ): Promise<"refilled" | "skipped_idle" | "sufficient"> {
-    const { balance } = await this.utxoManager.checkBalance(icao);
+    const pool = await this.utxoManager.checkBalance(icao);
+    const targetUtxoCount = this.getTargetUtxoCount(icao, force);
+    const enforceCountTarget =
+      force || pool.balance < this.config.refillThresholdSats;
 
-    if (balance >= this.config.refillThresholdSats) return "sufficient";
+    if (
+      pool.balance >= this.config.refillThresholdSats
+      && (!enforceCountTarget || pool.unlockedUtxoCount >= targetUtxoCount)
+    ) {
+      return "sufficient";
+    }
 
     if (!force && !this.isActive(icao)) {
       log.debug(
-        { icao, balance, threshold: this.config.refillThresholdSats },
+        {
+          icao,
+          balance: pool.balance,
+          unlockedUtxos: pool.unlockedUtxoCount,
+          readyUtxos: pool.readyUtxoCount,
+          coolingUtxos: pool.coolingUtxoCount,
+          threshold: this.config.refillThresholdSats,
+          targetUtxoCount,
+          enforceCountTarget,
+        },
         "Skipping refill — aircraft idle (no recent write activity)",
       );
       return "skipped_idle";
     }
 
+    const refillAmount = this.config.refillAmountSats;
+    const desiredOutputCount = this.getDesiredRefillOutputCount(
+      refillAmount,
+      targetUtxoCount - pool.unlockedUtxoCount,
+    );
+
     log.info(
-      { icao, balance, threshold: this.config.refillThresholdSats, force },
-      "Balance below threshold, initiating refill",
+      {
+        icao,
+        balance: pool.balance,
+        unlockedUtxos: pool.unlockedUtxoCount,
+        readyUtxos: pool.readyUtxoCount,
+        coolingUtxos: pool.coolingUtxoCount,
+        threshold: this.config.refillThresholdSats,
+        targetUtxoCount,
+        enforceCountTarget,
+        force,
+        refillAmount,
+        desiredOutputCount,
+      },
+      "Aircraft pool below target, initiating refill",
     );
 
     try {
       const fundingKey = PrivateKey.fromWif(this.config.fundingWalletWif);
-
-      const refillAmount = this.config.refillAmountSats;
-      const minRequired = refillAmount + 300;
+      const minRequired = refillAmount + estimateRefillFee(desiredOutputCount) + 100;
 
       const fundingUtxo = await this.fundingUtxoManager.acquire(minRequired);
       if (!fundingUtxo) {
@@ -179,9 +218,7 @@ export class AutoRefillMonitor {
       try {
         const aircraftPrivKey = this.vault.getAircraftPrivateKey(icao);
         const recipientPkh = derivePubKeyHash(aircraftPrivKey);
-        const recipientLockingScriptHex = new P2PKH().lock(recipientPkh).toHex();
-
-        const { tx, recipientVout, changeVout, changeSats, changeLockingScript } =
+        const { tx, recipientOutputs, changeVout, changeSats, changeLockingScript } =
           await buildRefillTx({
             fundingUtxo: {
               txid: fundingUtxo.txid.trim(),
@@ -192,15 +229,33 @@ export class AutoRefillMonitor {
             fundingKey,
             recipientPkh,
             amountSats: refillAmount,
+            recipientOutputCount: desiredOutputCount,
           });
 
-        const result = await this.broadcaster.broadcast(tx, icao);
+        const result = await this.broadcaster.broadcast(tx, icao, {
+          kind: "refill",
+          priority: BroadcastPriority.REFILL,
+        });
         if (result.status === "FAILED") {
           if (isDependencyPendingBroadcastFailure(result)) {
             log.info({ icao, code: result.code }, "Refill dependency not yet propagated; backing off");
             await this.fundingUtxoManager.release(fundingUtxo.txid.trim(), fundingUtxo.vout);
             this.refillCooldowns.set(icao.toUpperCase(), Date.now() + ORPHAN_MEMPOOL_COOLDOWN_MS);
             this.treasuryFailedAt = Date.now();
+            await sleep(SERIAL_REFILL_GAP_MS);
+            return "skipped_idle";
+          }
+          if (isTransientBroadcastFailure(result)) {
+            log.warn(
+              { icao, code: result.code, description: result.description },
+              "Refill broadcast failed transiently — retaining funding input and reconciling",
+            );
+            await this.fundingUtxoManager.release(fundingUtxo.txid.trim(), fundingUtxo.vout);
+            this.refillCooldowns.set(icao.toUpperCase(), Date.now() + TRANSIENT_REFILL_COOLDOWN_MS);
+            this.treasuryFailedAt = Date.now();
+            void this.fundingUtxoManager.reconcile(this.config.fundingWalletWif).catch((err) =>
+              log.error({ err }, "Background funding reconciliation failed"),
+            );
             await sleep(SERIAL_REFILL_GAP_MS);
             return "skipped_idle";
           }
@@ -222,17 +277,25 @@ export class AutoRefillMonitor {
           changeLockingScript,
         );
 
-        await this.utxoManager.addUtxo(
+        await this.utxoManager.addUtxos(
           icao,
-          txid,
-          recipientVout,
-          refillAmount,
-          recipientLockingScriptHex,
+          recipientOutputs.map((output) => ({
+            txid,
+            vout: output.vout,
+            satoshis: output.satoshis,
+            lockingScript: output.lockingScript,
+          })),
         );
 
         log.info(
-          { icao, txid, amount: refillAmount, changeReturned: changeSats > 0 },
-          "Refill transaction broadcast (local funding pool)",
+          {
+            icao,
+            txid,
+            amount: refillAmount,
+            recipientOutputs: recipientOutputs.length,
+            changeReturned: changeSats > 0,
+          },
+          "Refill transaction broadcast (multi-output aircraft top-up)",
         );
         await sleep(SERIAL_REFILL_GAP_MS);
         return "refilled";
@@ -245,6 +308,24 @@ export class AutoRefillMonitor {
       this.refillCooldowns.set(icao.toUpperCase(), Date.now() + REFILL_COOLDOWN_MS);
       return "skipped_idle";
     }
+  }
+
+  private getTargetUtxoCount(icao: string, force: boolean): number {
+    if (!force && !this.isActive(icao)) return 1;
+    return Math.max(1, this.config.activeAircraftUtxoTarget);
+  }
+
+  private getDesiredRefillOutputCount(
+    refillAmountSats: number,
+    missingUtxos: number,
+  ): number {
+    const desiredByGap = Math.max(1, missingUtxos);
+    const minOutputSats = Math.max(
+      REFILL_OUTPUT_DUST_LIMIT,
+      this.config.refillMinOutputSats,
+    );
+    const maxByAmount = Math.max(1, Math.floor(refillAmountSats / minOutputSats));
+    return Math.max(1, Math.min(desiredByGap, maxByAmount));
   }
 
   private async runSerialRefill<T>(op: () => Promise<T>): Promise<T> {

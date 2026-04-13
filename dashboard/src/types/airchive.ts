@@ -116,6 +116,7 @@ export interface TxResult {
   block_height?: number;
   merkle_path?: string;
   timestamp: number;
+  created_at?: string | Date;
   fee_sats: number;
   size_bytes: number;
   chronicle_validated?: boolean;

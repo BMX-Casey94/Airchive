@@ -31,6 +31,31 @@ export const txBroadcastFailures = new Counter({
   registers: [registry],
 });
 
+export const txBroadcastRetryTotal = new Counter({
+  name: "airchive_tx_broadcast_retries_total",
+  help: "Total transient broadcast retries attempted",
+  labelNames: ["kind", "reason"] as const,
+  registers: [registry],
+});
+
+export const txBroadcastQueueDepth = new Gauge({
+  name: "airchive_tx_broadcast_queue_depth",
+  help: "Current queued broadcast requests waiting for ARC slots",
+  registers: [registry],
+});
+
+export const txBroadcastInFlight = new Gauge({
+  name: "airchive_tx_broadcast_in_flight",
+  help: "Current number of in-flight ARC broadcast requests",
+  registers: [registry],
+});
+
+export const txBroadcastBreakerOpen = new Gauge({
+  name: "airchive_tx_broadcast_breaker_open",
+  help: "Whether the ARC transient failure breaker is currently open",
+  registers: [registry],
+});
+
 export const utxoPoolBalance = new Gauge({
   name: "airchive_utxo_pool_balance_sats",
   help: "UTXO pool balance per aircraft in satoshis",
