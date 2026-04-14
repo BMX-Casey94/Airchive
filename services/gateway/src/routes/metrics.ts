@@ -49,7 +49,7 @@ export async function metricsRoutes(app: FastifyInstance): Promise<void> {
         .count("* as total")
         .first() as Promise<CountRow>,
       db("tx_results")
-        .where("timestamp", ">=", recentWindowEpoch)
+        .where("created_at", ">=", new Date(recentWindowEpoch))
         .count("* as total")
         .first() as Promise<CountRow>,
     ]);
