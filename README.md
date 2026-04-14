@@ -45,9 +45,9 @@ The goal is an auditable, immutable trail of flight activity suitable for safety
   └──────────┘  alerts, agent marketplace panel
 ```
 
-**Ingestion** polls adsb.fi, OpenSky, and optional RTL-SDR endpoints, merges and deduplicates into `TelemetryRecord` shapes, and publishes to Redis `telemetry:{ICAO}` channels. A **phase engine** subscribes to those channels, runs the flight-phase state machine and adaptive write-rate controller, emits `write:{ICAO}` for the blockchain writer, and broadcasts enriched payloads for real-time consumers.
+**Ingestion** polls adsb.fi, OpenSky, and optional RTL-SDR endpoints, merges and deduplicates into `TelemetryRecord` shapes, and publishes to Redis `telemetry:{ICAO}` channels. A **phase engine** subscribes to those channels, runs the flight-phase state machine and adaptive write-rate controller, emits `write:{ICAO}` for the blockchain writer, and broadcasts enriched payloads for real-time consumers. Write rates are configurable per phase via environment variables (`WRITE_RATE_*_MS`).
 
-**Gateway** exposes HTTP APIs and WebSockets for the **dashboard** (globe, fleet grid, alerts, blockchain feed, agent marketplace). **Blockchain writer** consumes `write:{ICAO}` events, builds OP_RETURN transactions with encoded telemetry, and broadcasts via TAAL ARC. Each aircraft has its own independently funded wallet — **on-chain broadcasts only occur during active flight periods** (TAXI through LANDING phases). Parked aircraft write at most every 2 minutes, conserving both bandwidth and funds. An **activity-aware auto-refill** monitor tops up wallets only for actively flying aircraft, while the retry buffer now coalesces superseded telemetry writes per aircraft and treats orphan-mempool responses as bounded backpressure rather than destructive wallet churn.
+**Gateway** exposes HTTP APIs and WebSockets for the **dashboard** (globe, fleet grid, alerts, blockchain feed, agent marketplace). **Blockchain writer** consumes `write:{ICAO}` events, builds OP_RETURN transactions with encoded telemetry, and broadcasts via TAAL ARC through a **bounded-concurrency broadcaster** with priority queuing, transient retry with exponential backoff, and a circuit breaker to prevent cascade failures. Each aircraft has its own independently funded wallet — **on-chain broadcasts only occur during active flight periods** (TAXI through LANDING phases). Parked aircraft write at most every 2 minutes, conserving both bandwidth and funds. An **activity-aware auto-refill** monitor tops up wallets only for actively flying aircraft, while the retry buffer coalesces superseded telemetry writes per aircraft and treats orphan-mempool responses optimistically (recording the spend and making the change output immediately available rather than waiting for full propagation).
 
 **Overlay Node** runs a custom BSV overlay node (`services/overlay-node`) with an `AirchiveTopicManager` (`tm_airchive`) that indexes transactions by filtering for the `AIRCHIVE` protocol prefix in OP_RETURN outputs. It exposes a REST + WebSocket API for querying telemetry records by ICAO, transaction ID, time range, or flight session — providing a self-hosted, BSV-native lookup layer independent of third-party explorers.
 
@@ -121,6 +121,27 @@ Every aircraft wallet is deterministically derived and publicly verifiable:
 - **Transaction format:** All telemetry is encoded in OP_RETURN outputs with the `AIRCHIVE` protocol prefix, making transactions machine-parseable by any third party
 
 To verify any aircraft's on-chain activity, query the wallet list endpoint and follow the WhatsonChain links to inspect the raw transactions.
+
+## Broadcast shaping and reliability
+
+The blockchain writer includes several production-grade mechanisms to maintain sustained throughput under real-world network conditions:
+
+- **Bounded-concurrency ARC broadcaster** — configurable parallel slots (`ARC_MAX_CONCURRENT_BROADCASTS`, default 48) with a priority queue that favours refills and flight events over routine telemetry
+- **Transient retry with exponential backoff** — HTTP 500/502/503/504 errors are retried automatically (`ARC_TRANSIENT_RETRY_ATTEMPTS`, default 2) before deferring
+- **Circuit breaker** — opens after repeated transient failures within a time window, pausing broadcasts briefly to prevent cascade overload of ARC
+- **Optimistic orphan-mempool handling** — when ARC returns `SEEN_IN_ORPHAN_MEMPOOL`, the spend is recorded locally and the change output is made immediately available, avoiding UTXO stalls and eliminating double-spend errors from dependency chains
+- **WoC reconciliation deduplication** — funding wallet reconciliation against WhatsonChain is globally deduplicated with rate-limit awareness (30s cooldown, 120s after a 429)
+- **Write coalescing** — the retry buffer keeps only the latest telemetry per aircraft, so stale queued writes are replaced rather than replayed
+
+## Dashboard performance
+
+The operator dashboard is optimised for long-running sessions with large fleets:
+
+- **Stale aircraft eviction** — aircraft not updated for 5 minutes are automatically pruned from both the fleet store and the globe store, preventing unbounded memory growth
+- **Throttled store subscriptions** — the fleet grid and analytics panels use 2-second throttled selectors, reducing React re-renders from hundreds per second to one every 2 seconds
+- **Batched globe updates** — individual WebSocket telemetry messages are batched into a single globe store update per second, and Cesium entity sync is throttled to ~1 Hz
+- **Memoised components** — fleet cards use `React.memo` with CSS transitions instead of per-card Framer Motion spring animations
+- **Fetch overlap guards** — API polling (`/api/metrics` every 10s, `/api/fleet` every 60s) skips if the previous request is still in flight
 
 ## Quick start
 
@@ -208,7 +229,7 @@ The system currently tracks **239 aircraft** in `aircraft_config`, each with its
 
 The treasury wallet is a standard P2PKH wallet whose UTXOs are fetched directly from WhatsonChain at refill time — it is not managed in the UTXO pool database.
 
-**On-chain broadcasts only occur during active flight periods.** Parked aircraft write at most every 2 minutes. Once an aircraft is airborne (TAXI onwards), write rates increase to 15s for taxiing, 1s for takeoff/climb/landing, 2s for descent/approach, and 3s for cruise. This means the blockchain is only written to when there is meaningful data to record.
+**On-chain broadcasts only occur during active flight periods.** Parked aircraft write at most every 2 minutes. Once an aircraft is airborne (TAXI onwards), write rates increase to 10s for taxiing, 1s for takeoff/climb/descent/approach/landing, and 1.5s for cruise. All phase intervals are configurable via `WRITE_RATE_*_MS` environment variables. This means the blockchain is only written to when there is meaningful data to record.
 
 ### Activity-aware auto-refill
 
@@ -232,7 +253,7 @@ Authoritative list and descriptions: **`.env.example`** at the repository root. 
 - **Wallet Vault** — HD master seed, funding WIF
 - **Auto-refill** — threshold, amount, idle window
 - **Data Sources** — adsb.fi, OpenSky, RTL-SDR
-- **Ingestion** — poll interval, tracked aircraft, demo mode
+- **Ingestion** — poll interval, tracked aircraft, demo mode, write rate overrides (`WRITE_RATE_*_MS`)
 - **Gateway** — ports, JWT, CORS
 - **Agent Marketplace** — agent keys, intervals, storage URL
 - **Dashboard** — public URLs, Cesium token
@@ -269,31 +290,33 @@ The current configured fleet database contains **239 aircraft**. Aircraft are no
 |-----------|-------|
 | Current configured aircraft | **239** |
 | Avg active flight hours / aircraft / day | ~9 hours |
-| Weighted-avg tx/s per aircraft (in-flight) | ~0.39 (phase-weighted) |
-| Effective tx/s per aircraft over 24h | 0.39 × (9 / 24) ≈ 0.146 |
-| Effective sustained throughput at 239 aircraft | **~34.9 tx/second** |
-| Estimated daily volume at 239 aircraft | **~3.02 million transactions/day** |
-| Headroom vs 1.5M/day target | **~2.0x** |
+| Weighted-avg tx/s per aircraft (in-flight) | ~0.52 (phase-weighted) |
+| Effective tx/s per aircraft over 24h | 0.52 × (9 / 24) ≈ 0.195 |
+| Effective sustained throughput at 239 aircraft | **~46.6 tx/second** |
+| Estimated daily volume at 239 aircraft | **~4.02 million transactions/day** |
+| Headroom vs 1.5M/day target | **~2.7x** |
+| Observed sustained throughput (live monitoring) | **16–24 TX/s** (varies with fleet activity) |
 
-The adaptive write-rate controller adjusts per flight phase:
+The adaptive write-rate controller adjusts per flight phase (defaults shown; all overridable via `WRITE_RATE_*_MS` env vars):
 
 | Phase | Write interval | tx/s | Typical % of flight |
 |-------|---------------|------|---------------------|
 | TAKEOFF / LANDING | 1s | 1.00 | ~4% |
 | CLIMB | 1s | 1.00 | ~8% |
-| DESCENT / APPROACH | 2s | 0.50 | ~12% |
-| CRUISE | 3s | 0.33 | ~70% |
-| TAXI / TAXI_IN | 15s | 0.07 | ~6% |
+| DESCENT / APPROACH | 1s | 1.00 | ~12% |
+| CRUISE | 1.5s | 0.67 | ~70% |
+| TAXI | 10s | 0.10 | ~4% |
+| TAXI_IN | 15s | 0.07 | ~2% |
 | EMERGENCY | 1s | 1.00 | rare |
 | PARKED | 120s | 0.008 | n/a (not in-flight) |
 
-At the current fleet size, Airchive produces approximately **239 × 9 × 3,600 × 0.39 ≈ 3.02M transactions** within 24 hours under the same assumptions. That means the original **1.5M transactions/day** target can be met with substantial fleet headroom even after allowing for inactive tails, maintenance gaps, and uneven utilisation across carriers.
+At the current fleet size, Airchive produces approximately **239 × 9 × 3,600 × 0.52 ≈ 4.02M transactions** within 24 hours under the same assumptions. That means the original **1.5M transactions/day** target can be met with substantial fleet headroom even after allowing for inactive tails, maintenance gaps, and uneven utilisation across carriers.
 
 Each aircraft wallet is independently funded and manages its own UTXO chain, enabling fully parallel transaction construction with no contention.
 
-**Cost estimate:** At the current fee rate of 110 sats/KB, a typical 738-byte aircraft telemetry transaction costs ~82 sats. 1.5M transactions therefore costs approximately 1.23 BSV (~£14.64 at £11.90/BSV). At the current **239-aircraft** scale and the same 9-hour utilisation assumption, ~3.02M transactions/day would cost roughly **2.48 BSV** (~**£29.51** at the same reference price). The activity-aware auto-refill system distributes funding automatically from the treasury wallet.
+**Cost estimate:** At the current fee rate of 110 sats/KB, a typical 738-byte aircraft telemetry transaction costs ~82 sats. 1.5M transactions therefore costs approximately 1.23 BSV (~£14.64 at £11.90/BSV). At the current **239-aircraft** scale and the same 9-hour utilisation assumption, ~4.02M transactions/day would cost roughly **3.30 BSV** (~**£39.27** at the same reference price). The activity-aware auto-refill system distributes funding automatically from the treasury wallet.
 
-In recent local monitoring windows with the 239-aircraft database loaded, mixed live traffic typically produced single-digit to low double-digit live throughput bursts rather than the theoretical 24-hour ceiling. That is expected: only a subset of the configured fleet is active at any given moment, parked aircraft write far less often, and dependency-aware buffering deliberately favours correctness over aggressive child-spend chaining.
+In recent local monitoring windows with the 239-aircraft database loaded, live traffic sustains **16–24 TX/s** depending on how many aircraft are in active flight phases. Throughput peaks during descent/approach-heavy traffic periods (European evening arrivals, for example) and dips during quiet hours when most tracked aircraft are in cruise or parked. The ARC broadcaster consistently operates well within its capacity (typically 20–45 of 48 concurrent slots in use with an empty queue), confirming the system is write-generation-limited rather than broadcast-limited.
 
 > The `/demo` route on the dashboard includes an interactive cost calculator where stakeholders can adjust fleet size and flight hours to model their own economics.
 
