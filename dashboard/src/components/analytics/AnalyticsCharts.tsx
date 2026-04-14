@@ -43,6 +43,8 @@ function formatTxRate(rate: number): string {
 
 const FLEET_COUNT_THROTTLE_MS = 2_000;
 
+const GROUND_PHASES: ReadonlySet<string> = new Set(["PARKED", "TAXI", "TAXI_IN", "UNKNOWN"]);
+
 function useFleetCounts() {
   const lastRef = useRef({ tracked: 0, live: 0, airborne: 0, ts: 0 });
   return useAircraftStore((s) => {
@@ -53,7 +55,7 @@ function useFleetCounts() {
     for (const ac of s.fleet.values()) {
       if (isLiveAircraft(ac.lastSeen)) {
         live++;
-        if (!ac.onGround) airborne++;
+        if (!GROUND_PHASES.has(ac.phase)) airborne++;
       }
     }
     lastRef.current = { tracked: s.fleet.size, live, airborne, ts: now };
