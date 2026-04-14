@@ -146,6 +146,7 @@ export async function buildFlightEventTx(params: {
     utxo: params.utxo,
     privateKey: params.privateKey,
     scriptBytes,
+    useChronicleVersion: true,
   });
 }
 

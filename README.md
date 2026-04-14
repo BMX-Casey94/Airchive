@@ -78,38 +78,37 @@ The operator dashboard ([https://airchive.vercel.app](https://airchive.vercel.ap
 | **Wallet List** | All 239 configured aircraft wallets with BIP44 index and WhatsonChain links, generated automatically from the configured fleet |
 | **Pitch / Cost Calculator** (`/demo`) | Interactive chain-write economics calculator — compare naive 1 tx/s vs Airchive's adaptive rate, adjust fleet size and flight hours, view phase-by-phase write rate breakdown |
 
-## BSV Chronicle Integration
+## BSV Chronicle Compatibility
 
-Airchive is built for the **Chronicle era** of BSV (activated 7 April 2026, block 943,816). All telemetry transactions are broadcast with **`tx.version = 2`**, opting into the Chronicle ruleset.
+Airchive broadcasts telemetry transactions under the **Chronicle era** of BSV (activated 7 April 2026, block 943,816). All telemetry transactions use **`tx.version = 2`**, opting into the Chronicle ruleset.
 
-### What Chronicle enables
+### What this means in practice
 
-The Chronicle upgrade restores original Bitcoin protocol features:
+- **Transaction version 2:** Every telemetry transaction sets `tx.version = 2`, which opts into the Chronicle ruleset on the network. Miners accept these transactions under the relaxed Chronicle rules (no minimal-encoding enforcement, no Clean Stack requirement, functional opcodes permitted in unlocking scripts).
+- **Version badge:** The dashboard displays a **v2** badge on each transaction in the blockchain feed, confirming it was broadcast under Chronicle rules.
+- **Standard P2PKH signing:** Inputs are signed with standard P2PKH (sig + pubkey). The signing does not currently use the Chronicle-specific OTDA sighash flag (`[0x20]`).
+- **No restored opcodes used (yet):** The current transaction format does not use any of the opcodes Chronicle restores (`OP_SUBSTR`, `OP_LEFT`, `OP_RIGHT`, `OP_SPLIT`, `OP_LSHIFTNUM`, etc.). The OP_RETURN output is a standard data carrier with the `AIRCHIVE` protocol prefix.
 
-- **Restored opcodes:** `OP_SUBSTR` (0xb3), `OP_LEFT` (0xb4), `OP_RIGHT` (0xb5) for in-script string manipulation; `OP_2MUL`, `OP_2DIV`, `OP_LSHIFTNUM`, `OP_RSHIFTNUM` for arithmetic; `OP_VER`, `OP_VERIF`, `OP_VERNOTIF` for version-gated logic.
-- **Original Transaction Digest Algorithm (OTDA):** Opt-in via the `CHRONICLE` [0x20] sighash flag, restoring the original Bitcoin transaction digest.
-- **Relaxed malleability restrictions** for `tx.version > 1`: Minimal encoding, Low-S, NULLFAIL/NULLDUMMY, MINIMALIF, Clean Stack, and data-only unlocking script requirements are all removed.
-- **Functional opcodes in unlocking scripts:** Allowed for `tx.version > 1`.
-- **32 MB script number limit:** Increased from 750 KB.
+### Chronicle roadmap
 
-### How Airchive uses Chronicle
+The transaction pipeline is structured to adopt Chronicle-native features as the ecosystem tooling matures:
 
-- **Transaction version 2:** Every telemetry transaction uses `tx.version = 2`, signalling Chronicle-era compliance and opting into the relaxed ruleset.
-- **Chronicle-validated badge:** The dashboard displays a "Chronicle" badge on transactions that were broadcast under Chronicle rules, providing visual confirmation of the protocol version.
-- **Future-ready architecture:** The transaction pipeline is designed to adopt Chronicle opcodes (e.g. `OP_SUBSTR` for in-script ICAO extraction, `OP_VER` for version-gated validation) as the ecosystem tooling matures.
+- **On-chain payload validation** — a spendable output with a locking script that uses `OP_SPLIT`/`OP_SUBSTR` to extract and verify the `AIRCHIVE` protocol prefix, ICAO address, and record type directly in script. This would make telemetry records independently verifiable on-chain without external tooling.
+- **Version-gated logic** — `OP_VER` to enforce that only Chronicle-era transactions can spend validated telemetry outputs.
+- **OTDA sighash** — opt into the original transaction digest algorithm for signing, once `@bsv/sdk` exposes the `[0x20]` flag cleanly.
 
 ### On-chain telemetry payload format
 
-Every OP_RETURN output contains a structured binary payload:
+Every OP_RETURN script is structured as `OP_FALSE OP_RETURN` followed by six individual data pushes:
 
-| Offset | Length | Field | Description |
-|--------|--------|-------|-------------|
-| 0 | 8 | Protocol ID | `"AIRCHIVE"` (ASCII) |
-| 8 | 1 | Version | `0x01` |
-| 9 | 3 | ICAO | Aircraft address (packed hex) |
-| 12 | 8 | Timestamp | Epoch milliseconds (LE uint64) |
-| 20 | 1 | Record type | `0x01` telemetry, `0x02` flight event, `0x03` telemetry delta |
-| 21+ | variable | Payload | MessagePack-encoded telemetry data |
+| Push | Bytes | Field | Description |
+|------|-------|-------|-------------|
+| 1 | 8 | Protocol ID | `"AIRCHIVE"` (ASCII) |
+| 2 | 1 | Version | `0x01` |
+| 3 | 3 | ICAO | Aircraft address (packed hex) |
+| 4 | 8 | Timestamp | Epoch milliseconds (LE uint64) |
+| 5 | 1 | Record type | `0x01` telemetry, `0x02` flight event, `0x03` telemetry delta |
+| 6 | variable | Payload | MessagePack-encoded telemetry data |
 
 ## On-chain verifiability
 

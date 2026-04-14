@@ -1,11 +1,10 @@
 /**
- * Chronicle-era telemetry transactions for Airchive.
+ * Chronicle-era constants for Airchive telemetry transactions.
  *
  * Transactions use version 2 to opt into Chronicle rules (activated
- * 7 Apr 2026, block 943,816). The OP_RETURN output embeds a
- * Chronicle validation proof — a script fragment using OP_SPLIT that
- * demonstrates on-chain ICAO and protocol ID extraction. This proof
- * is independently verifiable by any party parsing the transaction.
+ * 7 Apr 2026, block 943,816). This signals Chronicle-era compliance
+ * and allows future adoption of restored opcodes (OP_SPLIT, OP_SUBSTR,
+ * OP_VER, etc.) without requiring a transaction format change.
  *
  * Payload header layout (from buildOpReturnPayload):
  *   [0..7]  PROTOCOL_ID  "AIRCHIVE" (8 bytes)

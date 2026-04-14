@@ -106,13 +106,13 @@ function FeedRow({ entry }: { entry: BlockchainEntry }) {
 
       {!isFlightEvent && <span className="flex-1" />}
 
-      {/* Chronicle badge */}
+      {/* TX version badge */}
       {entry.chronicle_validated && (
         <span
           className="flex-shrink-0 rounded px-1 py-0.5 text-[8px] font-bold uppercase tracking-widest border border-violet-500/40 bg-violet-500/10 text-violet-400"
-          title="Chronicle-era transaction (tx.version = 2) — opts into BSV Chronicle ruleset activated 7 Apr 2026"
+          title="Version 2 transaction — broadcast under BSV Chronicle rules (activated 7 Apr 2026, block 943,816)"
         >
-          Chronicle
+          v2
         </span>
       )}
 
