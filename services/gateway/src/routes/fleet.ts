@@ -16,6 +16,7 @@ interface FleetConfigRow {
 
 type GatewayAircraftState = TelemetryRecord & {
   phase?: string;
+  flight_phase?: string;
   flight_id?: string;
   last_updated: number;
   origin_icao?: string;
@@ -25,7 +26,13 @@ type GatewayAircraftState = TelemetryRecord & {
 };
 
 export function updateAircraftState(record: Omit<GatewayAircraftState, "last_updated">): void {
-  aircraftState.set(record.icao.toUpperCase(), { ...record, last_updated: Date.now() });
+  const phase = String(record.flight_phase ?? record.phase ?? "UNKNOWN").toUpperCase();
+  aircraftState.set(record.icao.toUpperCase(), {
+    ...record,
+    phase,
+    flight_phase: phase,
+    last_updated: Date.now(),
+  });
 }
 
 async function resolveWalletAddress(icao: string): Promise<string | null> {
@@ -87,7 +94,7 @@ export async function fleetRoutes(app: FastifyInstance): Promise<void> {
         roll: live?.roll ?? null,
         squawk: live?.squawk ?? null,
         emergency: live?.emergency ?? "none",
-        flight_phase: live?.phase ?? "UNKNOWN",
+        flight_phase: live?.flight_phase ?? live?.phase ?? "UNKNOWN",
         flight_id: live?.flight_id ?? null,
         wind_dir: live?.wind_dir ?? null,
         wind_speed: live?.wind_speed ?? null,

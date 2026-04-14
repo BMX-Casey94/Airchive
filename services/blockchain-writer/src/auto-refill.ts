@@ -21,6 +21,8 @@ const ORPHAN_MEMPOOL_COOLDOWN_MS = 20_000;
 const TRANSIENT_REFILL_COOLDOWN_MS = 45_000;
 const SERIAL_REFILL_GAP_MS = 1_000;
 const REFILL_OUTPUT_DUST_LIMIT = 546;
+const MAX_CONCURRENT_REFILLS = 4;
+const MIN_ACTIVE_READY_UTXOS = 4;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -33,7 +35,8 @@ export class AutoRefillMonitor {
   private readonly idleWindowMs: number;
   private readonly refillCooldowns = new Map<string, number>();
   private treasuryFailedAt = 0;
-  private refillSerialTail: Promise<void> = Promise.resolve();
+  private refillActive = 0;
+  private readonly refillWaiters: Array<() => void> = [];
 
   constructor(
     private readonly config: Config,
@@ -72,7 +75,7 @@ export class AutoRefillMonitor {
     }
 
     this.pendingRefills.add(key);
-    void this.runSerialRefill(() => this.checkAndRefill(key, true))
+    void this.runRefillSlot(() => this.checkAndRefill(key, true))
       .finally(() => this.pendingRefills.delete(key));
   }
 
@@ -114,22 +117,27 @@ export class AutoRefillMonitor {
     let sufficientBalance = 0;
 
     try {
-      for (const aircraft of this.fleet) {
+      const orderedFleet = [...this.fleet].sort((a, b) => {
+        return Number(this.isActive(b.icao)) - Number(this.isActive(a.icao));
+      });
+
+      const results = await Promise.all(orderedFleet.map(async (aircraft) => {
         const key = aircraft.icao.toUpperCase();
         if (this.pendingRefills.has(key)) {
-          skippedIdle++;
-          continue;
+          return "skipped_idle" as const;
         }
         this.pendingRefills.add(key);
         try {
-          const result = await this.runSerialRefill(() => this.checkAndRefill(aircraft.icao, force));
-          if (result === "refilled") refilled++;
-          else if (result === "skipped_idle") skippedIdle++;
-          else sufficientBalance++;
+          return await this.runRefillSlot(() => this.checkAndRefill(aircraft.icao, force));
         } finally {
           this.pendingRefills.delete(key);
         }
-        await new Promise((r) => setTimeout(r, 200));
+      }));
+
+      for (const result of results) {
+        if (result === "refilled") refilled++;
+        else if (result === "skipped_idle") skippedIdle++;
+        else sufficientBalance++;
       }
     } catch (err) {
       log.error({ err }, "Auto-refill cycle error");
@@ -150,12 +158,19 @@ export class AutoRefillMonitor {
     const pool = await this.utxoManager.checkBalance(icao);
     const activeAircraft = this.isActive(icao);
     const targetUtxoCount = this.getTargetUtxoCount(icao, force);
+    const readyUtxoTarget = this.getReadyUtxoTarget(icao, force);
     const enforceCountTarget =
       force || activeAircraft;
 
     if (
       pool.balance >= this.config.refillThresholdSats
-      && (!enforceCountTarget || pool.unlockedUtxoCount >= targetUtxoCount)
+      && (
+        !enforceCountTarget
+        || (
+          pool.unlockedUtxoCount >= targetUtxoCount
+          && pool.readyUtxoCount >= readyUtxoTarget
+        )
+      )
     ) {
       return "sufficient";
     }
@@ -171,6 +186,7 @@ export class AutoRefillMonitor {
           coolingUtxos: pool.coolingUtxoCount,
           threshold: this.config.refillThresholdSats,
           targetUtxoCount,
+          readyUtxoTarget,
           enforceCountTarget,
         },
         "Skipping refill — aircraft idle (no recent write activity)",
@@ -179,9 +195,11 @@ export class AutoRefillMonitor {
     }
 
     const refillAmount = this.config.refillAmountSats;
+    const missingUnlockedUtxos = Math.max(0, targetUtxoCount - pool.unlockedUtxoCount);
+    const missingReadyUtxos = Math.max(0, readyUtxoTarget - pool.readyUtxoCount);
     const desiredOutputCount = this.getDesiredRefillOutputCount(
       refillAmount,
-      targetUtxoCount - pool.unlockedUtxoCount,
+      Math.max(missingUnlockedUtxos, missingReadyUtxos),
     );
 
     log.info(
@@ -194,6 +212,7 @@ export class AutoRefillMonitor {
         activeAircraft,
         threshold: this.config.refillThresholdSats,
         targetUtxoCount,
+        readyUtxoTarget,
         enforceCountTarget,
         force,
         refillAmount,
@@ -325,6 +344,11 @@ export class AutoRefillMonitor {
     return Math.max(1, this.config.activeAircraftUtxoTarget);
   }
 
+  private getReadyUtxoTarget(icao: string, force: boolean): number {
+    if (!force && !this.isActive(icao)) return 1;
+    return Math.min(this.getTargetUtxoCount(icao, force), MIN_ACTIVE_READY_UTXOS);
+  }
+
   private getDesiredRefillOutputCount(
     refillAmountSats: number,
     missingUtxos: number,
@@ -339,18 +363,34 @@ export class AutoRefillMonitor {
     return Math.max(1, Math.min(desiredByGap, maxByAmount, maxOutputsPerTx));
   }
 
-  private async runSerialRefill<T>(op: () => Promise<T>): Promise<T> {
-    const previous = this.refillSerialTail;
-    let release = () => {};
-    this.refillSerialTail = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-
-    await previous;
+  private async runRefillSlot<T>(op: () => Promise<T>): Promise<T> {
+    await this.acquireRefillSlot();
     try {
       return await op();
     } finally {
-      release();
+      this.releaseRefillSlot();
+    }
+  }
+
+  private async acquireRefillSlot(): Promise<void> {
+    if (this.refillActive < MAX_CONCURRENT_REFILLS) {
+      this.refillActive++;
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      this.refillWaiters.push(() => {
+        this.refillActive++;
+        resolve();
+      });
+    });
+  }
+
+  private releaseRefillSlot(): void {
+    this.refillActive = Math.max(0, this.refillActive - 1);
+    const next = this.refillWaiters.shift();
+    if (next) {
+      next();
     }
   }
 }
