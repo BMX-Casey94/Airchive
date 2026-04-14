@@ -55,6 +55,7 @@ export interface AircraftState {
   updateAircraft: (record: AircraftTelemetry) => void;
   updateFleet: (records: AircraftTelemetry[]) => void;
   setWalletAddresses: (mapping: Record<string, string>) => void;
+  pruneStale: (maxAgeMs?: number) => number;
 }
 
 /**
@@ -137,4 +138,21 @@ export const useAircraftStore = create<AircraftState>()((set) => ({
       }
       return { fleet: nextFleet, walletAddressMap: nextMap };
     }),
+
+  pruneStale: (maxAgeMs = 300_000) => {
+    const now = Date.now();
+    let pruned = 0;
+    set((state) => {
+      const next = new Map<string, AircraftTelemetry>();
+      for (const [icao, ac] of state.fleet) {
+        if (now - ac.lastSeen < maxAgeMs || icao === state.selectedIcao) {
+          next.set(icao, ac);
+        } else {
+          pruned++;
+        }
+      }
+      return pruned > 0 ? { fleet: next } : state;
+    });
+    return pruned;
+  },
 }));

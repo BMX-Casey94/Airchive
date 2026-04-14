@@ -5,9 +5,16 @@ import {
 } from "@airchive/types";
 import { isEmergencyCondition } from "./emergency";
 
+export type WriteRateOverrides = Partial<Record<FlightPhase, number>>;
+
 export class WriteRateController {
   private readonly lastWriteMs = new Map<string, number>();
   private readonly emergencyOverrides = new Set<string>();
+  private readonly rates: Record<FlightPhase, number>;
+
+  constructor(overrides?: WriteRateOverrides) {
+    this.rates = { ...DEFAULT_WRITE_RATES, ...overrides };
+  }
 
   shouldWrite(icao: string, phase: FlightPhase, record: TelemetryRecord): boolean {
     const key = normaliseIcao(icao);
@@ -33,7 +40,7 @@ export class WriteRateController {
     const key = normaliseIcao(icao);
     if (this.emergencyOverrides.has(key)) return 1_000;
     if (record !== undefined && isEmergencyCondition(record)) return 1_000;
-    const base = DEFAULT_WRITE_RATES[phase];
+    const base = this.rates[phase];
     return Number.isFinite(base) ? base : 1_000;
   }
 

@@ -136,11 +136,18 @@ interface WsMessage {
 
 /* ── Hook ─────────────────────────────────────────────────────── */
 
+const GLOBE_BATCH_INTERVAL_MS = 1_000;
+const PRUNE_INTERVAL_MS = 60_000;
+const STALE_AGE_MS = 300_000;
+
 export function useWebSocket() {
   const wsRef = useRef<WebSocket | null>(null);
   const backoffRef = useRef(INITIAL_BACKOFF_MS);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const subscriptionsRef = useRef<Set<string>>(new Set());
+  const globeBatchRef = useRef<Map<string, Partial<GlobeAircraftState>>>(new Map());
+  const globeFlushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const fetchBusyRef = useRef({ metrics: false, fleet: false });
 
   const [connected, setConnected] = useState(false);
 
@@ -150,8 +157,30 @@ export function useWebSocket() {
   const pushEntry = useBlockchainStore((s) => s.pushEntry);
   const setDailySummary = useBlockchainStore((s) => s.setDailySummary);
   const pushAlert = useAlertStore((s) => s.pushAlert);
-  const updateGlobeAircraft = useFleetStore((s) => s.updateAircraft);
+  const bulkUpdateGlobe = useFleetStore((s) => s.bulkUpdate);
   const pushAgentEvent = useAgentStore((s) => s.pushEvent);
+
+  const flushGlobeBatch = useCallback(() => {
+    globeFlushTimer.current = null;
+    const batch = globeBatchRef.current;
+    if (batch.size === 0) return;
+    const updates = Array.from(batch.entries());
+    batch.clear();
+    bulkUpdateGlobe(updates);
+  }, [bulkUpdateGlobe]);
+
+  const enqueueGlobeUpdate = useCallback(
+    (icao: string, patch: Partial<GlobeAircraftState>) => {
+      globeBatchRef.current.set(icao, patch);
+      if (!globeFlushTimer.current) {
+        globeFlushTimer.current = setTimeout(
+          flushGlobeBatch,
+          GLOBE_BATCH_INTERVAL_MS,
+        );
+      }
+    },
+    [flushGlobeBatch],
+  );
 
   const sendMessage = useCallback((msg: Record<string, unknown>) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -210,14 +239,14 @@ export function useWebSocket() {
           case "telemetry": {
             const raw = msg.payload as RawTelemetry;
             updateAircraft(mapTelemetry(raw));
-            updateGlobeAircraft(raw.icao, mapToGlobeState(raw));
+            enqueueGlobeUpdate(raw.icao, mapToGlobeState(raw));
             break;
           }
           case "telemetry_batch": {
             const batch = msg.payload as RawTelemetry[];
             updateFleet(batch.map(mapTelemetry));
             for (const raw of batch) {
-              updateGlobeAircraft(raw.icao, mapToGlobeState(raw));
+              enqueueGlobeUpdate(raw.icao, mapToGlobeState(raw));
             }
             break;
           }
@@ -260,7 +289,7 @@ export function useWebSocket() {
       ws.close();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [updateAircraft, updateFleet, pushEntry, setDailySummary, pushAlert, updateGlobeAircraft, pushAgentEvent, sendMessage, backfillRecentTransactions]);
+  }, [updateAircraft, updateFleet, pushEntry, setDailySummary, pushAlert, enqueueGlobeUpdate, pushAgentEvent, sendMessage, backfillRecentTransactions]);
 
   const scheduleReconnect = useCallback(() => {
     if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
@@ -280,6 +309,8 @@ export function useWebSocket() {
     connect();
 
     function fetchMetrics() {
+      if (fetchBusyRef.current.metrics) return;
+      fetchBusyRef.current.metrics = true;
       fetch(`${API_URL}/api/metrics`)
         .then((r) => r.json())
         .then((json: { success: boolean; data?: { transactions_today: number; bytes_on_chain_today: number; bsv_cost_today_sats: number; mined_today?: number; pending_today?: number; failed_today?: number; active_aircraft?: number; tx_per_second?: number } }) => {
@@ -296,12 +327,15 @@ export function useWebSocket() {
             });
           }
         })
-        .catch(() => {});
+        .catch(() => {})
+        .finally(() => { fetchBusyRef.current.metrics = false; });
     }
 
     fetchMetrics();
 
     function fetchFleetSnapshot() {
+      if (fetchBusyRef.current.fleet) return;
+      fetchBusyRef.current.fleet = true;
       fetch(`${API_URL}/api/fleet`)
         .then((r) => r.json())
         .then((json: { success: boolean; data?: RawTelemetry[] }) => {
@@ -318,17 +352,24 @@ export function useWebSocket() {
             }
           }
         })
-        .catch(() => {});
+        .catch(() => {})
+        .finally(() => { fetchBusyRef.current.fleet = false; });
     }
 
     fetchFleetSnapshot();
     const walletInterval = setInterval(fetchFleetSnapshot, 60_000);
-
     const metricsInterval = setInterval(fetchMetrics, 10_000);
+
+    const pruneInterval = setInterval(() => {
+      useAircraftStore.getState().pruneStale(STALE_AGE_MS);
+      useFleetStore.getState().pruneStale(STALE_AGE_MS);
+    }, PRUNE_INTERVAL_MS);
 
     return () => {
       clearInterval(metricsInterval);
       clearInterval(walletInterval);
+      clearInterval(pruneInterval);
+      if (globeFlushTimer.current) clearTimeout(globeFlushTimer.current);
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
       wsRef.current?.close();
     };

@@ -91,12 +91,19 @@ export class FlightPhaseDetector {
   private readonly listeners: Array<(transition: PhaseTransition) => void> = [];
 
   update(record: TelemetryRecord): FlightPhase {
+    return this.updateWithTransitions(record).phase;
+  }
+
+  updateWithTransitions(
+    record: TelemetryRecord,
+  ): { phase: FlightPhase; transitions: PhaseTransition[] } {
+    const transitions: PhaseTransition[] = [];
     const icao = normaliseIcao(record.icao);
     let state = this.states.get(icao);
     if (!state) {
       state = createStateFromFirstRecord(record);
       this.states.set(icao, state);
-      return state.currentPhase;
+      return { phase: state.currentPhase, transitions };
     }
 
     const ts = telemetryTimeMs(record);
@@ -167,6 +174,7 @@ export class FlightPhaseDetector {
         timestamp: ts,
         telemetry: record,
       };
+      transitions.push(transition);
       for (const fn of this.listeners) {
         try {
           fn(transition);
@@ -178,7 +186,7 @@ export class FlightPhaseDetector {
 
     state.lastOnGround = onGround;
     state.lastRecord = record;
-    return state.currentPhase;
+    return { phase: state.currentPhase, transitions };
   }
 
   private stepAirbornePhase(

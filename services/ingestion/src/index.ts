@@ -1,5 +1,6 @@
 import { Redis } from "ioredis";
 import { createLogger } from "@airchive/logger";
+import { FlightPhase } from "@airchive/types";
 import { loadAirports } from "@airchive/airports";
 import { createDb, getAllAircraftConfig, upsertAircraftConfig } from "@airchive/db";
 import { getConfig } from "./config.js";
@@ -139,7 +140,8 @@ async function main(): Promise<void> {
   const publisher = new TelemetryPublisher(redis);
   const dedup = new DedupFilter();
 
-  phaseEngine = new PhaseEngine({ redis, airportLookup: airports, db });
+  const writeRateOverrides = loadWriteRateOverrides();
+  phaseEngine = new PhaseEngine({ redis, airportLookup: airports, db, writeRateOverrides });
   try {
     await phaseEngine.start(trackedAircraft);
   } catch (err) {
@@ -272,6 +274,33 @@ async function main(): Promise<void> {
 
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
+}
+
+function loadWriteRateOverrides(): Partial<Record<FlightPhase, number>> | undefined {
+  const mapping: Array<[string, FlightPhase]> = [
+    ["WRITE_RATE_PARKED_MS", FlightPhase.PARKED],
+    ["WRITE_RATE_TAXI_MS", FlightPhase.TAXI],
+    ["WRITE_RATE_TAKEOFF_MS", FlightPhase.TAKEOFF],
+    ["WRITE_RATE_CLIMB_MS", FlightPhase.CLIMB],
+    ["WRITE_RATE_CRUISE_MS", FlightPhase.CRUISE],
+    ["WRITE_RATE_DESCENT_MS", FlightPhase.DESCENT],
+    ["WRITE_RATE_APPROACH_MS", FlightPhase.APPROACH],
+    ["WRITE_RATE_LANDING_MS", FlightPhase.LANDING],
+    ["WRITE_RATE_TAXI_IN_MS", FlightPhase.TAXI_IN],
+  ];
+  const overrides: Partial<Record<FlightPhase, number>> = {};
+  let found = false;
+  for (const [envKey, phase] of mapping) {
+    const raw = process.env[envKey];
+    if (raw !== undefined && raw !== "") {
+      const val = Number.parseInt(raw, 10);
+      if (Number.isFinite(val) && val > 0) {
+        overrides[phase] = val;
+        found = true;
+      }
+    }
+  }
+  return found ? overrides : undefined;
 }
 
 main().catch((err) => {

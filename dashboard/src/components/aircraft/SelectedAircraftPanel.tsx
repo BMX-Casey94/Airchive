@@ -297,10 +297,10 @@ function AircraftDetail({ ac }: { ac: AircraftTelemetry }) {
 }
 
 export function SelectedAircraftPanel() {
-  const fleet = useAircraftStore((s) => s.fleet);
   const selectedIcao = useAircraftStore((s) => s.selectedIcao);
-
-  const ac = selectedIcao ? fleet.get(selectedIcao) ?? null : null;
+  const ac = useAircraftStore((s) =>
+    s.selectedIcao ? s.fleet.get(s.selectedIcao) ?? null : null,
+  );
 
   return (
     <Panel title="Selected Aircraft">

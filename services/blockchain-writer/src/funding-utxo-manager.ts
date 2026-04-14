@@ -17,6 +17,8 @@ import { fundingPoolBalance, fundingPoolCount } from "./metrics.js";
 const log = createLogger({ service: "blockchain-writer:funding-utxo" });
 
 const MIN_USABLE_SATS = 546;
+const MIN_RECONCILE_INTERVAL_MS = 30_000;
+const RATE_LIMITED_COOLDOWN_MS = 120_000;
 
 interface WocUtxo {
   tx_hash: string;
@@ -26,6 +28,9 @@ interface WocUtxo {
 }
 
 export class FundingUtxoManager {
+  private reconcileInFlight: Promise<void> | null = null;
+  private reconcileEarliestRetryAt = 0;
+
   constructor(
     private readonly db: Knex,
     private readonly wocApiUrl: string,
@@ -145,9 +150,21 @@ export class FundingUtxoManager {
 
   /**
    * Reconcile local state against on-chain reality.
-   * Adds missing UTXOs and removes spent ones.
+   * De-duplicated: if a reconciliation is in-flight, callers join it;
+   * if one completed recently (or WoC rate-limited us), callers skip.
    */
   async reconcile(fundingWif: string): Promise<void> {
+    if (Date.now() < this.reconcileEarliestRetryAt) return;
+    if (this.reconcileInFlight) return this.reconcileInFlight;
+
+    this.reconcileInFlight = this.doReconcile(fundingWif).finally(() => {
+      this.reconcileInFlight = null;
+    });
+
+    return this.reconcileInFlight;
+  }
+
+  private async doReconcile(fundingWif: string): Promise<void> {
     const fundingKey = PrivateKey.fromWif(fundingWif);
     const address = fundingKey.toAddress();
     const pkh = derivePubKeyHash(fundingKey);
@@ -157,9 +174,16 @@ export class FundingUtxoManager {
     try {
       onChain = await this.fetchFromChain(address);
     } catch (err) {
-      log.warn({ err }, "Funding reconciliation skipped — WoC unreachable");
+      const msg = (err as Error).message ?? "";
+      const cooldown = msg.includes("429")
+        ? RATE_LIMITED_COOLDOWN_MS
+        : MIN_RECONCILE_INTERVAL_MS;
+      this.reconcileEarliestRetryAt = Date.now() + cooldown;
+      log.warn({ err, retryInMs: cooldown }, "Funding reconciliation skipped — WoC unreachable");
       return;
     }
+
+    this.reconcileEarliestRetryAt = Date.now() + MIN_RECONCILE_INTERVAL_MS;
 
     const onChainSet = new Set(onChain.map((u) => `${u.tx_hash}:${u.tx_pos}`));
 

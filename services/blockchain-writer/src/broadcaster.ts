@@ -250,6 +250,13 @@ export class ArcBroadcaster extends EventEmitter {
     };
   }
 
+  getLimits(): Pick<ArcBroadcasterConfig, "maxConcurrentBroadcasts" | "maxQueueDepth"> {
+    return {
+      maxConcurrentBroadcasts: this.config.maxConcurrentBroadcasts,
+      maxQueueDepth: this.config.maxQueueDepth,
+    };
+  }
+
   isDegraded(): boolean {
     const state = this.getState();
     return state.circuitOpen

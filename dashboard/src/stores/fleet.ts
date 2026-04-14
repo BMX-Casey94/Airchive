@@ -23,6 +23,7 @@ interface FleetState {
   bulkUpdate: (updates: Array<[string, Partial<AircraftState>]>) => void;
   removeAircraft: (icao: string) => void;
   clearFleet: () => void;
+  pruneStale: (maxAgeMs?: number) => number;
 }
 
 export const useFleetStore = create<FleetState>()((set, get) => ({
@@ -173,4 +174,26 @@ export const useFleetStore = create<FleetState>()((set, get) => ({
       selectedIcao: null,
       selectedFlightId: null,
     }),
+
+  pruneStale: (maxAgeMs = 300_000) => {
+    const now = Date.now();
+    let pruned = 0;
+    set((state) => {
+      const nextAircraft = new Map<string, AircraftState>();
+      const nextTrails = new Map<string, PositionSnapshot[]>();
+      for (const [icao, ac] of state.aircraft) {
+        if (now - ac.lastSeen < maxAgeMs || icao === state.selectedIcao) {
+          nextAircraft.set(icao, ac);
+          const t = state.trails.get(icao);
+          if (t) nextTrails.set(icao, t);
+        } else {
+          pruned++;
+        }
+      }
+      return pruned > 0
+        ? { aircraft: nextAircraft, trails: nextTrails }
+        : state;
+    });
+    return pruned;
+  },
 }));

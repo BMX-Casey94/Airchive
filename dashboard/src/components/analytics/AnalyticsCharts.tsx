@@ -1,5 +1,6 @@
 "use client";
 
+import { useRef } from "react";
 import { useBlockchainStore } from "@/stores/blockchain-store";
 import { useAircraftStore } from "@/stores/aircraft-store";
 import { fmtBytes, fmtSats } from "@/lib/format";
@@ -40,21 +41,30 @@ function formatTxRate(rate: number): string {
   return rate.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
 }
 
+const FLEET_COUNT_THROTTLE_MS = 2_000;
+
+function useFleetCounts() {
+  const lastRef = useRef({ tracked: 0, live: 0, airborne: 0, ts: 0 });
+  return useAircraftStore((s) => {
+    const now = Date.now();
+    if (now - lastRef.current.ts < FLEET_COUNT_THROTTLE_MS) return lastRef.current;
+    let live = 0;
+    let airborne = 0;
+    for (const ac of s.fleet.values()) {
+      if (isLiveAircraft(ac.lastSeen)) {
+        live++;
+        if (!ac.onGround) airborne++;
+      }
+    }
+    lastRef.current = { tracked: s.fleet.size, live, airborne, ts: now };
+    return lastRef.current;
+  });
+}
+
 export function AnalyticsCharts() {
   const summary = useBlockchainStore((s) => s.dailySummary);
-  const fleet = useAircraftStore((s) => s.fleet);
-
-  const aircraft = Array.from(fleet.values());
-  const trackedCount = summary.trackedAircraftCount || aircraft.length;
-  const liveCount = aircraft.filter((ac) => isLiveAircraft(ac.lastSeen)).length;
-  const airborneCount = aircraft.filter(
-    (ac) => isLiveAircraft(ac.lastSeen) && !ac.onGround,
-  ).length;
-
-  const minedCount = summary.minedCount;
-  const pendingCount = summary.pendingCount;
-  const failedCount = summary.failedCount;
-  const totalStatusCount = minedCount + pendingCount + failedCount;
+  const { tracked, live: liveCount, airborne: airborneCount } = useFleetCounts();
+  const trackedCount = summary.trackedAircraftCount || tracked;
 
   return (
     <Panel title="Analytics">
@@ -102,48 +112,7 @@ export function AnalyticsCharts() {
           />
         </div>
 
-        {/* Transaction status breakdown */}
-        {totalStatusCount > 0 && (
-          <div className="space-y-2">
-            <p className="hud-label text-[9px]">Transaction Status</p>
-            <div className="flex gap-2 h-2 rounded-full overflow-hidden bg-space-black border border-panel-border">
-              {minedCount > 0 && (
-                <div
-                  className="h-full bg-signal-green rounded-full transition-all duration-500"
-                  style={{
-                    width: `${(minedCount / totalStatusCount) * 100}%`,
-                  }}
-                  title={`${minedCount} mined`}
-                />
-              )}
-              {pendingCount > 0 && (
-                <div
-                  className="h-full bg-neon-amber rounded-full transition-all duration-500"
-                  style={{
-                    width: `${(pendingCount / totalStatusCount) * 100}%`,
-                  }}
-                  title={`${pendingCount} pending`}
-                />
-              )}
-              {failedCount > 0 && (
-                <div
-                  className="h-full bg-alert-red rounded-full transition-all duration-500"
-                  style={{
-                    width: `${(failedCount / totalStatusCount) * 100}%`,
-                  }}
-                  title={`${failedCount} failed`}
-                />
-              )}
-            </div>
-            <div className="flex justify-between text-[9px] font-mono">
-              <span className="text-signal-green">{minedCount} mined</span>
-              <span className="text-neon-amber">{pendingCount} pending</span>
-              <span className="text-alert-red">{failedCount} failed</span>
-            </div>
-          </div>
-        )}
-
-        {totalStatusCount === 0 && summary.txCount === 0 && (
+        {summary.txCount === 0 && (
           <div className="flex flex-col items-center justify-center py-4 gap-2">
             <p className="text-[11px] text-hud-muted">
               Analytics will populate once blockchain transactions begin.

@@ -149,6 +149,20 @@ export async function buildFlightEventTx(params: {
   });
 }
 
+export function computeTxid(tx: Transaction): string {
+  try {
+    const id = (tx as unknown as { id?: (enc: string) => string }).id?.("hex");
+    if (typeof id === "string" && id.length === 64) return id;
+  } catch { /* fall through to manual derivation */ }
+
+  const raw = tx.toBinary();
+  const hash = Hash.hash256(raw as number[]) as number[];
+  return hash
+    .reverse()
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
 export async function buildRawOpReturnTx(params: {
   utxo: UTXORecord;
   privateKey: PrivateKey;

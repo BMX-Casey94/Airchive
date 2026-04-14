@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useRef, memo } from "react";
 import { useAircraftStore } from "@/stores/aircraft-store";
 import type { AircraftTelemetry } from "@/stores/aircraft-store";
 import { TRACKED_AIRCRAFT_MAP } from "@/lib/tracked-aircraft";
@@ -8,7 +8,6 @@ import { refinePhase } from "@/lib/refine-phase";
 import PhaseBadge from "@/components/ui/PhaseBadge";
 import { FlightPhase } from "@/types/airchive";
 import { fmtAltitude, fmtSpeed, fmtHeading, fmtRelativeTime } from "@/lib/format";
-import { motion } from "framer-motion";
 import clsx from "clsx";
 import Panel from "@/components/ui/Panel";
 
@@ -26,7 +25,7 @@ function hasBeenSeen(ac: AircraftTelemetry): boolean {
 
 type FleetFilter = "all" | "live" | "offline";
 
-function FleetCard({
+const FleetCard = memo(function FleetCard({
   ac,
   selected,
   onClick,
@@ -40,14 +39,11 @@ function FleetCard({
   const info = TRACKED_AIRCRAFT_MAP.get(ac.icao);
 
   return (
-    <motion.button
+    <button
       type="button"
       onClick={onClick}
-      whileHover={{ scale: 1.02 }}
-      whileTap={{ scale: 0.98 }}
-      transition={{ type: "spring", stiffness: 400, damping: 25 }}
       className={clsx(
-        "relative w-full rounded-xl border p-3 text-left transition-colors",
+        "relative w-full rounded-xl border p-3 text-left transition-colors hover:scale-[1.02] active:scale-[0.98]",
         "bg-panel-bg/25 backdrop-blur-xl",
         selected
           ? "border-electric-cyan/60 shadow-glow-cyan"
@@ -157,9 +153,9 @@ function FleetCard({
             : "Awaiting first ADS-B sighting"}
         </p>
       )}
-    </motion.button>
+    </button>
   );
-}
+});
 
 function MiniReadout({
   label,
@@ -185,13 +181,27 @@ function MiniReadout({
   );
 }
 
+const GRID_THROTTLE_MS = 2_000;
+
+function useThrottledFleet(): AircraftTelemetry[] {
+  const cacheRef = useRef<{ list: AircraftTelemetry[]; ts: number }>({
+    list: [],
+    ts: 0,
+  });
+  return useAircraftStore((s) => {
+    const now = Date.now();
+    if (now - cacheRef.current.ts < GRID_THROTTLE_MS) return cacheRef.current.list;
+    cacheRef.current = { list: Array.from(s.fleet.values()), ts: now };
+    return cacheRef.current.list;
+  });
+}
+
 export function FleetStatusGrid() {
   const [filter, setFilter] = useState<FleetFilter>("all");
-  const fleet = useAircraftStore((s) => s.fleet);
+  const aircraft = useThrottledFleet();
   const selectedIcao = useAircraftStore((s) => s.selectedIcao);
   const selectAircraft = useAircraftStore((s) => s.selectAircraft);
 
-  const aircraft = Array.from(fleet.values());
   const liveFirst = [...aircraft].sort((a, b) => {
     const aLive = isLive(a);
     const bLive = isLive(b);

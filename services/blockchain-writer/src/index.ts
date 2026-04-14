@@ -32,7 +32,7 @@ import { FundingUtxoManager } from "./funding-utxo-manager.js";
 import { AutoRefillMonitor } from "./auto-refill.js";
 import { WriteBuffer } from "./write-buffer.js";
 import { ConfirmationPoller } from "./confirmation-poller.js";
-import { buildFlightEventTx, buildTelemetryTx } from "./tx-builder.js";
+import { buildFlightEventTx, buildTelemetryTx, computeTxid } from "./tx-builder.js";
 import { registry } from "./metrics.js";
 
 const log = createLogger({ service: "blockchain-writer" });
@@ -345,6 +345,30 @@ async function main(): Promise<void> {
       });
 
       if (result.status === "FAILED") {
+        if (isDependencyPendingBroadcastFailure(result)) {
+          const localTxid = computeTxid(tx);
+          await utxoManager.recordSpend(
+            utxo.txid, utxo.vout,
+            localTxid, 1,
+            changeOutput.satoshis, changeOutput.lockingScript, icao,
+          );
+          const orphanRow = {
+            txid: localTxid,
+            aircraft_icao: icao,
+            record_type: RecordType.TELEMETRY,
+            status: "SEEN_ON_NETWORK" as const,
+            timestamp: Date.now(),
+            fee_sats: Number(utxo.satoshis) - changeOutput.satoshis,
+            size_bytes: tx.toBinary().length,
+            flight_id: telemetry.flight_id,
+            chronicle_validated: !!changeOutput.isChronicle,
+          };
+          await insertTxResult(db, orphanRow);
+          await publisher.publish("txresult", JSON.stringify(orphanRow)).catch(() => {});
+          confirmationPoller?.nudge();
+          log.info({ icao, txid: localTxid, code: result.code }, "Orphan-mempool broadcast recorded optimistically");
+          return;
+        }
         throw await handleFailedAircraftBroadcast(
           icao,
           utxoManager,
@@ -440,6 +464,29 @@ async function main(): Promise<void> {
       });
 
       if (result.status === "FAILED") {
+        if (isDependencyPendingBroadcastFailure(result)) {
+          const localTxid = computeTxid(tx);
+          await utxoManager.recordSpend(
+            utxo.txid, utxo.vout,
+            localTxid, 1,
+            changeOutput.satoshis, changeOutput.lockingScript, icao,
+          );
+          const orphanRow = {
+            txid: localTxid,
+            aircraft_icao: icao,
+            record_type: RecordType.FLIGHT_EVENT,
+            status: "SEEN_ON_NETWORK" as const,
+            timestamp: Date.now(),
+            fee_sats: Number(utxo.satoshis) - changeOutput.satoshis,
+            size_bytes: tx.toBinary().length,
+            flight_id: event.flight_id,
+          };
+          await insertTxResult(db, orphanRow);
+          await publisher.publish("txresult", JSON.stringify(orphanRow)).catch(() => {});
+          confirmationPoller?.nudge();
+          log.info({ icao, txid: localTxid, code: result.code }, "Orphan-mempool flight-event recorded optimistically");
+          return;
+        }
         throw await handleFailedAircraftBroadcast(
           icao,
           utxoManager,

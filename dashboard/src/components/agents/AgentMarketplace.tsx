@@ -130,6 +130,9 @@ export function AgentMarketplace() {
         title="Agent Marketplace"
         headerAction={
           <div className="flex items-center gap-3">
+            <span className="text-[9px] font-mono text-hud-muted/50 italic">
+              (this session)
+            </span>
             <span className="text-[9px] font-mono text-hud-muted">
               {totalPayments.toLocaleString("en-GB")} payments
             </span>
@@ -150,25 +153,25 @@ export function AgentMarketplace() {
             ))}
           </div>
 
-          {/* Stats Row */}
+          {/* Stats Row — session-scoped counters (reset on page reload) */}
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
             <StatTile
-              label="Total Payments"
+              label="Payments (session)"
               value={totalPayments.toLocaleString("en-GB")}
               colour="text-electric-cyan"
             />
             <StatTile
-              label="Collector Earned"
+              label="Earned (session)"
               value={fmtSats(totalEarnedSats)}
               colour="text-signal-green"
             />
             <StatTile
-              label="Agents Spent"
+              label="Spent (session)"
               value={fmtSats(totalSpentSats)}
               colour="text-neon-amber"
             />
             <StatTile
-              label="Discovery Events"
+              label="Discoveries (session)"
               value={events.filter((e) => e.type === "discovery").length.toString()}
               colour="text-signal-green"
             />

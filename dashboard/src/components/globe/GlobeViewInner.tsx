@@ -379,17 +379,36 @@ export default function GlobeViewInner() {
       }
     }
 
-    /* Subscribe to store changes — runs outside React render cycle */
-    const unsub = useFleetStore.subscribe(() => {
-      cancelAnimationFrame(rafRef.current);
-      rafRef.current = requestAnimationFrame(syncEntities);
-    });
+    /* Subscribe to store changes — throttled to ~1 Hz to prevent CPU overload */
+    let lastSyncTs = 0;
+    let throttleTimer: ReturnType<typeof setTimeout> | null = null;
+    const GLOBE_SYNC_INTERVAL_MS = 1_000;
+
+    const throttledSync = () => {
+      const now = Date.now();
+      const elapsed = now - lastSyncTs;
+      if (elapsed >= GLOBE_SYNC_INTERVAL_MS) {
+        lastSyncTs = now;
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = requestAnimationFrame(syncEntities);
+      } else if (!throttleTimer) {
+        throttleTimer = setTimeout(() => {
+          throttleTimer = null;
+          lastSyncTs = Date.now();
+          cancelAnimationFrame(rafRef.current);
+          rafRef.current = requestAnimationFrame(syncEntities);
+        }, GLOBE_SYNC_INTERVAL_MS - elapsed);
+      }
+    };
+
+    const unsub = useFleetStore.subscribe(throttledSync);
 
     /* Initial sync */
     syncEntities();
 
     return () => {
       unsub();
+      if (throttleTimer) clearTimeout(throttleTimer);
       cancelAnimationFrame(rafRef.current);
       handler.destroy();
       if (handlerRef.current === handler) handlerRef.current = null;

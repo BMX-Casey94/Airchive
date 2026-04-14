@@ -203,6 +203,11 @@ export class AutoRefillMonitor {
     );
 
     try {
+      if (Date.now() < this.treasuryFailedAt + TREASURY_FAILURE_COOLDOWN_MS) {
+        this.refillCooldowns.set(icao.toUpperCase(), Date.now() + REFILL_COOLDOWN_MS);
+        return "skipped_idle";
+      }
+
       const fundingKey = PrivateKey.fromWif(this.config.fundingWalletWif);
       const minRequired = refillAmount + estimateRefillFee(desiredOutputCount) + 100;
 

@@ -3,6 +3,7 @@ import {
   WriteRateController,
   isEmergencyCondition,
   getEmergencyDescription,
+  type WriteRateOverrides,
 } from "@airchive/flight-phase";
 import {
   FlightPhase,
@@ -72,6 +73,7 @@ export interface PhaseEngineOptions {
   redis: Redis;
   airportLookup: AirportLookup;
   db: Knex;
+  writeRateOverrides?: WriteRateOverrides;
 }
 
 export class PhaseEngine {
@@ -83,7 +85,7 @@ export class PhaseEngine {
 
   private readonly phaseDetector = new FlightPhaseDetector();
 
-  private readonly writeRateController = new WriteRateController();
+  private readonly writeRateController: WriteRateController;
 
   private readonly activeSessions = new Map<string, FlightSession>();
 
@@ -91,23 +93,17 @@ export class PhaseEngine {
 
   private readonly sessionAggs = new Map<string, SessionAgg>();
 
-  private readonly transitionBuffer: PhaseTransition[] = [];
-
   private subscriber: Redis | null = null;
 
   private subscribedChannels: string[] = [];
 
-  private processChain = Promise.resolve();
-
-  private unsubTransition: (() => void) | null = null;
+  private readonly processChainsByIcao = new Map<string, Promise<void>>();
 
   constructor(opts: PhaseEngineOptions) {
     this.redis = opts.redis;
     this.airportLookup = opts.airportLookup;
     this.db = opts.db;
-    this.unsubTransition = this.phaseDetector.onTransition((t) => {
-      this.transitionBuffer.push(t);
-    });
+    this.writeRateController = new WriteRateController(opts.writeRateOverrides);
   }
 
   async start(trackedAircraft: string[]): Promise<void> {
@@ -124,9 +120,7 @@ export class PhaseEngine {
     });
 
     sub.on("message", (channel, message) => {
-      this.processChain = this.processChain
-        .then(() => this.onTelemetryMessage(channel, message))
-        .catch((e) => log.error({ err: e, channel }, "PhaseEngine message handler failed"));
+      this.queueTelemetryMessage(channel, message);
     });
 
     const channels = trackedAircraft.map((icao) => `telemetry:${normaliseIcao(icao)}`);
@@ -149,13 +143,9 @@ export class PhaseEngine {
   }
 
   async stop(): Promise<void> {
-    if (this.unsubTransition) {
-      this.unsubTransition();
-      this.unsubTransition = null;
-    }
-
     const sub = this.subscriber;
     this.subscriber = null;
+    this.processChainsByIcao.clear();
     if (!sub) return;
 
     try {
@@ -172,6 +162,56 @@ export class PhaseEngine {
     this.subscribedChannels = [];
   }
 
+  private queueTelemetryMessage(channel: string, message: string): void {
+    const prefix = "telemetry:";
+    if (!channel.startsWith(prefix)) return;
+
+    const icao = normaliseIcao(channel.slice(prefix.length));
+    const previous = this.processChainsByIcao.get(icao) ?? Promise.resolve();
+    let next: Promise<void>;
+    next = previous
+      .catch(() => {})
+      .then(() => this.onTelemetryMessage(channel, message))
+      .catch((err) => {
+        log.error({ err, channel, icao }, "PhaseEngine message handler failed");
+      })
+      .finally(() => {
+        if (this.processChainsByIcao.get(icao) === next) {
+          this.processChainsByIcao.delete(icao);
+        }
+      });
+    this.processChainsByIcao.set(icao, next);
+  }
+
+  private detectPhaseUpdate(
+    record: TelemetryRecord,
+  ): { phase: FlightPhase; transitions: PhaseTransition[] } {
+    const detector = this.phaseDetector as FlightPhaseDetector & {
+      updateWithTransitions?: (
+        input: TelemetryRecord,
+      ) => { phase: FlightPhase; transitions: PhaseTransition[] };
+    };
+
+    if (typeof detector.updateWithTransitions === "function") {
+      return detector.updateWithTransitions(record);
+    }
+
+    const transitions: PhaseTransition[] = [];
+    const icao = normaliseIcao(record.icao);
+    const unsubscribe = this.phaseDetector.onTransition((transition) => {
+      if (normaliseIcao(transition.aircraft_icao) === icao) {
+        transitions.push(transition);
+      }
+    });
+
+    try {
+      const phase = this.phaseDetector.update(record);
+      return { phase, transitions };
+    } finally {
+      unsubscribe();
+    }
+  }
+
   private async onTelemetryMessage(channel: string, message: string): Promise<void> {
     const prefix = "telemetry:";
     if (!channel.startsWith(prefix)) return;
@@ -185,9 +225,7 @@ export class PhaseEngine {
     }
 
     const icao = normaliseIcao(record.icao);
-    this.transitionBuffer.length = 0;
-    const phase = this.phaseDetector.update(record);
-    const transitions = this.transitionBuffer.splice(0);
+    const { phase, transitions } = this.detectPhaseUpdate(record);
 
     for (const t of transitions) {
       await this.handlePhaseTransition(t);
