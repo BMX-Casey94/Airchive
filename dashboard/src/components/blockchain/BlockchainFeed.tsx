@@ -33,7 +33,8 @@ export default function BlockchainFeed() {
       Today: {summary.txCount.toLocaleString("en-GB")} tx
       {" · "}
       {fmtBytes(summary.totalBytes)}
-      {" · "}
+      <span className="hidden sm:inline">{" · "}</span>
+      <br className="sm:hidden" />
       {fmtSats(summary.totalSats)}
     </span>
   );

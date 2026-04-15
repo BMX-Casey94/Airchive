@@ -309,7 +309,7 @@ export function SelectedAircraftPanel() {
           <div className="h-10 w-10 rounded-full border border-muted-blue/30 flex items-center justify-center">
             <span className="text-hud-muted text-lg">✈</span>
           </div>
-          <p className="text-sm text-hud-muted">
+          <p className="text-sm text-hud-muted text-center">
             Select an aircraft from the fleet grid to view telemetry.
           </p>
         </div>

@@ -129,18 +129,20 @@ export function AgentMarketplace() {
       <Panel
         title="Agent Marketplace"
         headerAction={
-          <div className="flex items-center gap-3">
+          <div className="flex flex-col items-end gap-0.5 sm:flex-row sm:items-center sm:gap-3">
+            <div className="flex items-center gap-3">
+              <span className="text-[9px] font-mono text-hud-muted">
+                {totalPayments.toLocaleString("en-GB")} payments
+              </span>
+              <span className="text-[9px] font-mono text-signal-green">
+                +{fmtSats(totalEarnedSats)}
+              </span>
+              <span className="text-[9px] font-mono text-neon-amber">
+                -{fmtSats(totalSpentSats)}
+              </span>
+            </div>
             <span className="text-[9px] font-mono text-hud-muted/50 italic">
               (this session)
-            </span>
-            <span className="text-[9px] font-mono text-hud-muted">
-              {totalPayments.toLocaleString("en-GB")} payments
-            </span>
-            <span className="text-[9px] font-mono text-signal-green">
-              +{fmtSats(totalEarnedSats)}
-            </span>
-            <span className="text-[9px] font-mono text-neon-amber">
-              -{fmtSats(totalSpentSats)}
             </span>
           </div>
         }
