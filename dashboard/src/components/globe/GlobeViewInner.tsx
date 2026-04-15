@@ -110,6 +110,11 @@ export default function GlobeViewInner() {
       // Allow the globe itself to occlude aircraft on the far side.
       viewer.scene.globe.depthTestAgainstTerrain = true;
 
+      // Render at the native device resolution so the globe, labels, and
+      // icons are sharp on high-DPI / Retina mobile screens instead of
+      // being up-scaled from a 1× CSS-pixel canvas.
+      viewer.resolutionScale = window.devicePixelRatio ?? 1;
+
       cesiumRef.current = Cesium;
       viewerRef.current = viewer;
 

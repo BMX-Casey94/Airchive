@@ -122,7 +122,14 @@ export function AlertsPanel() {
                   : "border-electric-cyan/30 bg-electric-cyan/10 text-electric-cyan hover:bg-electric-cyan/20",
               )}
             >
-              {isSimulating ? "Sending..." : "Simulate/Test Alert System"}
+              {isSimulating ? (
+                "Sending..."
+              ) : (
+                <>
+                  <span className="sm:hidden">Simulate Alert</span>
+                  <span className="hidden sm:inline">Simulate/Test Alert System</span>
+                </>
+              )}
             </button>
           </div>
 
