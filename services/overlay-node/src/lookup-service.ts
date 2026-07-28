@@ -1,11 +1,7 @@
-import type {
-  FlightEventRecord,
-  FlightSession,
-  TelemetryRecord,
-} from "@airchive/types";
+import type { FlightSession } from "@airchive/types";
 import type { Knex } from "knex";
 
-import { parseAirchiveTx } from "./tx-parser.js";
+import { parseAirchiveTx, type AirchivePayload } from "./tx-parser.js";
 
 const ICAO_HEX = /^[0-9a-fA-F]{6}$/;
 const TXID_HEX = /^[0-9a-fA-F]{64}$/;
@@ -40,7 +36,7 @@ export interface TxLookupRow {
   flight_id: string | null;
   created_at: string;
   flight_session: FlightSessionJson | null;
-  payload: TelemetryRecord | FlightEventRecord | null;
+  payload: AirchivePayload | null;
 }
 
 function normaliseIcao(icao: string): string {
@@ -121,7 +117,7 @@ function sessionFromJoin(row: Record<string, unknown>): FlightSessionJson | null
 
 function mapTxRow(
   row: Record<string, unknown>,
-  payload: TelemetryRecord | FlightEventRecord | null,
+  payload: AirchivePayload | null,
 ): TxLookupRow {
   const created =
     row.created_at instanceof Date
@@ -153,7 +149,7 @@ function mapTxRow(
   };
 }
 
-function decodePayloadFromRow(row: Record<string, unknown>): TelemetryRecord | FlightEventRecord | null {
+function decodePayloadFromRow(row: Record<string, unknown>): AirchivePayload | null {
   const buf = bufferFromRow(row.op_return);
   if (buf === null) {
     return null;

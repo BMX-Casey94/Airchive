@@ -20,12 +20,24 @@ import { createLogger } from "@airchive/logger";
 import { Redis } from "ioredis";
 import type { Knex } from "knex";
 import * as sessionManager from "./session-manager.js";
+import {
+  phaseEngineMessagesTotal,
+  phaseEngineWriteDecisionsTotal,
+} from "./metrics.js";
 
 const log = createLogger({ service: "ingestion" });
 
 function normaliseIcao(icao: string): string {
   return icao.trim().toUpperCase();
 }
+
+/** Radius within which departures and arrivals are recorded at full rate. */
+const AIRPORT_PROXIMITY_MILES = 10;
+/**
+ * Above this altitude an aircraft is overflying, not arriving. Without the
+ * ceiling, cruise traffic over a busy region would sit permanently at 1 Hz.
+ */
+const AIRPORT_PROXIMITY_MAX_ALT_FT = 10_000;
 
 function headingDeg(record: TelemetryRecord): number {
   const t = record.track;
@@ -112,11 +124,19 @@ export class PhaseEngine {
       return;
     }
 
-    const sub = this.redis.duplicate();
+    const sub = this.redis.duplicate({
+      lazyConnect: true,
+      keepAlive: 10_000,
+      retryStrategy: (times) => Math.min(times * 500, 5_000),
+    });
     this.subscriber = sub;
 
     sub.on("error", (err) => {
       log.error({ err: err.message }, "PhaseEngine Redis subscriber error");
+    });
+
+    sub.on("reconnecting", (delayMs: number) => {
+      log.warn({ delayMs }, "PhaseEngine Redis subscriber reconnecting");
     });
 
     sub.on("message", (channel, message) => {
@@ -212,6 +232,36 @@ export class PhaseEngine {
     }
   }
 
+  /**
+   * True within {@link AIRPORT_PROXIMITY_MILES} of any airport. Only meaningful
+   * at low altitude — an airliner at cruise passes over airports constantly and
+   * must not be treated as arriving. Returns false when the airport database is
+   * empty, leaving phase-based rates in charge.
+   */
+  private isNearAirport(record: TelemetryRecord): boolean {
+    if (this.airportLookup.count === 0) return false;
+    if (!Number.isFinite(record.lat) || !Number.isFinite(record.lon)) return false;
+    if (
+      Number.isFinite(record.alt_baro)
+      && record.alt_baro > AIRPORT_PROXIMITY_MAX_ALT_FT
+      && record.on_ground !== true
+    ) {
+      return false;
+    }
+
+    const nearest = this.airportLookup.findNearest(
+      record.lat,
+      record.lon,
+      AIRPORT_PROXIMITY_MILES,
+    );
+    if (!nearest) return false;
+
+    return (
+      haversineDistanceMiles(record.lat, record.lon, nearest.lat, nearest.lon)
+      <= AIRPORT_PROXIMITY_MILES
+    );
+  }
+
   private async onTelemetryMessage(channel: string, message: string): Promise<void> {
     const prefix = "telemetry:";
     if (!channel.startsWith(prefix)) return;
@@ -226,6 +276,7 @@ export class PhaseEngine {
 
     const icao = normaliseIcao(record.icao);
     const { phase, transitions } = this.detectPhaseUpdate(record);
+    phaseEngineMessagesTotal.inc();
 
     for (const t of transitions) {
       await this.handlePhaseTransition(t);
@@ -238,11 +289,17 @@ export class PhaseEngine {
       log.warn({ icao, desc }, "Emergency condition active; write interval overridden");
     }
 
-    const allowWrite = this.writeRateController.shouldWrite(icao, phase, record);
-    if (allowWrite) {
+    this.writeRateController.setProximityOverride(icao, this.isNearAirport(record));
+
+    const trigger = this.writeRateController.getWriteTrigger(icao, phase, record);
+    phaseEngineWriteDecisionsTotal.inc({
+      phase,
+      decision: trigger ?? "rate_limited",
+    });
+    if (trigger !== null) {
       const payload = JSON.stringify(record);
       await this.redis.publish(`write:${icao}`, payload);
-      this.writeRateController.recordWrite(icao);
+      this.writeRateController.recordWrite(icao, phase, record);
       const session = this.activeSessions.get(icao);
       if (session) {
         await sessionManager.incrementTxCount(this.db, session.id);
@@ -262,6 +319,11 @@ export class PhaseEngine {
       dest_name: session?.dest_name,
     };
     await this.redis.publish("broadcast", JSON.stringify(enriched));
+    // The dashboard treats any `broadcast` as "this aircraft is live", but the
+    // writer only ever saw the rate-limited `write:` channel. Publishing the
+    // same liveness edge keeps refill's view of activity identical to the
+    // operator's, so a visibly-flying aircraft can never be judged idle.
+    await this.redis.publish("aircraft-activity", icao);
     this.accumulateTelemetry(icao, record);
   }
 

@@ -34,5 +34,8 @@ COPY --from=build /app/packages/logger/package.json packages/logger/
 COPY --from=build /app/services/overlay-node/dist services/overlay-node/dist
 COPY --from=build /app/services/overlay-node/package.json services/overlay-node/
 COPY --from=deps /app/node_modules ./node_modules
+COPY deploy/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 USER node
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["node", "services/overlay-node/dist/index.js"]

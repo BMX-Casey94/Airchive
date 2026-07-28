@@ -6,6 +6,7 @@ import type {
 } from "@airchive/types";
 import { RecordType } from "@airchive/types";
 import {
+  buildOpReturnPayload,
   buildOpReturnScript,
   encodeFlightEventPayload,
   encodeTelemetryPayload,
@@ -26,6 +27,11 @@ export interface BuildResult {
     lockingScript: string;
     isChronicle?: boolean;
   };
+  /**
+   * The flat AIRCHIVE envelope carried in the OP_RETURN. Persisted with the
+   * transaction so history can be decoded without refetching from a miner.
+   */
+  opReturn?: Uint8Array;
 }
 
 export function derivePubKeyHash(key: PrivateKey): number[] {
@@ -53,16 +59,59 @@ export function calculateFee(estimatedBytes: number): number {
   return Math.ceil((estimatedBytes / 1000) * SATS_PER_KB * FEE_BUFFER);
 }
 
+interface SpendableOutputRef {
+  txid: string;
+  vout: number;
+  satoshis: number;
+  lockingScript: string;
+}
+
+function buildSourceTransaction(output: SpendableOutputRef): Transaction {
+  const sourceTx = new Transaction();
+  for (let vout = 0; vout < output.vout; vout++) {
+    sourceTx.addOutput({
+      lockingScript: Script.fromBinary([]),
+      satoshis: 0,
+    });
+  }
+  sourceTx.addOutput({
+    lockingScript: Script.fromHex(output.lockingScript),
+    satoshis: output.satoshis,
+  });
+  return sourceTx;
+}
+
+function addSpendableInput(
+  tx: Transaction,
+  spend: SpendableOutputRef,
+  privateKey: PrivateKey,
+): void {
+  const inputLockScript = Script.fromHex(spend.lockingScript);
+  tx.addInput({
+    sourceTransaction: buildSourceTransaction(spend),
+    sourceTXID: spend.txid,
+    sourceOutputIndex: spend.vout,
+    unlockingScriptTemplate: new P2PKH().unlock(
+      privateKey,
+      "all",
+      false,
+      spend.satoshis,
+      inputLockScript,
+    ),
+    sequence: 0xffffffff,
+  });
+}
+
 async function buildOpReturnTx(params: {
   utxo: UTXORecord;
   privateKey: PrivateKey;
   scriptBytes: number[];
+  opReturn?: Uint8Array;
   useChronicleVersion?: boolean;
 }): Promise<BuildResult> {
-  const { utxo, privateKey, scriptBytes, useChronicleVersion } = params;
+  const { utxo, privateKey, scriptBytes, opReturn, useChronicleVersion } = params;
   const inputSats = Number(utxo.satoshis);
   const pkh = derivePubKeyHash(privateKey);
-  const inputLockScript = Script.fromHex(utxo.locking_script);
   const changeLockScript = new P2PKH().lock(pkh);
 
   const inputSize = INPUT_OVERHEAD + P2PKH_UNLOCK_SIZE;
@@ -80,12 +129,12 @@ async function buildOpReturnTx(params: {
   const tx = new Transaction();
   tx.version = useChronicleVersion ? CHRONICLE_TX_VERSION : 1;
 
-  tx.addInput({
-    sourceTXID: utxo.txid,
-    sourceOutputIndex: utxo.vout,
-    unlockingScriptTemplate: new P2PKH().unlock(privateKey, "all", false, inputSats, inputLockScript),
-    sequence: 0xffffffff,
-  });
+  addSpendableInput(tx, {
+    txid: utxo.txid,
+    vout: utxo.vout,
+    satoshis: inputSats,
+    lockingScript: utxo.locking_script,
+  }, privateKey);
 
   tx.addOutput({
     lockingScript: Script.fromBinary(scriptBytes),
@@ -106,6 +155,7 @@ async function buildOpReturnTx(params: {
       lockingScript: changeLockScript.toHex(),
       isChronicle: !!useChronicleVersion,
     },
+    opReturn,
   };
 }
 
@@ -116,16 +166,23 @@ export async function buildTelemetryTx(params: {
   recordType: RecordType;
 }): Promise<BuildResult> {
   const payloadBytes = encodeTelemetryPayload(params.telemetry);
+  const recordType = params.recordType as 0x01 | 0x02 | 0x03;
   const scriptBytes = buildOpReturnScript(
     params.telemetry.icao,
     params.telemetry.ts,
-    params.recordType as 0x01 | 0x02 | 0x03,
+    recordType,
     payloadBytes,
   );
   return buildOpReturnTx({
     utxo: params.utxo,
     privateKey: params.privateKey,
     scriptBytes,
+    opReturn: buildOpReturnPayload(
+      params.telemetry.icao,
+      params.telemetry.ts,
+      recordType,
+      payloadBytes,
+    ),
     useChronicleVersion: true,
   });
 }
@@ -136,9 +193,11 @@ export async function buildFlightEventTx(params: {
   event: FlightEventRecord;
 }): Promise<BuildResult> {
   const payloadBytes = encodeFlightEventPayload(params.event);
+  // Captured once so the script and the persisted envelope cannot disagree.
+  const timestamp = Date.now();
   const scriptBytes = buildOpReturnScript(
     params.event.icao,
-    Date.now(),
+    timestamp,
     0x02 as 0x01 | 0x02 | 0x03,
     payloadBytes,
   );
@@ -146,6 +205,12 @@ export async function buildFlightEventTx(params: {
     utxo: params.utxo,
     privateKey: params.privateKey,
     scriptBytes,
+    opReturn: buildOpReturnPayload(
+      params.event.icao,
+      timestamp,
+      0x02 as 0x01 | 0x02 | 0x03,
+      payloadBytes,
+    ),
     useChronicleVersion: true,
   });
 }
@@ -172,16 +237,23 @@ export async function buildRawOpReturnTx(params: {
   recordType: RecordType;
   payload: Uint8Array;
 }): Promise<BuildResult> {
+  const recordType = params.recordType as 0x01 | 0x02 | 0x03;
   const scriptBytes = buildOpReturnScript(
     params.icao,
     params.timestamp,
-    params.recordType as 0x01 | 0x02 | 0x03,
+    recordType,
     params.payload,
   );
   return buildOpReturnTx({
     utxo: params.utxo,
     privateKey: params.privateKey,
     scriptBytes,
+    opReturn: buildOpReturnPayload(
+      params.icao,
+      params.timestamp,
+      recordType,
+      params.payload,
+    ),
   });
 }
 
@@ -205,20 +277,12 @@ export async function buildConsolidationTx(
   const tx = new Transaction();
 
   for (const utxo of utxos) {
-    const sats = Number(utxo.satoshis);
-    const lockScript = Script.fromHex(utxo.locking_script);
-    tx.addInput({
-      sourceTXID: utxo.txid,
-      sourceOutputIndex: utxo.vout,
-      unlockingScriptTemplate: new P2PKH().unlock(
-        privateKey,
-        "all",
-        false,
-        sats,
-        lockScript,
-      ),
-      sequence: 0xffffffff,
-    });
+    addSpendableInput(tx, {
+      txid: utxo.txid,
+      vout: utxo.vout,
+      satoshis: Number(utxo.satoshis),
+      lockingScript: utxo.locking_script,
+    }, privateKey);
   }
 
   tx.addOutput({
@@ -254,39 +318,58 @@ const REFILL_OUTPUT_DUST_LIMIT = 546;
 export function estimateRefillFee(
   recipientOutputCount: number,
   includeChange = true,
+  inputCount = 1,
 ): number {
   const safeRecipientCount = Math.max(1, Math.floor(recipientOutputCount));
+  const safeInputCount = Math.max(1, Math.floor(inputCount));
   const outputCount = safeRecipientCount + (includeChange ? 1 : 0);
   const estSize =
     TX_OVERHEAD +
-    varintSize(1) +
-    (INPUT_OVERHEAD + P2PKH_UNLOCK_SIZE) +
+    varintSize(safeInputCount) +
+    (INPUT_OVERHEAD + P2PKH_UNLOCK_SIZE) * safeInputCount +
     (P2PKH_OUTPUT_SIZE * outputCount);
   return calculateFee(estSize);
 }
 
+export interface FundingInput {
+  txid: string;
+  vout: number;
+  satoshis: number;
+  lockingScript: string;
+}
+
+/**
+ * Builds a treasury → aircraft refill. Multiple funding inputs are supported
+ * because a heavily split treasury can hold plenty of value overall while no
+ * single output covers a refill on its own; requiring one large UTXO in that
+ * state stalls every write despite the money being there.
+ */
 export async function buildRefillTx(params: {
-  fundingUtxo: { txid: string; vout: number; satoshis: number; lockingScript: string };
+  fundingUtxos: FundingInput[];
   fundingKey: PrivateKey;
   recipientPkh: number[];
   amountSats: number;
   recipientOutputCount?: number;
 }): Promise<RefillResult> {
   const {
-    fundingUtxo,
+    fundingUtxos,
     fundingKey,
     recipientPkh,
     amountSats,
     recipientOutputCount = 1,
   } = params;
-  const inputSats = fundingUtxo.satoshis;
+  if (fundingUtxos.length === 0) {
+    throw new Error("Refill requires at least one funding UTXO");
+  }
+  const inputSats = fundingUtxos.reduce((sum, utxo) => sum + utxo.satoshis, 0);
   const safeRecipientCount = Math.max(1, Math.floor(recipientOutputCount));
-  const fee = estimateRefillFee(safeRecipientCount);
+  const fee = estimateRefillFee(safeRecipientCount, true, fundingUtxos.length);
 
   const changeSats = inputSats - amountSats - fee;
   if (changeSats < 0) {
     throw new Error(
-      `Funding UTXO insufficient: ${inputSats} sats for ${amountSats} + ${fee} fee`,
+      `Funding UTXOs insufficient: ${inputSats} sats across ${fundingUtxos.length} `
+        + `input(s) for ${amountSats} + ${fee} fee`,
     );
   }
 
@@ -295,20 +378,14 @@ export async function buildRefillTx(params: {
   const recipientLockScript = new P2PKH().lock(recipientPkh);
   const tx = new Transaction();
 
-  const fundingLockScript = Script.fromHex(fundingUtxo.lockingScript);
-
-  tx.addInput({
-    sourceTXID: fundingUtxo.txid,
-    sourceOutputIndex: fundingUtxo.vout,
-    unlockingScriptTemplate: new P2PKH().unlock(
-      fundingKey,
-      "all",
-      false,
-      inputSats,
-      fundingLockScript,
-    ),
-    sequence: 0xffffffff,
-  });
+  for (const utxo of fundingUtxos) {
+    addSpendableInput(tx, {
+      txid: utxo.txid,
+      vout: utxo.vout,
+      satoshis: utxo.satoshis,
+      lockingScript: utxo.lockingScript,
+    }, fundingKey);
+  }
 
   const baseRecipientSats = Math.floor(amountSats / safeRecipientCount);
   const remainder = amountSats % safeRecipientCount;
@@ -352,4 +429,63 @@ export async function buildRefillTx(params: {
     changeSats: changeVout !== null ? changeSats : 0,
     changeLockingScript: changeLockingScriptHex,
   };
+}
+
+export interface FundingSplitResult {
+  tx: Transaction;
+  outputs: Array<{ vout: number; satoshis: number; lockingScript: string }>;
+}
+
+/**
+ * Reshapes the treasury: spends one or more funding outputs back to the funding
+ * address as `targetOutputCount` equal outputs. One input with many outputs is a
+ * split; many inputs with one output is a consolidation. Both are the same
+ * transaction shape, so they share a builder.
+ */
+export async function buildFundingSplitTx(params: {
+  fundingUtxos: FundingInput[];
+  fundingKey: PrivateKey;
+  targetOutputCount: number;
+}): Promise<FundingSplitResult> {
+  const { fundingUtxos, fundingKey, targetOutputCount } = params;
+  if (fundingUtxos.length === 0) {
+    throw new Error("Funding reshape requires at least one input");
+  }
+  const inputSats = fundingUtxos.reduce((sum, utxo) => sum + utxo.satoshis, 0);
+  const safeCount = Math.max(1, Math.min(targetOutputCount, 50));
+  const fee = estimateRefillFee(safeCount, false, fundingUtxos.length);
+  const availableSats = inputSats - fee;
+  if (availableSats < safeCount * REFILL_OUTPUT_DUST_LIMIT) {
+    throw new Error(
+      `Cannot reshape funding UTXOs: ${inputSats} sats across `
+        + `${fundingUtxos.length} input(s) is too small for ${safeCount} outputs`,
+    );
+  }
+
+  const baseSats = Math.floor(availableSats / safeCount);
+  const remainder = availableSats % safeCount;
+
+  const fundingPkh = derivePubKeyHash(fundingKey);
+  const lockScript = new P2PKH().lock(fundingPkh);
+  const lockScriptHex = lockScript.toHex();
+  const tx = new Transaction();
+
+  for (const utxo of fundingUtxos) {
+    addSpendableInput(tx, {
+      txid: utxo.txid,
+      vout: utxo.vout,
+      satoshis: utxo.satoshis,
+      lockingScript: utxo.lockingScript,
+    }, fundingKey);
+  }
+
+  const outputs: FundingSplitResult["outputs"] = [];
+  for (let i = 0; i < safeCount; i++) {
+    const sats = baseSats + (i < remainder ? 1 : 0);
+    tx.addOutput({ lockingScript: lockScript, satoshis: sats });
+    outputs.push({ vout: i, satoshis: sats, lockingScript: lockScriptHex });
+  }
+
+  await tx.sign();
+  return { tx, outputs };
 }

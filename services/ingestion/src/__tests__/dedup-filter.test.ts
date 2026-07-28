@@ -74,7 +74,21 @@ describe("DedupFilter", () => {
     expect(f.shouldPublish({ ...r })).toBe(false);
   });
 
-  it("suppresses a record when position and motion deltas stay within the thresholds", () => {
+  it("suppresses a parked aircraft whose deltas stay within the ground thresholds", () => {
+    const f = new DedupFilter();
+    const r = mockRecord({ on_ground: true, alt_baro: 0, gs: 0 });
+    f.recordPublished(r);
+    const smallMove = mockRecord({
+      on_ground: true,
+      lat: r.lat + 0.00005,
+      lon: r.lon + 0.00005,
+      alt_baro: r.alt_baro + 10,
+      gs: r.gs + 1,
+    });
+    expect(f.shouldPublish(smallMove)).toBe(false);
+  });
+
+  it("publishes an airborne aircraft whose deltas would be suppressed on the ground", () => {
     const f = new DedupFilter();
     const r = mockRecord();
     f.recordPublished(r);
@@ -84,7 +98,14 @@ describe("DedupFilter", () => {
       alt_baro: r.alt_baro + 10,
       gs: r.gs + 1,
     });
-    expect(f.shouldPublish(smallMove)).toBe(false);
+    expect(f.shouldPublish(smallMove)).toBe(true);
+  });
+
+  it("still suppresses an airborne aircraft that has genuinely not changed", () => {
+    const f = new DedupFilter();
+    const r = mockRecord();
+    f.recordPublished(r);
+    expect(f.shouldPublish(mockRecord({ alt_baro: r.alt_baro + 5 }))).toBe(false);
   });
 
   it("allows a record when the position change exceeds the threshold", () => {

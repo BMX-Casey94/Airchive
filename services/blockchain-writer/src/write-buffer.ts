@@ -19,26 +19,31 @@ import {
   isDependencyPendingBroadcastFailure,
   isLocalBackpressureBroadcastFailure,
   isTransientBroadcastFailure,
-  type ArcBroadcaster,
+  type Broadcaster,
 } from "./broadcaster.js";
 import type { UtxoManager } from "./utxo-manager.js";
 import { buildRawOpReturnTx, computeTxid } from "./tx-builder.js";
 import { insertTxResult } from "@airchive/db";
-import { pendingWritesGauge } from "./metrics.js";
+import {
+  pendingWritesGauge,
+  recordTypeMetricLabel,
+  writerWriteIngressTotal,
+  writerWriteOutcomesTotal,
+} from "./metrics.js";
 import type { AutoRefillMonitor } from "./auto-refill.js";
 
 const log = createLogger({ service: "blockchain-writer:write-buffer" });
 
-const RETRY_INTERVAL_MS = 5_000;
+const RETRY_INTERVAL_MS = 2_500;
 const RETRY_BATCH_SIZE = 100;
 const RETRY_MAX_PARALLEL_AIRCRAFT = 12;
 const RETRY_CONCURRENCY_DIVISOR = 4;
-const TRANSIENT_BROADCAST_COOLDOWN_MS = 45_000;
+const TRANSIENT_BROADCAST_COOLDOWN_MS = 3_000;
 
 type PendingWrite = Awaited<ReturnType<typeof getPendingWrites>>[number];
 
 type RetryWriteOutcome =
-  | { type: "succeeded"; icao: string }
+  | { type: "succeeded"; icao: string; blockReason?: string }
   | { type: "deferred"; icao: string; requestRefill: boolean; blockReason?: string }
   | { type: "failed"; icao: string };
 
@@ -50,12 +55,30 @@ interface RetryGroupOutcome {
   refillRequested: Set<string>;
 }
 
+function isUtxoUnavailableWriteDeferral(message: string): boolean {
+  return message.includes("No available UTXOs")
+    || message.includes("UTXO spend cooling down")
+    || message.includes("UTXO ready reserve protected")
+    // A stale pool is a funding problem, not a bad payload. Treating it as a
+    // retry would burn the retry budget and hand the write to the purge.
+    || message.includes("pool is stale");
+}
+
 function isTransientWriteDeferral(message: string): boolean {
   return message.includes("Broadcast dependency pending")
     || message.includes("Broadcast local backpressure")
     || message.includes("Broadcast transient failure")
-    || message.includes("UTXO spend cooling down")
-    || message.includes("No available UTXOs");
+    || isUtxoUnavailableWriteDeferral(message);
+}
+
+function classifyRetryDeferralOutcome(message: string): string {
+  return isUtxoUnavailableWriteDeferral(message)
+    ? "deferred_utxo_unavailable"
+    : "deferred_backpressure";
+}
+
+function formatRetryBackoffReason(remainingMs: number): string {
+  return `Retry propagation backoff active (${remainingMs}ms remaining)`;
 }
 
 export class WriteBuffer {
@@ -63,16 +86,36 @@ export class WriteBuffer {
   private retrying = false;
   private redisPublisher: Redis | null = null;
   private autoRefill: AutoRefillMonitor | null = null;
+  private drainBatchSize: number | null = null;
+  private fundingDryGate: (() => boolean) | null = null;
 
   constructor(
     private readonly db: Knex,
-    private readonly broadcaster: ArcBroadcaster,
+    private readonly broadcaster: Broadcaster,
     private readonly utxoManager: UtxoManager,
     private readonly vault: WalletVault,
   ) {}
 
   setAutoRefill(refill: AutoRefillMonitor): void {
     this.autoRefill = refill;
+  }
+
+  /**
+   * Caps how many writes a single retry cycle attempts. Recovery from a funding
+   * outage uses this so a backlog accumulated over hours is released steadily
+   * rather than all at once.
+   */
+  setDrainBatchSize(size: number | null): void {
+    this.drainBatchSize = size === null ? null : Math.max(1, Math.floor(size));
+  }
+
+  /**
+   * While the treasury is dry every retry is certain to fail on UTXO
+   * acquisition, so the loop pauses entirely instead of burning the retry
+   * budget and ageing the backlog towards the purge.
+   */
+  setFundingDryGate(gate: () => boolean): void {
+    this.fundingDryGate = gate;
   }
 
   setRedisPublisher(redis: Redis): void {
@@ -159,7 +202,23 @@ export class WriteBuffer {
         return 0;
       }
 
-      const pending = await getPendingWrites(this.db, RETRY_BATCH_SIZE);
+      // While the treasury cannot fund a refill, every retry is guaranteed to
+      // fail on UTXO acquisition. Churning through them only burns broadcaster
+      // capacity and buries the real cause in deferral noise.
+      if (this.autoRefill?.isTreasuryBlocked()) {
+        log.debug("Skipping retry cycle — treasury backing off, writes cannot be funded");
+        return 0;
+      }
+
+      // The drain during recovery calls retry() directly, so the gate is only
+      // consulted for the scheduled loop.
+      if (this.drainBatchSize === null && this.fundingDryGate?.()) {
+        log.debug("Skipping retry cycle — treasury dry, backlog held until refunded");
+        return 0;
+      }
+
+      const batchSize = this.drainBatchSize ?? RETRY_BATCH_SIZE;
+      const pending = await getPendingWrites(this.db, batchSize);
       if (pending.length === 0) return 0;
 
       const pendingByAircraft = this.groupPendingWritesByAircraft(pending);
@@ -254,9 +313,35 @@ export class WriteBuffer {
     let successCount = 0;
     let deferredCount = 0;
     let blockedReason: string | null = null;
+    const icao = writes[0]?.aircraft_icao;
+
+    if (!icao) {
+      return {
+        successCount,
+        deferredCount,
+        failedByIcao,
+        deferredByIcao,
+        refillRequested,
+      };
+    }
+
+    const retryBackoffRemainingMs = this.autoRefill?.getRetryBackoffRemainingMs(icao) ?? 0;
+    if (retryBackoffRemainingMs > 0) {
+      log.debug(
+        { icao, remainingMs: retryBackoffRemainingMs },
+        formatRetryBackoffReason(retryBackoffRemainingMs),
+      );
+      deferredByIcao.set(icao, writes.length);
+      return {
+        successCount,
+        deferredCount: writes.length,
+        failedByIcao,
+        deferredByIcao,
+        refillRequested,
+      };
+    }
 
     for (const write of writes) {
-      const icao = write.aircraft_icao;
       if (blockedReason) {
         await markWriteDeferred(this.db, write.id, blockedReason).catch(() => {});
         deferredByIcao.set(icao, (deferredByIcao.get(icao) ?? 0) + 1);
@@ -267,15 +352,20 @@ export class WriteBuffer {
       const outcome = await this.retryPendingWrite(write);
       if (outcome.type === "succeeded") {
         successCount++;
+        if (outcome.blockReason) {
+          blockedReason = outcome.blockReason;
+        }
         continue;
       }
 
       if (outcome.type === "deferred") {
         deferredByIcao.set(icao, (deferredByIcao.get(icao) ?? 0) + 1);
         deferredCount++;
+        if (outcome.blockReason) {
+          blockedReason = outcome.blockReason;
+        }
         if (outcome.requestRefill) {
           refillRequested.add(icao);
-          blockedReason = outcome.blockReason ?? "No available UTXOs";
         }
         continue;
       }
@@ -296,14 +386,18 @@ export class WriteBuffer {
     write: PendingWrite,
   ): Promise<RetryWriteOutcome> {
     const icao = write.aircraft_icao;
+    const recordTypeLabel = recordTypeMetricLabel(write.record_type);
+    writerWriteIngressTotal.inc({ path: "retry", record_type: recordTypeLabel });
     let utxoAcquired = false;
     let utxoTxid = "";
     let utxoVout = 0;
+    let broadcastAttempted = false;
 
     try {
       const privateKey = this.vault.getAircraftPrivateKey(icao);
       const walletAddress = this.vault.getAircraftAddress(icao);
-      const utxo = await this.utxoManager.acquireUtxo(icao);
+      const retryReadyReserve = this.autoRefill?.getRetryReadyReserve(icao) ?? 0;
+      const utxo = await this.utxoManager.acquireUtxo(icao, retryReadyReserve);
       utxoAcquired = true;
       utxoTxid = utxo.txid;
       utxoVout = utxo.vout;
@@ -313,7 +407,7 @@ export class WriteBuffer {
           ? new Uint8Array(write.payload)
           : write.payload;
 
-      const { tx, changeOutput } = await buildRawOpReturnTx({
+      const { tx, changeOutput, opReturn } = await buildRawOpReturnTx({
         utxo,
         privateKey,
         icao,
@@ -326,19 +420,28 @@ export class WriteBuffer {
         write.record_type === RecordTypeEnum.FLIGHT_EVENT
           ? BroadcastPriority.RETRY_EVENT
           : BroadcastPriority.RETRY_TELEMETRY;
+      broadcastAttempted = true;
       const result = await this.broadcaster.broadcast(tx, icao, {
         kind: "retry",
         priority: retryPriority,
       });
 
       if (result.status === "FAILED") {
-        if (isDependencyPendingBroadcastFailure(result)) {
+        // Only meaningful without an upstream SEEN_ON_NETWORK gate; with one,
+        // an orphan result is a real failure and must not be recorded as a send.
+        if (
+          isDependencyPendingBroadcastFailure(result)
+          && !this.broadcaster.hasSeenOnNetworkGate
+        ) {
           const localTxid = computeTxid(tx);
-          await this.utxoManager.recordSpend(
+          const poolState = await this.utxoManager.recordSpend(
             utxo.txid, utxo.vout,
             localTxid, 1,
             changeOutput.satoshis, changeOutput.lockingScript, icao,
           );
+          const blockReason = `Broadcast dependency pending: ${result.code ?? result.description ?? "unknown"}`;
+          this.autoRefill?.noteRetryPressure(icao, blockReason);
+          this.autoRefill?.requestRefillIfPoolLow(icao, poolState);
           utxoAcquired = false;
           const orphanRow = {
             txid: localTxid,
@@ -350,12 +453,17 @@ export class WriteBuffer {
             size_bytes: tx.toBinary().length,
             flight_id: write.flight_id ?? undefined,
           };
-          await insertTxResult(this.db, orphanRow);
+          await insertTxResult(this.db, { ...orphanRow, op_return: opReturn });
           await this.redisPublisher?.publish("txresult", JSON.stringify(orphanRow)).catch(() => {});
           log.info({ icao, txid: localTxid, code: result.code }, "Retry orphan-mempool recorded optimistically");
           await deletePendingWrite(this.db, write.id);
           pendingWritesGauge.dec();
-          return { type: "succeeded", icao };
+          writerWriteOutcomesTotal.inc({
+            path: "retry",
+            record_type: recordTypeLabel,
+            outcome: "optimistic_orphan",
+          });
+          return { type: "succeeded", icao, blockReason };
         }
         if (isLocalBackpressureBroadcastFailure(result)) {
           throw new Error(`Broadcast local backpressure: ${result.code ?? "unknown"}`);
@@ -380,7 +488,7 @@ export class WriteBuffer {
 
       const txid = result.txid;
 
-      await this.utxoManager.recordSpend(
+      const poolState = await this.utxoManager.recordSpend(
         utxo.txid,
         utxo.vout,
         txid,
@@ -389,6 +497,7 @@ export class WriteBuffer {
         changeOutput.lockingScript,
         icao,
       );
+      this.autoRefill?.requestRefillIfPoolLow(icao, poolState);
 
       const retryResultRow = {
         txid,
@@ -400,29 +509,48 @@ export class WriteBuffer {
         size_bytes: tx.toBinary().length,
         flight_id: write.flight_id ?? undefined,
       };
-      await insertTxResult(this.db, retryResultRow);
+      await insertTxResult(this.db, { ...retryResultRow, op_return: opReturn });
       await this.redisPublisher?.publish("txresult", JSON.stringify(retryResultRow)).catch(() => {});
 
       await deletePendingWrite(this.db, write.id);
       pendingWritesGauge.dec();
+      writerWriteOutcomesTotal.inc({
+        path: "retry",
+        record_type: recordTypeLabel,
+        outcome: "broadcasted",
+      });
       return { type: "succeeded", icao };
     } catch (err) {
-      if (utxoAcquired) {
+      // Only an input the network was never offered may go straight back into
+      // the pool. Once it has been broadcast, unlocking it risks a second
+      // transaction spending it, and the resulting conflict silently kills the
+      // aircraft's whole chain — so leave it locked and let the chain decide.
+      if (utxoAcquired && !broadcastAttempted) {
         await this.utxoManager
           .releaseUtxo(utxoTxid, utxoVout)
+          .catch(() => {});
+      } else if (utxoAcquired) {
+        void this.utxoManager
+          .reconcile(icao, this.vault.getAircraftAddress(icao))
           .catch(() => {});
       }
 
       const msg = (err as Error).message ?? "";
-      const requestRefill =
-        msg.includes("No available UTXOs")
-        || msg.includes("UTXO spend cooling down");
+      const requestRefill = isUtxoUnavailableWriteDeferral(msg);
+      if (requestRefill) {
+        this.autoRefill?.noteRetryPressure(icao, msg);
+      }
       if (requestRefill) {
         this.autoRefill?.requestRefill(icao);
       }
 
       if (isTransientWriteDeferral(msg)) {
         await markWriteDeferred(this.db, write.id, msg).catch(() => {});
+        writerWriteOutcomesTotal.inc({
+          path: "retry",
+          record_type: recordTypeLabel,
+          outcome: classifyRetryDeferralOutcome(msg),
+        });
         return {
           type: "deferred",
           icao,
@@ -432,6 +560,11 @@ export class WriteBuffer {
       }
 
       await markWriteRetried(this.db, write.id, msg).catch(() => {});
+      writerWriteOutcomesTotal.inc({
+        path: "retry",
+        record_type: recordTypeLabel,
+        outcome: "failed",
+      });
       return { type: "failed", icao };
     }
   }

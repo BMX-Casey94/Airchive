@@ -1,6 +1,14 @@
+import type { Knex } from "knex";
 import type { TelemetryRecord } from "@airchive/types";
+import { RecordType } from "@airchive/types";
 import { createLogger } from "@airchive/logger";
-import { analyseFleet, summariseAnalysis, type FleetAnalysis } from "./analysis-engine.js";
+import {
+  analyseFleet,
+  summariseAnalysis,
+  type Anomaly,
+  type FleetAnalysis,
+} from "./analysis-engine.js";
+import { inscribeAgentRecord, type InscriptionSink } from "./agent-inscriptions.js";
 import { getPrice } from "./data-products.js";
 import {
   agentPaymentsTotal,
@@ -12,6 +20,55 @@ import type { AgentActivityPublisher } from "./activity-publisher.js";
 import { identityRegistryUnavailable } from "./identity-utils.js";
 
 const log = createLogger({ service: "analyst-agent" });
+
+/**
+ * Anomalies are inscribed in full rather than as a count, but the payload still
+ * has to fit an OP_RETURN comfortably. Highest severity first, so a truncated
+ * list never drops a critical event in favour of an informational one.
+ */
+const MAX_INSCRIBED_ANOMALIES = 25;
+const MAX_INSCRIBED_STALE = 50;
+/** Two missed inscriptions in a row means the agent is not actually working. */
+const UNHEALTHY_FAILURE_STREAK = 2;
+
+const SEVERITY_RANK: Record<Anomaly["severity"], number> = {
+  critical: 0,
+  warning: 1,
+  info: 2,
+};
+
+function buildAnalysisRecord(
+  analysis: FleetAnalysis,
+  summary: string,
+): Record<string, unknown> {
+  const ranked = [...analysis.anomalies].sort(
+    (a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity],
+  );
+
+  return {
+    v: 1,
+    ts: analysis.timestamp,
+    summary,
+    totalAircraft: analysis.totalAircraft,
+    airborne: analysis.airborne,
+    grounded: analysis.grounded,
+    avgAltFt: analysis.avgAltitudeFt,
+    avgGsKts: analysis.avgGroundSpeedKts,
+    maxAltFt: analysis.maxAltitudeFt,
+    maxSpeedKts: analysis.maxSpeedKts,
+    phases: analysis.phaseDistribution,
+    anomalyCount: analysis.anomalies.length,
+    anomalies: ranked.slice(0, MAX_INSCRIBED_ANOMALIES).map((anomaly) => ({
+      icao: anomaly.icao,
+      type: anomaly.type,
+      severity: anomaly.severity,
+      value: anomaly.value,
+      threshold: anomaly.threshold,
+    })),
+    staleCount: analysis.staleAircraft.length,
+    stale: analysis.staleAircraft.slice(0, MAX_INSCRIBED_STALE),
+  };
+}
 
 export interface AnalystWallet {
   getIdentityKey(): string;
@@ -34,15 +91,48 @@ export class AnalystAgent {
   private cycleCount = 0;
   private totalSpentSats = 0;
   private lastAnalysis: FleetAnalysis | null = null;
+  private lastCycleAt = 0;
+  private lastInscriptionAt = 0;
+  private consecutiveInscriptionFailures = 0;
 
   constructor(
     collector: CollectorAgent,
     activityPub: AgentActivityPublisher,
     intervalMs: number,
+    private readonly db: Knex,
+    private readonly sink: InscriptionSink | null,
   ) {
     this.collector = collector;
     this.activityPub = activityPub;
     this.intervalMs = intervalMs;
+  }
+
+  /**
+   * Real health, not a timer. An agent that cannot land records on-chain is
+   * degraded no matter how reliably its loop ticks.
+   */
+  getHealth(): { status: "running" | "degraded" | "stopped"; detail: string } {
+    if (!this.running) return { status: "stopped", detail: "Agent is not running" };
+
+    const cycleGap = Date.now() - this.lastCycleAt;
+    if (this.lastCycleAt > 0 && cycleGap > this.intervalMs * 3) {
+      return {
+        status: "degraded",
+        detail: `No completed cycle for ${Math.round(cycleGap / 1000)}s`,
+      };
+    }
+    if (this.consecutiveInscriptionFailures >= UNHEALTHY_FAILURE_STREAK) {
+      return {
+        status: "degraded",
+        detail: `${this.consecutiveInscriptionFailures} consecutive inscription failures`,
+      };
+    }
+    return {
+      status: "running",
+      detail: this.lastInscriptionAt > 0
+        ? `Last inscription ${Math.round((Date.now() - this.lastInscriptionAt) / 1000)}s ago`
+        : "Awaiting first inscription",
+    };
   }
 
   async start(wallet: AnalystWallet): Promise<void> {
@@ -198,55 +288,36 @@ export class AnalystAgent {
           this.lastAnalysis = analysis;
           const summary = summariseAnalysis(analysis);
 
-          try {
-            const inscription = await this.wallet.inscribeText(
-              JSON.stringify({
-                type: "AIRCHIVE_ANALYSIS",
-                version: 1,
-                ts: analysis.timestamp,
-                summary,
-                airborne: analysis.airborne,
-                grounded: analysis.grounded,
-                avgAlt: analysis.avgAltitudeFt,
-                avgGs: analysis.avgGroundSpeedKts,
-                maxAlt: analysis.maxAltitudeFt,
-                anomalyCount: analysis.anomalies.length,
-                staleCount: analysis.staleAircraft.length,
-                phases: analysis.phaseDistribution,
-              }),
-            );
+          const inscription = await inscribeAgentRecord({
+            db: this.db,
+            sink: this.sink,
+            agentLabel: "analyst",
+            recordType: RecordType.AGENT_ANALYSIS,
+            record: buildAnalysisRecord(analysis, summary),
+          });
 
+          if (inscription) {
+            this.lastInscriptionAt = Date.now();
+            this.consecutiveInscriptionFailures = 0;
             analysisPublishedTotal.inc();
-            log.info(
-              { txid: inscription.txid, cycle: this.cycleCount, summary },
-              "Analysis published on-chain",
-            );
-
-            await this.activityPub.publishAnalysis(
-              "analyst",
-              summary,
-              inscription.txid,
-              {
-                airborne: analysis.airborne,
-                grounded: analysis.grounded,
-                anomalies: analysis.anomalies.length,
-              },
-            );
-          } catch (err) {
-            log.debug({ err }, "On-chain inscription failed (non-fatal)");
-            await this.activityPub.publishAnalysis(
-              "analyst",
-              summariseAnalysis(analysis),
-              "pending",
-              {
-                airborne: analysis.airborne,
-                grounded: analysis.grounded,
-                anomalies: analysis.anomalies.length,
-              },
-            );
+          } else {
+            this.consecutiveInscriptionFailures++;
           }
+
+          await this.activityPub.publishAnalysis(
+            "analyst",
+            summary,
+            inscription?.txid ?? "failed",
+            {
+              airborne: analysis.airborne,
+              grounded: analysis.grounded,
+              anomalies: analysis.anomalies.length,
+              inscribed: inscription !== null,
+            },
+          );
         }
       }
+      this.lastCycleAt = Date.now();
     } catch (err) {
       log.error({ err, cycle: this.cycleCount }, "Analysis cycle failed");
     }

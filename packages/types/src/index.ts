@@ -14,6 +14,10 @@ export enum RecordType {
   TELEMETRY = 0x01,
   FLIGHT_EVENT = 0x02,
   TELEMETRY_DELTA = 0x03,
+  /** Fleet-wide analysis inscribed by the Analyst agent. */
+  AGENT_ANALYSIS = 0x04,
+  /** Coverage summary inscribed by the Monitor agent. */
+  AGENT_MONITOR = 0x05,
 }
 
 export type EmergencyString =
@@ -121,6 +125,8 @@ export interface UTXORecord {
   satoshis: number;
   locking_script: string;
   is_locked: boolean;
+  /** When the lock was taken, so locks orphaned by a crash can be reclaimed. */
+  locked_at?: Date | null;
   is_chronicle?: boolean;
   created_at: Date;
 }
@@ -141,11 +147,22 @@ export interface TxResult {
   record_type: RecordType;
   status: "SEEN_ON_NETWORK" | "MINED" | "FAILED";
   block_height?: number;
+  /**
+   * The inclusion proof as received. Stored whether or not it verified, so its
+   * presence is not evidence of anything — read `spv_verified` for that.
+   */
   merkle_path?: string;
+  /**
+   * Set once the proof has been recomputed to a Merkle root matching a locally
+   * held, proof-of-work-checked header.
+   */
+  spv_verified?: boolean;
   timestamp: number;
   fee_sats: number;
   size_bytes: number;
   chronicle_validated?: boolean;
+  /** Flat AIRCHIVE envelope as written to the OP_RETURN, for offline decoding. */
+  op_return?: Uint8Array | null;
 }
 
 export enum AlertSeverity {
@@ -172,16 +189,24 @@ export interface WriteRateConfig {
   interval_ms: number;
 }
 
+/**
+ * Source polling runs at 1 Hz, so 1000ms is a hard fidelity ceiling — writing
+ * faster only duplicates records. Every airborne phase therefore sits at that
+ * floor. Ground movement is safety-relevant and is sampled far more often than
+ * before; a parked aircraft only needs a periodic liveness heartbeat.
+ */
+export const MIN_WRITE_INTERVAL_MS = 1_000;
+
 export const DEFAULT_WRITE_RATES: Record<FlightPhase, number> = {
-  [FlightPhase.PARKED]: 120_000,
-  [FlightPhase.TAXI]: 15_000,
-  [FlightPhase.TAKEOFF]: 1_000,
-  [FlightPhase.CLIMB]: 1_000,
-  [FlightPhase.CRUISE]: 3_000,
-  [FlightPhase.DESCENT]: 2_000,
-  [FlightPhase.APPROACH]: 2_000,
-  [FlightPhase.LANDING]: 1_000,
-  [FlightPhase.TAXI_IN]: 15_000,
+  [FlightPhase.PARKED]: 60_000,
+  [FlightPhase.TAXI]: 2_000,
+  [FlightPhase.TAKEOFF]: MIN_WRITE_INTERVAL_MS,
+  [FlightPhase.CLIMB]: MIN_WRITE_INTERVAL_MS,
+  [FlightPhase.CRUISE]: MIN_WRITE_INTERVAL_MS,
+  [FlightPhase.DESCENT]: MIN_WRITE_INTERVAL_MS,
+  [FlightPhase.APPROACH]: MIN_WRITE_INTERVAL_MS,
+  [FlightPhase.LANDING]: MIN_WRITE_INTERVAL_MS,
+  [FlightPhase.TAXI_IN]: 2_000,
 };
 
 export interface FlightSession {

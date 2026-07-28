@@ -16,7 +16,54 @@ import { AlertNotifier } from "./notifier.js";
 
 const log = createLogger({ service: "alert-engine" });
 
+/** Alerts raised by other services and already persisted by them. */
+const SYSTEM_ALERT_CHANNEL = "alerts";
+/** Bounded so a long-running process cannot accumulate ids indefinitely. */
+const DISPATCHED_ALERT_MEMORY = 500;
+
 let running = true;
+
+const dispatchedAlertIds = new Set<string>();
+
+function rememberDispatched(id: string): boolean {
+  if (dispatchedAlertIds.has(id)) return false;
+  dispatchedAlertIds.add(id);
+  if (dispatchedAlertIds.size > DISPATCHED_ALERT_MEMORY) {
+    const oldest = dispatchedAlertIds.values().next().value;
+    if (oldest !== undefined) dispatchedAlertIds.delete(oldest);
+  }
+  return true;
+}
+
+function parseExternalAlert(raw: string): AlertRecord | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object") return null;
+  const rec = parsed as Record<string, unknown>;
+  if (typeof rec.id !== "string" || typeof rec.message !== "string") return null;
+  if (typeof rec.severity !== "string" || typeof rec.type !== "string") return null;
+
+  return {
+    id: rec.id,
+    aircraft_icao:
+      typeof rec.aircraft_icao === "string" ? rec.aircraft_icao : "SYSTEM",
+    flight_id: typeof rec.flight_id === "string" ? rec.flight_id : undefined,
+    severity: rec.severity as AlertRecord["severity"],
+    type: rec.type,
+    message: rec.message,
+    data:
+      rec.data !== null && typeof rec.data === "object"
+        ? (rec.data as Record<string, unknown>)
+        : {},
+    acknowledged: false,
+    created_at:
+      typeof rec.created_at === "string" ? new Date(rec.created_at) : new Date(),
+  };
+}
 
 function toNewAlert(a: AlertRecord): NewAlert {
   return {
@@ -121,10 +168,14 @@ async function main(): Promise<void> {
   await redis.connect();
   await subscriber.connect();
 
-  const channels = config.trackedAircraft.flatMap((icao) => {
+  const channels: string[] = config.trackedAircraft.flatMap((icao) => {
     const u = icao.trim().toUpperCase();
-    return [`telemetry:${u}`, `phase:${u}`] as const;
+    return [`telemetry:${u}`, `phase:${u}`];
   });
+  // System-level alerts (treasury dry, recovery) are raised by other services
+  // and persisted there; the engine owns dispatch so notification config lives
+  // in exactly one place.
+  channels.push(SYSTEM_ALERT_CHANNEL);
 
   await subscriber.subscribe(...channels);
   log.info(
@@ -176,6 +227,14 @@ async function main(): Promise<void> {
     database: typeof db,
     sig: SignalLossMonitor,
   ): Promise<void> {
+    if (channel === SYSTEM_ALERT_CHANNEL) {
+      const alert = parseExternalAlert(message);
+      // Already persisted by the publisher, so this is dispatch only.
+      if (alert === null || !rememberDispatched(alert.id)) return;
+      await n.notify(alert);
+      return;
+    }
+
     if (channel.startsWith("telemetry:")) {
       const record = parseTelemetry(message, tr);
       if (record === null) return;

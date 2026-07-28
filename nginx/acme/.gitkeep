@@ -1,0 +1,3 @@
+# ACME HTTP-01 challenge webroot, served by nginx at
+# http://<host>/.well-known/acme-challenge/. Point the certbot webroot plugin
+# at the host side of this directory.

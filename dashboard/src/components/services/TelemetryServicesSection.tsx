@@ -8,18 +8,18 @@ const CARD_ACCENT =
 
 const services = [
   {
-    tag: "Black Box Integration",
-    title: "Flight Data Recorder Companion",
+    tag: "Surveillance Archival",
+    title: "Independent ADS-B Record",
     body:
-      "Airchive operates as a parallel, tamper-proof data layer alongside traditional FDR/CVR systems. Full structured telemetry — altitude, heading, airspeed, vertical rate, engine parameters — is encoded into each on-chain record (compact MessagePack in OP_RETURN), so investigators can decode and read the actual sensor fields, not merely verify a digest.",
-    stat: "Full payload",
-    statLabel: "Decodable records",
+      "Airchive archives live ADS-B surveillance — position, altitude, ground speed, heading, vertical rate, squawk and ground state — as a public record independent of any operator-held recorder. Each field is encoded into the transaction itself, so the record is decoded and read directly from the chain rather than checked against a digest held elsewhere.",
+    stat: "9 fields",
+    statLabel: "Per decoded record",
   },
   {
-    tag: "Immutable Telemetry",
-    title: "Tamper-Proof Data at Source",
+    tag: "Append-Only Telemetry",
+    title: "Fixed at the Point of Writing",
     body:
-      "Telemetric payloads are cryptographically signed at the aircraft edge node before transmission. Once written to the BSV blockchain, records cannot be altered, deleted, or back-dated. The Analyst agent independently publishes cryptographically signed fleet-analysis summaries as on-chain inscriptions — providing a second, autonomous layer of verifiable evidence beyond raw sensor records.",
+      "Every record is written in a transaction signed with the aircraft's own secp256k1 key and chained to that aircraft's previous write. Once mined, a record cannot be altered, removed or back-dated without breaking the chain. The Analyst agent publishes its fleet summaries the same way, giving a second, independently signed layer of evidence.",
     stat: "0",
     statLabel: "Mutable records",
   },
@@ -32,12 +32,12 @@ const services = [
     statLabel: "Critical-phase interval",
   },
   {
-    tag: "Regulatory Compliance",
-    title: "Audit-Ready Evidence Chain",
+    tag: "Verifiable Audit Trail",
+    title: "Proof You Can Check Yourself",
     body:
-      "Full ICAO Annex 6 and EASA Part-CAT alignment. Blockchain-anchored records satisfy data-retention mandates with cryptographic proof of completeness — no gaps, no overwrites. Export flight envelopes, event summaries, and decoded telemetry in regulator-accepted formats at the click of a button.",
-    stat: "100%",
-    statLabel: "Data completeness",
+      "Every mined record's inclusion proof is recomputed against a block header this system holds and has proof-of-work checked itself — SPV, with no reliance on a trusted explorer. Any record can be traced back to its block and re-verified independently, and the decoded evidence chain for a whole flight can be replayed from the chain alone.",
+    stat: "SPV",
+    statLabel: "Verified, not asserted",
   },
   {
     tag: "Agent Marketplace",
@@ -156,15 +156,13 @@ export function TelemetryServicesSection() {
         <div className="w-16 h-px bg-gradient-to-r from-transparent via-electric-cyan/30 to-transparent" />
 
         <p className="text-xs text-hud-muted/80 leading-relaxed max-w-2xl">
-          Whether you operate a single aircraft or an entire fleet, Airchive
-          integrates seamlessly with your existing avionics, ground stations,
-          and maintenance systems. Autonomous Collector, Analyst, and Monitor
-          agents operate continuously — ingesting live telemetry, running
-          anomaly detection, and publishing cryptographically signed fleet
-          analyses directly to the BSV blockchain. We work with airlines,
-          MRO providers, charter operators, military organisations, and
-          aviation regulators to deliver immutable telemetry as a service —
-          no hardware changes required.
+          Airchive archives the ADS-B signal your aircraft already broadcasts,
+          so nothing needs to be fitted or changed to start building a record.
+          Autonomous Collector, Analyst, and Monitor agents operate
+          continuously — ingesting live telemetry, running anomaly detection,
+          and publishing signed fleet analyses directly to the BSV blockchain.
+          We are building towards deployments with airlines, MRO providers,
+          charter operators, and aviation authorities.
         </p>
         <p className="text-xs text-white/70 leading-relaxed max-w-2xl">
           Interested in protecting your flight data with blockchain-grade
@@ -182,7 +180,7 @@ export function TelemetryServicesSection() {
         </p>
 
         <span className="hud-label text-[10px] text-electric-cyan/50 mt-1">
-          BSV · MessagePack · Ed25519 · BRC-100
+          BSV · MessagePack · secp256k1 · SPV · BRC-100
         </span>
       </motion.div>
     </section>

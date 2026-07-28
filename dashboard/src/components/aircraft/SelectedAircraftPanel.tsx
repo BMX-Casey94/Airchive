@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import { useAircraftStore } from "@/stores/aircraft-store";
 import type { AircraftTelemetry } from "@/stores/aircraft-store";
 import { TRACKED_AIRCRAFT_MAP } from "@/lib/tracked-aircraft";
@@ -7,6 +8,7 @@ import { refinePhase } from "@/lib/refine-phase";
 import Panel from "@/components/ui/Panel";
 import DataReadout from "@/components/ui/DataReadout";
 import PhaseBadge from "@/components/ui/PhaseBadge";
+import HistoricalDataModal from "@/components/aircraft/HistoricalDataModal";
 import { FlightPhase } from "@/types/airchive";
 import {
   fmtAltitude,
@@ -55,6 +57,7 @@ function estimatePitch(
 
 function AircraftDetail({ ac }: { ac: AircraftTelemetry }) {
   const info = TRACKED_AIRCRAFT_MAP.get(ac.icao);
+  const [historyOpen, setHistoryOpen] = useState(false);
 
   return (
     <div className="space-y-4">
@@ -258,6 +261,44 @@ function AircraftDetail({ ac }: { ac: AircraftTelemetry }) {
             {ac.flightId}
           </p>
         </div>
+      )}
+
+      {/* Historical Data */}
+      <div className="border-t border-panel-border/30 pt-4">
+        <button
+          type="button"
+          onClick={() => setHistoryOpen(true)}
+          className={clsx(
+            "flex items-center justify-center gap-2 w-full",
+            "rounded-lg border border-neon-amber/30 bg-neon-amber/5",
+            "px-4 py-2.5 text-xs font-mono text-neon-amber",
+            "transition-all hover:border-neon-amber/60 hover:bg-neon-amber/10 hover:shadow-glow-amber",
+          )}
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            className="h-4 w-4 shrink-0"
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+            strokeWidth={1.5}
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z"
+            />
+          </svg>
+          Historical Data
+        </button>
+      </div>
+
+      {historyOpen && (
+        <HistoricalDataModal
+          icao={ac.icao}
+          callsign={ac.callsign}
+          onClose={() => setHistoryOpen(false)}
+        />
       )}
 
       {/* View Wallet On-Chain */}

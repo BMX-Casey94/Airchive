@@ -58,6 +58,10 @@ export function encodeFlightEventPayload(event: FlightEventRecord): Uint8Array {
   return encode(event);
 }
 
+export function encodeAgentPayload(record: Record<string, unknown>): Uint8Array {
+  return encode(record);
+}
+
 export function buildOpReturnPayload(
   icao: string,
   timestamp: number,

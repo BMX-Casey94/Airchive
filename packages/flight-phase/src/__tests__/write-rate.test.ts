@@ -67,26 +67,41 @@ describe("WriteRateController", () => {
   it("returns false from shouldWrite when the phase interval has not elapsed", () => {
     const c = new WriteRateController();
     const rec = mockTelemetry({ icao: "ABC123" });
-    expect(c.shouldWrite("ABC123", FlightPhase.CRUISE, rec)).toBe(true);
-    c.recordWrite("ABC123");
-    vi.advanceTimersByTime(4000);
-    expect(c.shouldWrite("ABC123", FlightPhase.CRUISE, rec)).toBe(false);
+    expect(c.shouldWrite("ABC123", FlightPhase.PARKED, rec)).toBe(true);
+    c.recordWrite("ABC123", FlightPhase.PARKED, rec);
+    vi.advanceTimersByTime(30_000);
+    expect(c.shouldWrite("ABC123", FlightPhase.PARKED, rec)).toBe(false);
   });
 
   it("returns true from shouldWrite once the phase interval has elapsed", () => {
     const c = new WriteRateController();
     const rec = mockTelemetry({ icao: "ABC123" });
-    c.recordWrite("ABC123");
-    vi.advanceTimersByTime(5000);
-    expect(c.shouldWrite("ABC123", FlightPhase.CRUISE, rec)).toBe(true);
+    c.recordWrite("ABC123", FlightPhase.PARKED, rec);
+    vi.advanceTimersByTime(60_000);
+    expect(c.shouldWrite("ABC123", FlightPhase.PARKED, rec)).toBe(true);
   });
 
-  it("uses distinct default intervals per phase (PARKED, CRUISE, TAKEOFF)", () => {
+  it("samples every airborne phase at the 1 Hz source polling floor", () => {
     const c = new WriteRateController();
     const rec = mockTelemetry();
-    expect(c.getIntervalMs("X", FlightPhase.PARKED, rec)).toBe(300_000);
-    expect(c.getIntervalMs("X", FlightPhase.CRUISE, rec)).toBe(5000);
-    expect(c.getIntervalMs("X", FlightPhase.TAKEOFF, rec)).toBe(1000);
+    for (const phase of [
+      FlightPhase.TAKEOFF,
+      FlightPhase.CLIMB,
+      FlightPhase.CRUISE,
+      FlightPhase.DESCENT,
+      FlightPhase.APPROACH,
+      FlightPhase.LANDING,
+    ]) {
+      expect(c.getIntervalMs("X", phase, rec)).toBe(1000);
+    }
+  });
+
+  it("samples ground movement often and parked aircraft as a heartbeat", () => {
+    const c = new WriteRateController();
+    const rec = mockTelemetry();
+    expect(c.getIntervalMs("X", FlightPhase.TAXI, rec)).toBe(2000);
+    expect(c.getIntervalMs("X", FlightPhase.TAXI_IN, rec)).toBe(2000);
+    expect(c.getIntervalMs("X", FlightPhase.PARKED, rec)).toBe(60_000);
   });
 
   it("forces a 1,000 ms interval when an emergency override is active", () => {
@@ -101,8 +116,8 @@ describe("WriteRateController", () => {
     const c = new WriteRateController();
     const rec = mockTelemetry({ icao: "RWTS01" });
     expect(c.shouldWrite("RWTS01", FlightPhase.CRUISE, rec)).toBe(true);
-    c.recordWrite("RWTS01");
-    vi.advanceTimersByTime(4999);
+    c.recordWrite("RWTS01", FlightPhase.CRUISE, rec);
+    vi.advanceTimersByTime(999);
     expect(c.shouldWrite("RWTS01", FlightPhase.CRUISE, rec)).toBe(false);
     vi.advanceTimersByTime(1);
     expect(c.shouldWrite("RWTS01", FlightPhase.CRUISE, rec)).toBe(true);
@@ -111,10 +126,88 @@ describe("WriteRateController", () => {
   it("clears per-aircraft state when reset is called", () => {
     const c = new WriteRateController();
     const rec = mockTelemetry({ icao: "RST001" });
-    c.recordWrite("RST001");
+    c.recordWrite("RST001", FlightPhase.PARKED, rec);
     c.setEmergencyOverride("RST001", true);
     c.reset("RST001");
-    expect(c.getIntervalMs("RST001", FlightPhase.PARKED, rec)).toBe(300_000);
+    expect(c.getIntervalMs("RST001", FlightPhase.PARKED, rec)).toBe(60_000);
     expect(c.shouldWrite("RST001", FlightPhase.CRUISE, rec)).toBe(true);
+  });
+
+  describe("event-triggered writes", () => {
+    /** Parks an aircraft on a 60s interval so only an event can emit a write. */
+    function parkedController(initial: TelemetryRecord) {
+      const c = new WriteRateController();
+      c.recordWrite("EVT001", FlightPhase.PARKED, initial);
+      vi.advanceTimersByTime(1000);
+      return c;
+    }
+
+    it("emits immediately on a phase transition", () => {
+      const rec = mockTelemetry({ icao: "EVT001" });
+      const c = parkedController(rec);
+      expect(c.shouldWrite("EVT001", FlightPhase.PARKED, rec)).toBe(false);
+      expect(c.shouldWrite("EVT001", FlightPhase.TAXI, rec)).toBe(true);
+    });
+
+    it("emits immediately on a squawk change", () => {
+      const rec = mockTelemetry({ icao: "EVT001", squawk: "1000" });
+      const c = parkedController(rec);
+      const squawked = mockTelemetry({ icao: "EVT001", squawk: "7700" });
+      expect(c.shouldWrite("EVT001", FlightPhase.PARKED, squawked)).toBe(true);
+    });
+
+    it("emits immediately when the aircraft leaves the ground", () => {
+      const rec = mockTelemetry({ icao: "EVT001", on_ground: true });
+      const c = parkedController(rec);
+      const airborne = mockTelemetry({ icao: "EVT001", on_ground: false });
+      expect(c.shouldWrite("EVT001", FlightPhase.PARKED, airborne)).toBe(true);
+    });
+
+    it("emits when the vertical rate crosses the climb threshold", () => {
+      const rec = mockTelemetry({ icao: "EVT001", baro_rate: 200 });
+      const c = parkedController(rec);
+      expect(
+        c.shouldWrite("EVT001", FlightPhase.PARKED, mockTelemetry({ baro_rate: 900 })),
+      ).toBe(false);
+      expect(
+        c.shouldWrite("EVT001", FlightPhase.PARKED, mockTelemetry({ baro_rate: 1200 })),
+      ).toBe(true);
+    });
+
+    it("emits on a heading change beyond the threshold, using shortest arc", () => {
+      const rec = mockTelemetry({ icao: "EVT001", true_heading: 355 });
+      const c = parkedController(rec);
+      // 355° -> 2° is a 7° turn across north, below the 10° threshold.
+      expect(
+        c.shouldWrite("EVT001", FlightPhase.PARKED, mockTelemetry({ true_heading: 2 })),
+      ).toBe(false);
+      expect(
+        c.shouldWrite("EVT001", FlightPhase.PARKED, mockTelemetry({ true_heading: 20 })),
+      ).toBe(true);
+    });
+
+    it("emits on an altitude change beyond the threshold", () => {
+      const rec = mockTelemetry({ icao: "EVT001", alt_baro: 10_000 });
+      const c = parkedController(rec);
+      expect(
+        c.shouldWrite("EVT001", FlightPhase.PARKED, mockTelemetry({ alt_baro: 10_300 })),
+      ).toBe(false);
+      expect(
+        c.shouldWrite("EVT001", FlightPhase.PARKED, mockTelemetry({ alt_baro: 10_600 })),
+      ).toBe(true);
+    });
+
+    it("reports why a write was emitted", () => {
+      const rec = mockTelemetry({ icao: "TRG001", alt_baro: 10_000 });
+      const c = new WriteRateController();
+      expect(c.getWriteTrigger("TRG001", FlightPhase.PARKED, rec)).toBe("first");
+      c.recordWrite("TRG001", FlightPhase.PARKED, rec);
+      expect(c.getWriteTrigger("TRG001", FlightPhase.PARKED, rec)).toBeNull();
+      expect(
+        c.getWriteTrigger("TRG001", FlightPhase.PARKED, mockTelemetry({ alt_baro: 12_000 })),
+      ).toBe("event");
+      vi.advanceTimersByTime(60_000);
+      expect(c.getWriteTrigger("TRG001", FlightPhase.PARKED, rec)).toBe("interval");
+    });
   });
 });

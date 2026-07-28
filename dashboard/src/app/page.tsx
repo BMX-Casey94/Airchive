@@ -62,6 +62,11 @@ const EmergencyOverlay = dynamic(
   { ssr: false },
 );
 
+const FundingStatus = dynamic(
+  () => import("@/components/system/FundingStatus"),
+  { ssr: false },
+);
+
 const TelemetryServicesSection = dynamic(
   () =>
     import("@/components/services/TelemetryServicesSection").then(
@@ -169,6 +174,13 @@ export default function DashboardPage() {
       <DashboardLogo />
 
       <div className="grid grid-cols-1 gap-3 lg:gap-4 lg:grid-cols-12 auto-rows-min">
+        {/* ── Treasury health: a dry wallet stops every write ─── */}
+        <section className="lg:col-span-12">
+          <Suspense fallback={<PanelSkeleton className="h-24" />}>
+            <FundingStatus />
+          </Suspense>
+        </section>
+
         {/* ── Row 1: 3D Globe (full width, hero) ──────────── */}
         <section className="lg:col-span-12" style={{ minHeight: "50vh" }}>
           <Suspense fallback={<PanelSkeleton className="h-full min-h-[50vh]" />}>

@@ -1,4 +1,5 @@
 import { createServer as createHttpServer } from "node:http";
+import type { Knex } from "knex";
 import { Redis } from "ioredis";
 import {
   RecordType,
@@ -6,12 +7,18 @@ import {
   type TelemetryRecord,
 } from "@airchive/types";
 import { WalletVault } from "@airchive/crypto";
-import { encodeTelemetryPayload, encodeFlightEventPayload } from "@airchive/telemetry-codec";
+import {
+  encodeTelemetryPayload,
+  encodeFlightEventPayload,
+  FLEET_PSEUDO_ICAO,
+} from "@airchive/telemetry-codec";
 import {
   closeDb,
   getAllAircraftConfig,
   getDb,
+  getFundingState,
   insertTxResult,
+  TREASURY_SCOPE,
   unlockAllAircraftUtxos,
   updateTxStatus,
   upsertAircraftConfig,
@@ -26,25 +33,158 @@ import {
   isTransientBroadcastFailure,
   type ArcCallbackPayload,
   type BroadcastOutcome,
+  type Broadcaster,
 } from "./broadcaster.js";
-import { UtxoManager } from "./utxo-manager.js";
+import { ArcadeBroadcaster, isTerminalArcadeFailure } from "./arcade-broadcaster.js";
+import { ArcadeSseClient } from "./arcade-sse.js";
+import { StalePoolError, UtxoManager } from "./utxo-manager.js";
 import { FundingUtxoManager } from "./funding-utxo-manager.js";
-import { AutoRefillMonitor } from "./auto-refill.js";
+import { AutoRefillMonitor, treasuryOutputFloorSats } from "./auto-refill.js";
 import { WriteBuffer } from "./write-buffer.js";
 import { ConfirmationPoller } from "./confirmation-poller.js";
+import { FundingStateMachine } from "./funding-state.js";
+import { HeaderStore } from "./header-store.js";
+import { recordUnverifiedProof, recordVerifiedProof, verifyBump } from "./spv.js";
 import { buildFlightEventTx, buildTelemetryTx, computeTxid } from "./tx-builder.js";
-import { registry } from "./metrics.js";
+import {
+  recordTypeMetricLabel,
+  registry,
+  writerWriteIngressTotal,
+  writerWriteOutcomesTotal,
+} from "./metrics.js";
 
 const log = createLogger({ service: "blockchain-writer" });
 
 const CONSOLIDATION_INTERVAL_MS = 24 * 60 * 60 * 1_000;
 const METRICS_PORT = Number(process.env.METRICS_PORT ?? "9091");
-const TRANSIENT_BROADCAST_COOLDOWN_MS = 45_000;
+const TRANSIENT_BROADCAST_COOLDOWN_MS = 3_000;
+const PENDING_WRITE_MAX_RETRIES = 10;
+const LOCK_RECLAIM_INTERVAL_MS = 60_000;
+/** Blocks arrive roughly every ten minutes, so this stays comfortably ahead. */
+const HEADER_SYNC_INTERVAL_MS = 120_000;
+/** Published by ingestion on every telemetry tick the dashboard renders. */
+const AIRCRAFT_ACTIVITY_CHANNEL = "aircraft-activity";
+
+/**
+ * Distinguishes "this write could not be funded" from "this write is bad".
+ * Only the latter may ever be discarded.
+ */
+function isFundingRelatedError(lastError: string | null): boolean {
+  if (!lastError) return false;
+  return lastError.includes("No available UTXOs")
+    || lastError.includes("UTXO spend cooling down")
+    || lastError.includes("UTXO ready reserve protected")
+    || lastError.includes("pool is stale")
+    || lastError.includes("TREASURY DRY");
+}
+
+/**
+ * Telemetry is irreplaceable, so the retry-exhaustion purge must never discard
+ * writes that only failed because there was nothing to fund them with. Those
+ * rows are preserved and drained once funding returns.
+ */
+async function purgeUnrecoverablePendingWrites(db: Knex): Promise<void> {
+  // A funding outage in progress means every exhausted row is suspect. Nothing
+  // is discarded until the treasury is demonstrably healthy again.
+  const funding = await getFundingState(db, TREASURY_SCOPE).catch(() => undefined);
+  if (funding && funding.state !== "HEALTHY") {
+    log.warn(
+      { fundingState: funding.state },
+      "Skipping pending-write purge — funding is not healthy, backlog preserved in full",
+    );
+    return;
+  }
+
+  const exhausted = await db("pending_writes")
+    .where("retry_count", ">=", PENDING_WRITE_MAX_RETRIES)
+    .select("id", "last_error") as Array<{ id: number; last_error: string | null }>;
+
+  if (exhausted.length === 0) return;
+
+  const preserved: number[] = [];
+  const purgeable: number[] = [];
+  for (const row of exhausted) {
+    (isFundingRelatedError(row.last_error) ? preserved : purgeable).push(row.id);
+  }
+
+  if (preserved.length > 0) {
+    // Reset the counter so a long funding outage cannot creep these rows back
+    // towards the purge threshold on every restart.
+    await db("pending_writes").whereIn("id", preserved).update({ retry_count: 0 });
+    log.warn(
+      { preserved: preserved.length },
+      "Preserved pending writes that exhausted retries solely due to funding starvation",
+    );
+  }
+
+  if (purgeable.length > 0) {
+    await db("pending_writes").whereIn("id", purgeable).delete();
+    log.info(
+      { purged: purgeable.length, maxRetries: PENDING_WRITE_MAX_RETRIES },
+      "Purged pending writes that failed for non-funding reasons",
+    );
+  }
+}
+
+/**
+ * Transient transport faults. The pools and clients underneath all reconnect on
+ * their own, so the correct response is to log and carry on rather than to tear
+ * down a process that is mid-flight on several hundred aircraft.
+ */
+const RECOVERABLE_SOCKET_CODES = new Set([
+  "ECONNRESET",
+  "EPIPE",
+  "ETIMEDOUT",
+  "ECONNREFUSED",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "UND_ERR_SOCKET",
+  "UND_ERR_CONNECT_TIMEOUT",
+]);
+
+function isRecoverableSocketError(err: Error): boolean {
+  const code = (err as NodeJS.ErrnoException).code;
+  if (code !== undefined && RECOVERABLE_SOCKET_CODES.has(code)) return true;
+  const cause = (err as { cause?: unknown }).cause;
+  if (cause instanceof Error) return isRecoverableSocketError(cause);
+  return false;
+}
 
 function shouldRequestRefillForAcquireError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err ?? "");
   return message.includes("No available UTXOs")
     || message.includes("UTXO spend cooling down");
+}
+
+/**
+ * A pool holding only locked, dust or phantom rows cannot be fixed by a refill —
+ * it needs chain truth. Reconcile instead, otherwise the wallet stays silent
+ * indefinitely while refills succeed into a pool nothing can spend from.
+ */
+function handleAcquireFailure(
+  err: unknown,
+  icao: string,
+  utxoManager: UtxoManager,
+  autoRefill: AutoRefillMonitor,
+  walletAddress: string,
+): void {
+  if (err instanceof StalePoolError) {
+    log.warn(
+      { icao, residualRows: err.residualRows },
+      "Aircraft pool stale — reconciling against chain",
+    );
+    void utxoManager.reconcile(icao, walletAddress).catch((reconcileErr) =>
+      log.error({ err: reconcileErr, icao }, "Stale-pool reconciliation failed"),
+    );
+    autoRefill.requestRefill(icao);
+    return;
+  }
+
+  if (shouldRequestRefillForAcquireError(err)) {
+    autoRefill.requestRefill(icao);
+  }
 }
 
 function isHandledBackpressureError(err: unknown): boolean {
@@ -53,6 +193,42 @@ function isHandledBackpressureError(err: unknown): boolean {
     || message.includes("Broadcast local backpressure")
     || message.includes("UTXO spend cooling down")
     || message.includes("Broadcast transient failure");
+}
+
+/**
+ * Decides what to do with an input after a write failed.
+ *
+ * Releasing it unconditionally is unsafe. "Transient" upstream failures —
+ * timeouts, socket resets, 5xx after the node already accepted the bytes — and
+ * any error raised *after* the broadcast call leave the writer unable to say
+ * whether the network has the transaction. Unlocking the input then lets the
+ * next write spend it a second time; one of the two is rejected as a conflict,
+ * and because the writer records its change optimistically the whole subsequent
+ * chain for that aircraft is invalid. That is precisely how an aircraft goes
+ * quiet while still appearing live.
+ *
+ * So: release only when the transaction was never handed to the broadcaster.
+ * Otherwise leave the input locked and let chain truth decide, which the
+ * reconcile below does immediately and the lock-TTL sweep repeats as a backstop.
+ */
+async function settleInputAfterFailedWrite(
+  icao: string,
+  utxoManager: UtxoManager,
+  utxo: { txid: string; vout: number },
+  walletAddress: string,
+  broadcastAttempted: boolean,
+): Promise<void> {
+  if (!broadcastAttempted) {
+    await utxoManager.releaseUtxo(utxo.txid, utxo.vout).catch(() => {});
+    return;
+  }
+
+  void utxoManager.reconcile(icao, walletAddress).catch((err) =>
+    log.warn(
+      { err, icao, txid: utxo.txid.slice(0, 12), vout: utxo.vout },
+      "Reconciliation after an inconclusive broadcast failed — input stays locked",
+    ),
+  );
 }
 
 async function handleFailedAircraftBroadcast(
@@ -151,7 +327,7 @@ async function main(): Promise<void> {
   }
   log.info({ count: fleet.length }, "aircraft_config rows ensured");
 
-  const broadcaster = new ArcBroadcaster(config.arcUrl, config.arcApiKey, {
+  const arcBroadcaster = new ArcBroadcaster(config.arcEndpoints, {
     maxConcurrentBroadcasts: config.arcMaxConcurrentBroadcasts,
     maxQueueDepth: config.arcMaxQueueDepth,
     transientRetryAttempts: config.arcTransientRetryAttempts,
@@ -160,6 +336,41 @@ async function main(): Promise<void> {
     circuitWindowMs: config.arcCircuitWindowMs,
     circuitOpenMs: config.arcCircuitOpenMs,
   });
+  log.info(
+    { arcEndpoints: config.arcEndpoints.map((endpoint) => endpoint.name) },
+    "ARC upstreams configured",
+  );
+
+  // Arcade is preferred when configured, with ARC retained as the fallback so
+  // an Arcade outage degrades throughput rather than stopping writes.
+  let arcadeBroadcaster: ArcadeBroadcaster | null = null;
+  let arcadeSse: ArcadeSseClient | null = null;
+  if (config.arcade.enabled) {
+    arcadeBroadcaster = new ArcadeBroadcaster(
+      {
+        url: config.arcade.url,
+        apiKey: config.arcade.apiKey,
+        batchWindowMs: config.arcade.batchWindowMs,
+        maxBatchSize: config.arcade.maxBatchSize,
+        callbackToken: config.arcade.callbackToken,
+      },
+      arcBroadcaster,
+    );
+    await arcadeBroadcaster.checkHealth();
+    log.info(
+      {
+        endpoint: config.arcade.url,
+        batchWindowMs: config.arcade.batchWindowMs,
+        maxBatchSize: config.arcade.maxBatchSize,
+        sse: config.arcade.sseEnabled,
+      },
+      "Arcade broadcaster enabled (ARC retained as fallback)",
+    );
+  } else {
+    log.warn("ARCADE_URL not set — broadcasting via ARC only");
+  }
+
+  const broadcaster: Broadcaster = arcadeBroadcaster ?? arcBroadcaster;
   const utxoManager = new UtxoManager(db, config.wocApiUrl);
   const fundingUtxoManager = new FundingUtxoManager(db, config.wocApiUrl);
   const writeBuffer = new WriteBuffer(db, broadcaster, utxoManager, vault);
@@ -174,6 +385,16 @@ async function main(): Promise<void> {
   );
   writeBuffer.setAutoRefill(autoRefill);
   let confirmationPoller: ConfirmationPoller | null = null;
+
+  const headerStore = new HeaderStore(db, config.wocApiUrl);
+  const initialHeaders = await headerStore.syncTip();
+  log.info(
+    { synced: initialHeaders, tip: await headerStore.currentHeight() },
+    "Block header store initialised",
+  );
+  const headerSyncInterval = setInterval(() => {
+    void headerStore.syncTip().catch((err) => log.warn({ err }, "Header sync failed"));
+  }, HEADER_SYNC_INTERVAL_MS);
 
   /* ── Startup: unlock stale locks from previous unclean shutdown ── */
   const unlockedAircraft = await unlockAllAircraftUtxos(db);
@@ -205,12 +426,7 @@ async function main(): Promise<void> {
     log.warn({ purged: chroniclePurged }, "Purged UTXOs with custom Chronicle locking scripts (unspendable with standard P2PKH)");
   }
 
-  const stalePurged = await db("pending_writes")
-    .where("retry_count", ">=", 10)
-    .delete();
-  if (stalePurged > 0) {
-    log.info({ purged: stalePurged }, "Purged stale pending writes (retry_count >= 10)");
-  }
+  await purgeUnrecoverablePendingWrites(db);
   await writeBuffer.coalesceTelemetryBacklog().catch((err) =>
     log.error({ err }, "Telemetry backlog coalescing failed"),
   );
@@ -221,31 +437,164 @@ async function main(): Promise<void> {
     log.error({ err }, "Funding UTXO bootstrap failed"),
   );
 
+  /* ── Reshape the treasury for refill concurrency ── */
+  const treasuryFloorSats = treasuryOutputFloorSats(
+    config.refillAmountSats,
+    config.refillMaxOutputsPerTx,
+  );
+
+  // Consolidate before splitting: an already-fragmented treasury has no output
+  // big enough to split, so splitting first would be a no-op and the pool would
+  // stay stuck below the refill floor.
+  await fundingUtxoManager
+    .consolidateIfFragmented(config.fundingWalletWif, broadcaster, treasuryFloorSats)
+    .catch((err) => log.error({ err }, "Funding pool consolidation failed"));
+
+  await fundingUtxoManager
+    .splitIfNeeded(
+      config.fundingWalletWif,
+      broadcaster,
+      config.fundingPoolSplitTarget,
+      treasuryFloorSats,
+    )
+    .catch((err) => log.error({ err }, "Funding pool split failed"));
+
   broadcaster.on("status-update", (payload: ArcCallbackPayload) => {
-    void handleArcCallback(payload);
+    void handleStatusUpdate(payload);
   });
 
-  async function handleArcCallback(payload: ArcCallbackPayload): Promise<void> {
+  /**
+   * Undoes the local bookkeeping for a transaction the network refused.
+   *
+   * The writer records a spend and its change the moment a broadcast is
+   * accepted for delivery, which is what keeps the per-aircraft chain moving at
+   * 1 Hz. When the network later rejects that transaction, the local pool is
+   * left holding an output that does not exist. Purging it and reconciling the
+   * owning wallet against the chain is what stops a single rejection from
+   * silently ending every subsequent write for that aircraft.
+   */
+  async function handleTerminalRejection(txid: string): Promise<void> {
     try {
-      const status =
-        payload.txStatus === "MINED" ? "MINED" as const : "SEEN_ON_NETWORK" as const;
-      await updateTxStatus(
-        db,
-        payload.txid,
-        status,
-        payload.blockHeight,
-        payload.merklePath,
+      const purged = await utxoManager.invalidateOutputsOf(txid);
+
+      const owner = await db("tx_results")
+        .where({ txid })
+        .first("aircraft_icao") as { aircraft_icao?: string } | undefined;
+      const icao = owner?.aircraft_icao?.trim().toUpperCase();
+
+      if (icao && icao !== FLEET_PSEUDO_ICAO) {
+        const address = vault.getAircraftAddress(icao);
+        await utxoManager.reconcile(icao, address);
+        autoRefill.requestRefill(icao);
+        log.warn(
+          { icao, txid: txid.slice(0, 12), purged },
+          "Rejected transaction unwound and wallet reconciled against chain",
+        );
+        return;
+      }
+
+      // No owning aircraft means the treasury broadcast it — a refill, split or
+      // consolidation — so the funding pool is the one holding phantom outputs.
+      await fundingUtxoManager.reconcile(config.fundingWalletWif);
+    } catch (err) {
+      log.error(
+        { err, txid: txid.slice(0, 12) },
+        "Failed to unwind a rejected transaction — pool may hold phantom outputs",
       );
+    }
+  }
+
+  async function handleStatusUpdate(payload: ArcCallbackPayload): Promise<void> {
+    try {
+      const upstreamStatus = payload.txStatus.trim().toUpperCase();
+
+      // REJECTED and DOUBLE_SPEND_ATTEMPTED are terminal. Recording them as
+      // FAILED stops the retry loop from resurrecting a transaction the network
+      // has already refused, which for a double spend would be actively harmful.
+      if (isTerminalArcadeFailure(upstreamStatus)) {
+        await updateTxStatus(db, payload.txid, "FAILED");
+        log.error(
+          {
+            txid: payload.txid,
+            status: upstreamStatus,
+            reason: payload.extraInfo ?? "(upstream gave no reason)",
+            competingTxs: payload.competingTxs,
+          },
+          "Transaction terminally rejected by the network — will not be retried",
+        );
+
+        // The rejected transaction's outputs do not exist, so anything the
+        // writer optimistically recorded from it must go before it becomes the
+        // parent of the aircraft's next write and propagates the rejection.
+        await handleTerminalRejection(payload.txid);
+
+        await publisher
+          .publish("txresult", JSON.stringify({ txid: payload.txid, status: "FAILED" }))
+          .catch(() => {});
+        return;
+      }
+
+      // MINED is only ever recorded off the back of a proof that verifies
+      // against a header we hold. An upstream simply asserting MINED is not
+      // evidence, and treating it as such is what made the old "SPV Verified"
+      // badge meaningless.
+      if (upstreamStatus === "MINED" && payload.merklePath) {
+        const result = await verifyBump(payload.txid, payload.merklePath, headerStore);
+        if (result.verified && result.blockHeight !== undefined) {
+          await recordVerifiedProof(db, payload.txid, payload.merklePath, result.blockHeight);
+          await publisher
+            .publish(
+              "txresult",
+              JSON.stringify({
+                txid: payload.txid,
+                status: "MINED",
+                block_height: result.blockHeight,
+                spv_verified: true,
+              }),
+            )
+            .catch(() => {});
+          return;
+        }
+        await recordUnverifiedProof(
+          db,
+          payload.txid,
+          payload.merklePath,
+          result.blockHeight ?? payload.blockHeight,
+          result.reason ?? "verification failed",
+        );
+        // The poller retries it once the header catches up.
+        confirmationPoller?.nudge();
+        return;
+      }
+
+      await updateTxStatus(db, payload.txid, "SEEN_ON_NETWORK", payload.blockHeight);
+      if (upstreamStatus === "MINED") {
+        // Mined without a proof: keep polling until one is available.
+        confirmationPoller?.nudge();
+      }
       log.debug(
-        { txid: payload.txid, status: payload.txStatus },
-        "TX status updated from ARC callback",
+        { txid: payload.txid, status: upstreamStatus },
+        "TX status updated from broadcaster status stream",
       );
     } catch (err) {
-      log.error({ err, txid: payload.txid }, "ARC callback processing error");
+      log.error({ err, txid: payload.txid }, "Status update processing error");
     }
   }
 
   broadcaster.setupCallbackReceiver(config.arcCallbackPort);
+
+  if (arcadeBroadcaster && config.arcade.sseEnabled) {
+    arcadeSse = new ArcadeSseClient(
+      arcadeBroadcaster.baseUrl,
+      arcadeBroadcaster.callbackToken,
+      config.arcade.apiKey,
+    );
+    arcadeSse.on("status-update", (payload: ArcCallbackPayload) => {
+      arcadeBroadcaster?.noteStatus(payload.txid, payload.txStatus);
+      void handleStatusUpdate(payload);
+    });
+    arcadeSse.start();
+  }
 
   const publisher = new Redis({
     host: config.redis.host,
@@ -254,6 +603,9 @@ async function main(): Promise<void> {
     db: config.redis.db,
     lazyConnect: true,
     retryStrategy: (times) => Math.min(times * 500, 5_000),
+  });
+  publisher.on("error", (err) => {
+    log.warn({ err: err.message }, "Redis publisher error");
   });
   await publisher.connect();
   writeBuffer.setRedisPublisher(publisher);
@@ -267,18 +619,33 @@ async function main(): Promise<void> {
     lazyConnect: true,
     retryStrategy: (times) => Math.min(times * 500, 5_000),
   });
+  subscriber.on("error", (err) => {
+    log.warn({ err: err.message }, "Redis subscriber error");
+  });
 
   await subscriber.connect();
   log.info("Redis subscriber connected");
 
-  const channels: string[] = [];
+  const channels: string[] = [AIRCRAFT_ACTIVITY_CHANNEL];
   for (const aircraft of fleet) {
     channels.push(`write:${aircraft.icao}`, `flight-event:${aircraft.icao}`);
   }
   await subscriber.subscribe(...channels);
   log.info({ channels: channels.length }, "Subscribed to Redis channels");
 
+  const trackedIcaos = new Set(fleet.map((aircraft) => aircraft.icao.toUpperCase()));
+
   subscriber.on("message", (channel: string, message: string) => {
+    // Liveness carries no payload — it exists purely so refill's notion of an
+    // active aircraft matches what the dashboard is showing.
+    if (channel === AIRCRAFT_ACTIVITY_CHANNEL) {
+      const icao = message.trim().toUpperCase();
+      if (trackedIcaos.has(icao)) {
+        autoRefill.recordActivity(icao);
+      }
+      return;
+    }
+
     const sep = channel.indexOf(":");
     const prefix = channel.slice(0, sep);
     const icao = channel.slice(sep + 1);
@@ -292,14 +659,42 @@ async function main(): Promise<void> {
     }
   });
 
+  async function bufferDeferredWrite(
+    icao: string,
+    recordType: RecordType,
+    payload: Uint8Array,
+    flightId: string | undefined,
+    context: string,
+  ): Promise<boolean> {
+    try {
+      await writeBuffer.buffer(icao, recordType, payload, flightId);
+      return true;
+    } catch (err) {
+      log.error({ err, icao, recordType, context }, "Failed to persist deferred write");
+      writerWriteOutcomesTotal.inc({
+        path: "live",
+        record_type: recordTypeMetricLabel(recordType),
+        outcome: "buffer_persist_failed",
+      });
+      return false;
+    }
+  }
+
   async function processTelemetryWrite(
     icao: string,
     raw: string,
   ): Promise<void> {
+    const recordTypeLabel = recordTypeMetricLabel(RecordType.TELEMETRY);
+    writerWriteIngressTotal.inc({ path: "live", record_type: recordTypeLabel });
     let telemetry: TelemetryRecord;
     try {
       telemetry = JSON.parse(raw) as TelemetryRecord;
     } catch {
+      writerWriteOutcomesTotal.inc({
+        path: "live",
+        record_type: recordTypeLabel,
+        outcome: "invalid_json",
+      });
       log.error({ icao }, "Invalid telemetry JSON on write channel");
       return;
     }
@@ -312,7 +707,19 @@ async function main(): Promise<void> {
 
     if (shouldDeferTelemetry) {
       const payload = encodeTelemetryPayload(telemetry);
-      await writeBuffer.buffer(icao, RecordType.TELEMETRY, payload, telemetry.flight_id);
+      const buffered = await bufferDeferredWrite(
+        icao,
+        RecordType.TELEMETRY,
+        payload,
+        telemetry.flight_id,
+        "preemptive_defer",
+      );
+      if (!buffered) return;
+      writerWriteOutcomesTotal.inc({
+        path: "live",
+        record_type: recordTypeLabel,
+        outcome: "buffered_preemptive",
+      });
       return;
     }
 
@@ -323,35 +730,58 @@ async function main(): Promise<void> {
     try {
       utxo = await utxoManager.acquireUtxo(icao);
     } catch (err) {
-      if (shouldRequestRefillForAcquireError(err)) {
-        autoRefill.requestRefill(icao);
-      }
+      handleAcquireFailure(err, icao, utxoManager, autoRefill, walletAddress);
       const payload = encodeTelemetryPayload(telemetry);
-      await writeBuffer.buffer(icao, RecordType.TELEMETRY, payload, telemetry.flight_id);
+      const buffered = await bufferDeferredWrite(
+        icao,
+        RecordType.TELEMETRY,
+        payload,
+        telemetry.flight_id,
+        "utxo_unavailable",
+      );
+      if (!buffered) return;
+      writerWriteOutcomesTotal.inc({
+        path: "live",
+        record_type: recordTypeLabel,
+        outcome: "buffered_utxo_unavailable",
+      });
       return;
     }
 
+    let broadcastAttempted = false;
     try {
-      const { tx, changeOutput } = await buildTelemetryTx({
+      const { tx, changeOutput, opReturn } = await buildTelemetryTx({
         utxo,
         privateKey,
         telemetry,
         recordType: RecordType.TELEMETRY,
       });
 
+      broadcastAttempted = true;
       const result = await broadcaster.broadcast(tx, icao, {
         kind: "telemetry",
         priority: BroadcastPriority.LIVE_TELEMETRY,
       });
 
       if (result.status === "FAILED") {
-        if (isDependencyPendingBroadcastFailure(result)) {
+        // With a SEEN_ON_NETWORK gate upstream, an orphan result means the
+        // network genuinely never took the transaction within the window, so
+        // the optimistic path below would record a spend that never happened.
+        if (
+          isDependencyPendingBroadcastFailure(result)
+          && !broadcaster.hasSeenOnNetworkGate
+        ) {
           const localTxid = computeTxid(tx);
-          await utxoManager.recordSpend(
+          const poolState = await utxoManager.recordSpend(
             utxo.txid, utxo.vout,
             localTxid, 1,
             changeOutput.satoshis, changeOutput.lockingScript, icao,
           );
+          autoRefill.noteRetryPressure(
+            icao,
+            `Broadcast dependency pending: ${result.code ?? result.description ?? "unknown"}`,
+          );
+          autoRefill.requestRefillIfPoolLow(icao, poolState);
           const orphanRow = {
             txid: localTxid,
             aircraft_icao: icao,
@@ -363,9 +793,16 @@ async function main(): Promise<void> {
             flight_id: telemetry.flight_id,
             chronicle_validated: !!changeOutput.isChronicle,
           };
-          await insertTxResult(db, orphanRow);
+          // The envelope is persisted but kept out of the Redis broadcast: it is
+          // for later decoding, not for live dashboard consumers.
+          await insertTxResult(db, { ...orphanRow, op_return: opReturn });
           await publisher.publish("txresult", JSON.stringify(orphanRow)).catch(() => {});
           confirmationPoller?.nudge();
+          writerWriteOutcomesTotal.inc({
+            path: "live",
+            record_type: recordTypeLabel,
+            outcome: "optimistic_orphan",
+          });
           log.info({ icao, txid: localTxid, code: result.code }, "Orphan-mempool broadcast recorded optimistically");
           return;
         }
@@ -380,7 +817,7 @@ async function main(): Promise<void> {
 
       const txid = result.txid;
 
-      await utxoManager.recordSpend(
+      const poolState = await utxoManager.recordSpend(
         utxo.txid,
         utxo.vout,
         txid,
@@ -389,6 +826,7 @@ async function main(): Promise<void> {
         changeOutput.lockingScript,
         icao,
       );
+      autoRefill.requestRefillIfPoolLow(icao, poolState);
 
       const txResultRow = {
         txid,
@@ -401,15 +839,29 @@ async function main(): Promise<void> {
         flight_id: telemetry.flight_id,
         chronicle_validated: !!changeOutput.isChronicle,
       };
-      await insertTxResult(db, txResultRow);
+      await insertTxResult(db, { ...txResultRow, op_return: opReturn });
       await publisher.publish("txresult", JSON.stringify(txResultRow)).catch(() => {});
       confirmationPoller?.nudge();
+      writerWriteOutcomesTotal.inc({
+        path: "live",
+        record_type: recordTypeLabel,
+        outcome: "broadcasted",
+      });
     } catch (err) {
-      await utxoManager.releaseUtxo(utxo.txid, utxo.vout).catch(() => {});
+      await settleInputAfterFailedWrite(
+        icao, utxoManager, utxo, walletAddress, broadcastAttempted,
+      );
       const payload = encodeTelemetryPayload(telemetry);
       await writeBuffer
         .buffer(icao, RecordType.TELEMETRY, payload, telemetry.flight_id)
         .catch(() => {});
+      writerWriteOutcomesTotal.inc({
+        path: "live",
+        record_type: recordTypeLabel,
+        outcome: isHandledBackpressureError(err)
+          ? "buffered_after_backpressure"
+          : "buffered_after_failure",
+      });
       if (isHandledBackpressureError(err)) {
         log.warn({ err, icao }, "Telemetry write deferred");
       } else {
@@ -422,17 +874,36 @@ async function main(): Promise<void> {
     icao: string,
     raw: string,
   ): Promise<void> {
+    const recordTypeLabel = recordTypeMetricLabel(RecordType.FLIGHT_EVENT);
+    writerWriteIngressTotal.inc({ path: "live", record_type: recordTypeLabel });
     let event: FlightEventRecord;
     try {
       event = JSON.parse(raw) as FlightEventRecord;
     } catch {
+      writerWriteOutcomesTotal.inc({
+        path: "live",
+        record_type: recordTypeLabel,
+        outcome: "invalid_json",
+      });
       log.error({ icao }, "Invalid flight-event JSON");
       return;
     }
 
     if (broadcaster.getState().circuitOpen) {
       const payload = encodeFlightEventPayload(event);
-      await writeBuffer.buffer(icao, RecordType.FLIGHT_EVENT, payload, event.flight_id);
+      const buffered = await bufferDeferredWrite(
+        icao,
+        RecordType.FLIGHT_EVENT,
+        payload,
+        event.flight_id,
+        "preemptive_defer",
+      );
+      if (!buffered) return;
+      writerWriteOutcomesTotal.inc({
+        path: "live",
+        record_type: recordTypeLabel,
+        outcome: "buffered_preemptive",
+      });
       return;
     }
 
@@ -443,34 +914,57 @@ async function main(): Promise<void> {
     try {
       utxo = await utxoManager.acquireUtxo(icao);
     } catch (err) {
-      if (shouldRequestRefillForAcquireError(err)) {
-        autoRefill.requestRefill(icao);
-      }
+      handleAcquireFailure(err, icao, utxoManager, autoRefill, walletAddress);
       const payload = encodeFlightEventPayload(event);
-      await writeBuffer.buffer(icao, RecordType.FLIGHT_EVENT, payload, event.flight_id);
+      const buffered = await bufferDeferredWrite(
+        icao,
+        RecordType.FLIGHT_EVENT,
+        payload,
+        event.flight_id,
+        "utxo_unavailable",
+      );
+      if (!buffered) return;
+      writerWriteOutcomesTotal.inc({
+        path: "live",
+        record_type: recordTypeLabel,
+        outcome: "buffered_utxo_unavailable",
+      });
       return;
     }
 
+    let broadcastAttempted = false;
     try {
-      const { tx, changeOutput } = await buildFlightEventTx({
+      const { tx, changeOutput, opReturn } = await buildFlightEventTx({
         utxo,
         privateKey,
         event,
       });
 
+      broadcastAttempted = true;
       const result = await broadcaster.broadcast(tx, icao, {
         kind: "flight_event",
         priority: BroadcastPriority.FLIGHT_EVENT,
       });
 
       if (result.status === "FAILED") {
-        if (isDependencyPendingBroadcastFailure(result)) {
+        // With a SEEN_ON_NETWORK gate upstream, an orphan result means the
+        // network genuinely never took the transaction within the window, so
+        // the optimistic path below would record a spend that never happened.
+        if (
+          isDependencyPendingBroadcastFailure(result)
+          && !broadcaster.hasSeenOnNetworkGate
+        ) {
           const localTxid = computeTxid(tx);
-          await utxoManager.recordSpend(
+          const poolState = await utxoManager.recordSpend(
             utxo.txid, utxo.vout,
             localTxid, 1,
             changeOutput.satoshis, changeOutput.lockingScript, icao,
           );
+          autoRefill.noteRetryPressure(
+            icao,
+            `Broadcast dependency pending: ${result.code ?? result.description ?? "unknown"}`,
+          );
+          autoRefill.requestRefillIfPoolLow(icao, poolState);
           const orphanRow = {
             txid: localTxid,
             aircraft_icao: icao,
@@ -481,9 +975,14 @@ async function main(): Promise<void> {
             size_bytes: tx.toBinary().length,
             flight_id: event.flight_id,
           };
-          await insertTxResult(db, orphanRow);
+          await insertTxResult(db, { ...orphanRow, op_return: opReturn });
           await publisher.publish("txresult", JSON.stringify(orphanRow)).catch(() => {});
           confirmationPoller?.nudge();
+          writerWriteOutcomesTotal.inc({
+            path: "live",
+            record_type: recordTypeLabel,
+            outcome: "optimistic_orphan",
+          });
           log.info({ icao, txid: localTxid, code: result.code }, "Orphan-mempool flight-event recorded optimistically");
           return;
         }
@@ -498,7 +997,7 @@ async function main(): Promise<void> {
 
       const txid = result.txid;
 
-      await utxoManager.recordSpend(
+      const poolState = await utxoManager.recordSpend(
         utxo.txid,
         utxo.vout,
         txid,
@@ -507,6 +1006,7 @@ async function main(): Promise<void> {
         changeOutput.lockingScript,
         icao,
       );
+      autoRefill.requestRefillIfPoolLow(icao, poolState);
 
       const feResultRow = {
         txid,
@@ -518,15 +1018,29 @@ async function main(): Promise<void> {
         size_bytes: tx.toBinary().length,
         flight_id: event.flight_id,
       };
-      await insertTxResult(db, feResultRow);
+      await insertTxResult(db, { ...feResultRow, op_return: opReturn });
       await publisher.publish("txresult", JSON.stringify(feResultRow)).catch(() => {});
       confirmationPoller?.nudge();
+      writerWriteOutcomesTotal.inc({
+        path: "live",
+        record_type: recordTypeLabel,
+        outcome: "broadcasted",
+      });
     } catch (err) {
-      await utxoManager.releaseUtxo(utxo.txid, utxo.vout).catch(() => {});
+      await settleInputAfterFailedWrite(
+        icao, utxoManager, utxo, walletAddress, broadcastAttempted,
+      );
       const payload = encodeFlightEventPayload(event);
       await writeBuffer
         .buffer(icao, RecordType.FLIGHT_EVENT, payload, event.flight_id)
         .catch(() => {});
+      writerWriteOutcomesTotal.inc({
+        path: "live",
+        record_type: recordTypeLabel,
+        outcome: isHandledBackpressureError(err)
+          ? "buffered_after_backpressure"
+          : "buffered_after_failure",
+      });
       if (isHandledBackpressureError(err)) {
         log.warn({ err, icao }, "Flight-event write deferred");
       } else {
@@ -538,6 +1052,18 @@ async function main(): Promise<void> {
   const consolidationInterval = setInterval(() => {
     void runConsolidation();
   }, CONSOLIDATION_INTERVAL_MS);
+
+  // Locks are only ever held across a single broadcast. Anything older lost its
+  // owner, so reclaim it rather than letting the spendable pool quietly shrink —
+  // but only for outputs the chain agrees are still unspent.
+  const lockReclaimInterval = setInterval(() => {
+    void utxoManager
+      .reclaimStaleLocks((icao) => vault.getAircraftAddress(icao))
+      .catch((err) => log.error({ err }, "Aircraft UTXO lock reclaim failed"));
+    void fundingUtxoManager.reclaimStaleLocks().catch((err) =>
+      log.error({ err }, "Funding UTXO lock reclaim failed"),
+    );
+  }, LOCK_RECLAIM_INTERVAL_MS);
 
   async function runConsolidation(): Promise<void> {
     log.info("Running UTXO consolidation cycle");
@@ -556,11 +1082,30 @@ async function main(): Promise<void> {
     }
   }
 
+  const fundingState = new FundingStateMachine(
+    db,
+    config,
+    fundingUtxoManager,
+    autoRefill,
+    writeBuffer,
+    broadcaster,
+    publisher,
+  );
+  writeBuffer.setFundingDryGate(() => fundingState.isDry());
+  await fundingState.start();
+
   autoRefill.start();
   writeBuffer.startRetryLoop();
 
-  confirmationPoller = new ConfirmationPoller(db, config.wocApiUrl);
+  confirmationPoller = new ConfirmationPoller(
+    db,
+    config.wocApiUrl,
+    headerStore,
+    arcadeBroadcaster?.baseUrl,
+    config.arcade.apiKey,
+  );
   confirmationPoller.setRedisPublisher(publisher);
+  confirmationPoller.setTerminalRejectionHandler(handleTerminalRejection);
   confirmationPoller.start();
 
   log.info("Running initial auto-refill check (activity-aware bootstrap)");
@@ -592,6 +1137,10 @@ async function main(): Promise<void> {
     log.info("Graceful shutdown initiated");
 
     clearInterval(consolidationInterval);
+    clearInterval(lockReclaimInterval);
+    clearInterval(headerSyncInterval);
+    arcadeSse?.stop();
+    fundingState.stop();
     autoRefill.stop();
     writeBuffer.stopRetryLoop();
     confirmationPoller?.stop();
@@ -617,6 +1166,29 @@ async function main(): Promise<void> {
 
   process.on("SIGINT", () => void shutdown());
   process.on("SIGTERM", () => void shutdown());
+
+  // A socket reset from Postgres, Redis or a broadcaster must not be able to
+  // kill the writer with a bare stack trace. These are logged with full context
+  // and, for a genuinely unknown fault, the process exits non-zero so the
+  // supervisor restarts it cleanly rather than leaving it half-alive.
+  process.on("unhandledRejection", (reason) => {
+    const err = reason instanceof Error ? reason : new Error(String(reason));
+    if (isRecoverableSocketError(err)) {
+      log.warn({ err: err.message }, "Recoverable socket error outside a handler");
+      return;
+    }
+    log.fatal({ err }, "Unhandled promise rejection — restarting");
+    process.exit(1);
+  });
+
+  process.on("uncaughtException", (err) => {
+    if (isRecoverableSocketError(err)) {
+      log.warn({ err: err.message }, "Recoverable socket error outside a handler");
+      return;
+    }
+    log.fatal({ err }, "Uncaught exception — restarting");
+    process.exit(1);
+  });
 
   log.info(
     { aircraftCount: fleet.length },

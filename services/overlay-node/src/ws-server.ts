@@ -1,16 +1,15 @@
 import type { Server } from "node:http";
-import type { FlightEventRecord, TelemetryRecord } from "@airchive/types";
 import type { RawData, WebSocket } from "ws";
 import { WebSocketServer } from "ws";
 
-import type { ParsedAirchiveTx } from "./tx-parser.js";
+import type { AirchivePayload, ParsedAirchiveTx } from "./tx-parser.js";
 
 export interface NewTxPushPayload {
   txid: string;
   icao: string;
   timestamp: number;
   recordType: number;
-  payload: TelemetryRecord | FlightEventRecord;
+  payload: AirchivePayload;
 }
 
 export interface WsClientMessage {

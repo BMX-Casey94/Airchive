@@ -1,8 +1,30 @@
 import type { TelemetryRecord } from "@airchive/types";
 
-const LAT_LON_THRESHOLD = 0.0001;
-const ALT_THRESHOLD_FT = 25;
-const GS_THRESHOLD_KTS = 2;
+/**
+ * Dedup exists to drop repeats of the same observation arriving from multiple
+ * feeds — not to rate-limit. Thresholds sized for a stationary aircraft on a
+ * stand discard real signal from one in flight, where a 20 ft drift or a 2 kt
+ * speed trim is a genuine state change worth recording. Airborne aircraft
+ * therefore get much tighter thresholds.
+ */
+interface DedupThresholds {
+  latLonDeg: number;
+  altitudeFt: number;
+  groundSpeedKts: number;
+}
+
+const GROUND_THRESHOLDS: DedupThresholds = {
+  latLonDeg: 0.0001,
+  altitudeFt: 25,
+  groundSpeedKts: 2,
+};
+
+const AIRBORNE_THRESHOLDS: DedupThresholds = {
+  latLonDeg: 0.00002,
+  altitudeFt: 10,
+  groundSpeedKts: 1,
+};
+
 const MAX_SILENCE_MS = 60_000;
 
 interface LastSeen {
@@ -28,16 +50,17 @@ export class DedupFilter {
 
     if (record.on_ground !== prev.on_ground) return true;
 
+    const thresholds = thresholdsFor(record, prev);
     const latDelta = Math.abs(record.lat - prev.lat);
     const lonDelta = Math.abs(record.lon - prev.lon);
     const altDelta = Math.abs(record.alt_baro - prev.alt_baro);
     const gsDelta = Math.abs(record.gs - prev.gs);
 
     if (
-      latDelta <= LAT_LON_THRESHOLD &&
-      lonDelta <= LAT_LON_THRESHOLD &&
-      altDelta <= ALT_THRESHOLD_FT &&
-      gsDelta <= GS_THRESHOLD_KTS
+      latDelta <= thresholds.latLonDeg &&
+      lonDelta <= thresholds.latLonDeg &&
+      altDelta <= thresholds.altitudeFt &&
+      gsDelta <= thresholds.groundSpeedKts
     ) {
       return false;
     }
@@ -56,4 +79,13 @@ export class DedupFilter {
       publishedAt: Date.now(),
     });
   }
+}
+
+/**
+ * Treats an aircraft as airborne if either the current or previous observation
+ * says so, so the transition itself is never judged by ground thresholds.
+ */
+function thresholdsFor(record: TelemetryRecord, prev: LastSeen): DedupThresholds {
+  const airborne = record.on_ground === false || prev.on_ground === false;
+  return airborne ? AIRBORNE_THRESHOLDS : GROUND_THRESHOLDS;
 }

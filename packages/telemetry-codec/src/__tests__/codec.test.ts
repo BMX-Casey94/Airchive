@@ -3,6 +3,7 @@ import type { FlightEventRecord, TelemetryRecord } from "@airchive/types";
 
 import {
   buildOpReturnPayload,
+  buildOpReturnScript,
   encodeFlightEventPayload,
   encodeIcaoHex,
   encodeTelemetryPayload,
@@ -14,6 +15,7 @@ import {
   decodeIcaoHex,
   decodeTelemetryPayload,
   decodeTimestamp,
+  flattenOpReturnScript,
   parseOpReturnPayload,
 } from "../decoder.js";
 import { PROTOCOL_ID_BYTES, PROTOCOL_VERSION } from "../constants.js";
@@ -64,6 +66,10 @@ function mockTelemetry(overrides: Partial<TelemetryRecord> = {}): TelemetryRecor
   };
 }
 
+// Header layout: protocol id, version, ICAO, timestamp, record type.
+const VERSION_OFFSET = PROTOCOL_ID_BYTES.length;
+const RECORD_TYPE_OFFSET = PROTOCOL_ID_BYTES.length + 1 + 3 + 8;
+
 describe("telemetry codec", () => {
   describe("ICAO hex", () => {
     it("round-trips encodeIcaoHex and decodeIcaoHex", () => {
@@ -105,7 +111,14 @@ describe("telemetry codec", () => {
       expect(parsed.icao).toBe(record.icao.toUpperCase());
       expect(parsed.timestamp).toBe(record.ts);
       expect(parsed.recordType).toBe(RecordType.TELEMETRY);
-      expect(decodeTelemetryPayload(parsed.payload)).toEqual(record);
+      // The encoder shortens two keys on the wire and aliases feed names, so
+      // the decoded record is the wire shape rather than the input verbatim.
+      const { adsb_version, data_sources, ...rest } = record;
+      expect(decodeTelemetryPayload(parsed.payload)).toEqual({
+        ...rest,
+        transponder_ver: adsb_version,
+        data_sources: ["feed_1"],
+      });
     });
 
     it("throws when the protocol identifier does not match", () => {
@@ -120,7 +133,7 @@ describe("telemetry codec", () => {
       const record = mockTelemetry();
       const payload = encodeTelemetryPayload(record);
       const raw = buildOpReturnPayload(record.icao, record.ts, RecordType.TELEMETRY, payload);
-      raw[4] = 0x99;
+      raw[VERSION_OFFSET] = 0x99;
       expect(() => parseOpReturnPayload(raw)).toThrow(/version/i);
     });
 
@@ -128,12 +141,42 @@ describe("telemetry codec", () => {
       const record = mockTelemetry();
       const payload = encodeTelemetryPayload(record);
       const raw = buildOpReturnPayload(record.icao, record.ts, RecordType.TELEMETRY, payload);
-      raw[16] = 0xff;
+      raw[RECORD_TYPE_OFFSET] = 0xff;
       expect(() => parseOpReturnPayload(raw)).toThrow(/record type/i);
     });
 
     it("rejects payloads shorter than the fixed header", () => {
       expect(() => parseOpReturnPayload(new Uint8Array(10))).toThrow(/short/i);
+    });
+
+    it("flattens an on-chain script back into the parseable envelope", () => {
+      const record = mockTelemetry();
+      const payload = encodeTelemetryPayload(record);
+      const script = new Uint8Array(
+        buildOpReturnScript(record.icao, record.ts, RecordType.TELEMETRY, payload),
+      );
+      const flat = flattenOpReturnScript(script);
+      expect(flat).not.toBeNull();
+      expect(flat).toEqual(
+        buildOpReturnPayload(record.icao, record.ts, RecordType.TELEMETRY, payload),
+      );
+      expect(parseOpReturnPayload(flat!).icao).toBe(record.icao.toUpperCase());
+    });
+
+    it("flattens payloads large enough to need PUSHDATA2", () => {
+      const record = mockTelemetry();
+      const payload = new Uint8Array(400).fill(7);
+      const script = new Uint8Array(
+        buildOpReturnScript(record.icao, record.ts, RecordType.TELEMETRY, payload),
+      );
+      const flat = flattenOpReturnScript(script);
+      expect(flat).not.toBeNull();
+      expect(parseOpReturnPayload(flat!).payload).toEqual(payload);
+    });
+
+    it("returns null for scripts that are not AIRCHIVE OP_RETURNs", () => {
+      expect(flattenOpReturnScript(new Uint8Array([0x76, 0xa9, 0x14]))).toBeNull();
+      expect(flattenOpReturnScript(new Uint8Array([0x00, 0x6a, 0x03, 1, 2, 3]))).toBeNull();
     });
   });
 

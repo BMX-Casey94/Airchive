@@ -231,6 +231,14 @@ export class AirportLookup {
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code === "ENOENT") {
+        // Degrading to an empty lookup keeps ingestion alive, but every origin,
+        // destination and proximity result silently becomes null. Warn loudly so
+        // this is never mistaken for "no airports nearby".
+        console.warn(
+          `[@airchive/airports] Airport CSV not found at ${path} — all airport ` +
+            "lookups will return null. Run `pnpm --filter @airchive/airports run " +
+            "fetch:airports` to populate it.",
+        );
         return new AirportLookup([]);
       }
       throw err;

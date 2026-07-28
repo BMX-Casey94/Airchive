@@ -89,6 +89,19 @@ export interface PhaseSegment {
   durationMs: number;
 }
 
+/* ── Decoded telemetry attached to a transaction row ─────── */
+export interface TelemetrySample {
+  callsign: string | null;
+  latitude: number | null;
+  longitude: number | null;
+  altitudeFt: number | null;
+  groundSpeedKts: number | null;
+  headingDeg: number | null;
+  verticalRateFpm: number | null;
+  onGround: boolean | null;
+  squawk: string | null;
+}
+
 /* ── Transaction result (from API) ──────────────────────── */
 export interface TxResultDTO {
   txid: string;
@@ -96,12 +109,18 @@ export interface TxResultDTO {
   recordType: RecordType;
   status: TxStatus;
   blockHeight?: number;
+  /** A proof was received. This alone is not verification — see `spvVerified`. */
   merklePath?: string;
+  /** The proof was recomputed against a locally held, work-checked header. */
+  spvVerified?: boolean;
   timestamp: number;
   feeSats: number;
   sizeBytes: number;
   flightId?: string;
   createdAt: string;
+  /** Both are only returned when the route is called with `decode=true`. */
+  phase?: FlightPhase;
+  telemetry?: TelemetrySample | null;
 }
 
 /* ── Decoded OP_RETURN fields shown on tx explorer page ─── */

@@ -10,10 +10,10 @@
     "clean": "rimraf dist *.tsbuildinfo",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/",
-    "test": "vitest run"
+    "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
-    "@bsv/sdk": "^1.1.0",
+    "@bsv/sdk": "^2.0.13",
     "@airchive/types": "workspace:*"
   },
   "devDependencies": {

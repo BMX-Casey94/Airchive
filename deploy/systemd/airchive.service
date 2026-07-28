@@ -1,0 +1,24 @@
+[Unit]
+Description=Airchive telemetry stack
+Documentation=file:///opt/airchive/deploy/README.md
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/airchive
+Environment=COMPOSE_PROJECT_NAME=airchive
+
+# Compose already sets restart: unless-stopped on every container, so this unit
+# exists to bring the stack up at boot and to give the operator a single
+# systemctl handle — not to supervise individual services.
+ExecStart=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --remove-orphans
+ExecStop=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.prod.yml stop
+ExecReload=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build --remove-orphans
+
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

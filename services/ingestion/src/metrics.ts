@@ -24,6 +24,34 @@ export const recordsTotal = new Counter({
   registers: [register],
 });
 
+export const mergedRecordsTotal = new Counter({
+  name: "airchive_ingestion_merged_records_total",
+  help: "Total merged telemetry records before dedup filtering",
+  registers: [register],
+});
+
+export const dedupDecisionsTotal = new Counter({
+  name: "airchive_ingestion_dedup_decisions_total",
+  help: "Total dedup filter decisions",
+  labelNames: ["decision"] as const,
+  registers: [register],
+});
+
+export const phaseEngineMessagesTotal = new Counter({
+  name: "airchive_phase_engine_messages_total",
+  help: "Total telemetry messages processed by the phase engine",
+  registers: [register],
+});
+
+export const phaseEngineWriteDecisionsTotal = new Counter({
+  name: "airchive_phase_engine_write_decisions_total",
+  help:
+    "Phase-engine write decisions by flight phase. Decision is the trigger that "
+    + "emitted the write (first, event, interval) or rate_limited when suppressed.",
+  labelNames: ["phase", "decision"] as const,
+  registers: [register],
+});
+
 export const errorsTotal = new Counter({
   name: "airchive_ingestion_errors_total",
   help: "Total ingestion errors",

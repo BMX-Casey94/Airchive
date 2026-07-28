@@ -29,6 +29,20 @@ export const analysisPublishedTotal = new Counter({
   registers: [registry],
 });
 
+export const agentInscriptionsTotal = new Counter({
+  name: "agent_inscriptions_total",
+  help: "Agent on-chain inscription attempts by outcome",
+  labelNames: ["agent", "outcome"] as const,
+  registers: [registry],
+});
+
+export const agentHealthy = new Gauge({
+  name: "agent_healthy",
+  help: "Whether each agent is completing cycles and landing records on-chain",
+  labelNames: ["agent"] as const,
+  registers: [registry],
+});
+
 export const dataRequestLatency = new Histogram({
   name: "data_request_latency_seconds",
   help: "Latency of data request fulfilment",

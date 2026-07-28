@@ -68,8 +68,10 @@ export async function auditRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(404).send({ success: false, error: "Transaction not found" });
     }
 
-    const verified = tx.status === "MINED" && tx.merkle_path != null;
-
+    // Read the writer's own verdict rather than re-deriving one. A stored
+    // merkle path only means a proof was received; the writer records
+    // unverified proofs too, so treating its presence as verification is how an
+    // audit endpoint ends up asserting something it never checked.
     return reply.send({
       success: true,
       data: {
@@ -77,7 +79,8 @@ export async function auditRoutes(app: FastifyInstance): Promise<void> {
         status: tx.status,
         block_height: tx.block_height,
         merkle_path: tx.merkle_path,
-        spv_verified: verified,
+        spv_verified: tx.spv_verified === true,
+        proof_received: tx.merkle_path != null,
         aircraft_icao: tx.aircraft_icao,
         timestamp: tx.timestamp,
       },

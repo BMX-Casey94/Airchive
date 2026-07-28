@@ -1,0 +1,6 @@
+# TLS material for the nginx container is mounted here read-only.
+# Expected filenames (see nginx/nginx.conf header comment):
+#   fullchain.pem  leaf certificate + intermediate chain
+#   privkey.pem    matching private key, PEM, unencrypted
+#   chain.pem      intermediate chain only, optional, for OCSP stapling
+# Never commit real key material.

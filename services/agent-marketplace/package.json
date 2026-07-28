@@ -15,6 +15,7 @@
   "dependencies": {
     "@airchive/db": "workspace:*",
     "@airchive/logger": "workspace:*",
+    "@airchive/telemetry-codec": "workspace:*",
     "@airchive/types": "workspace:*",
     "@bsv/sdk": "^2.0.13",
     "@bsv/simple": "^0.3.0",

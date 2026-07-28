@@ -43,14 +43,33 @@ function StatusBadge({ status }: { status: string }) {
   );
 }
 
-function SpvBadge({ hasMerklePath }: { hasMerklePath: boolean }) {
+/**
+ * Reports the writer's verification verdict, never an inference from the
+ * presence of a proof. Unverified proofs are stored too, so a merkle path on
+ * its own says only that one was received.
+ */
+function SpvBadge({
+  spvVerified,
+  proofReceived,
+}: {
+  spvVerified: boolean;
+  proofReceived: boolean;
+}) {
+  const label = spvVerified
+    ? "SPV verified"
+    : proofReceived
+      ? "Proof received"
+      : "Awaiting proof";
+
   return (
     <span
       className={clsx(
         "inline-flex items-center gap-1.5 px-3 py-1 rounded-full border text-xs font-mono",
-        hasMerklePath
+        spvVerified
           ? "bg-signal-green/20 border-signal-green/40 text-signal-green"
-          : "bg-panel-bg border-panel-border text-hud-muted",
+          : proofReceived
+            ? "bg-neon-amber/20 border-neon-amber/40 text-neon-amber"
+            : "bg-panel-bg border-panel-border text-hud-muted",
       )}
     >
       <svg
@@ -61,7 +80,7 @@ function SpvBadge({ hasMerklePath }: { hasMerklePath: boolean }) {
         stroke="currentColor"
         strokeWidth={2}
       >
-        {hasMerklePath ? (
+        {spvVerified ? (
           <path
             strokeLinecap="round"
             strokeLinejoin="round"
@@ -75,7 +94,7 @@ function SpvBadge({ hasMerklePath }: { hasMerklePath: boolean }) {
           />
         )}
       </svg>
-      {hasMerklePath ? "SPV Verified" : "Awaiting SPV"}
+      {label}
     </span>
   );
 }
@@ -186,7 +205,7 @@ export default function TxExplorerPage({
         </div>
         <div className="flex items-center gap-3 shrink-0">
           <StatusBadge status={tx.status} />
-          <SpvBadge hasMerklePath={!!tx.merklePath} />
+          <SpvBadge spvVerified={!!tx.spvVerified} proofReceived={!!tx.merklePath} />
         </div>
       </div>
 
@@ -210,7 +229,7 @@ export default function TxExplorerPage({
               {RECORD_TYPE_LABEL[tx.recordType] ?? `0x${tx.recordType.toString(16).padStart(2, "0")}`}
             </span>
           </FieldRow>
-          <FieldRow label="ARC Status">
+          <FieldRow label="Network Status">
             <StatusBadge status={tx.status} />
           </FieldRow>
           <FieldRow label="Timestamp">
@@ -321,21 +340,23 @@ export default function TxExplorerPage({
       <div className="panel p-5">
         <p className="hud-label text-[9px] mb-4">SPV Verification</p>
         <div className="flex items-center gap-4">
-          <SpvBadge hasMerklePath={!!tx.merklePath} />
-          {tx.merklePath ? (
+          <SpvBadge spvVerified={!!tx.spvVerified} proofReceived={!!tx.merklePath} />
+          {tx.spvVerified ? (
             <p className="text-xs text-signal-green/80">
-              This transaction has been independently verified via its Merkle
-              proof path against the block header.
+              The inclusion proof for this transaction was recomputed to a Merkle
+              root matching a block header held locally, whose proof of work this
+              system checked itself. No third party was trusted for this result.
             </p>
-          ) : tx.status === "MINED" ? (
+          ) : tx.merklePath ? (
             <p className="text-xs text-neon-amber/80">
-              Transaction is mined but the Merkle path has not yet been
-              retrieved. SPV verification will be available shortly.
+              An inclusion proof has been received but not yet verified — the
+              matching block header has not been synchronised. Verification is
+              retried as the header chain catches up.
             </p>
           ) : (
             <p className="text-xs text-hud-muted">
-              SPV verification requires the transaction to be included in a
-              mined block with a valid Merkle path.
+              Awaiting an inclusion proof. One becomes available once the
+              transaction is mined into a block.
             </p>
           )}
         </div>

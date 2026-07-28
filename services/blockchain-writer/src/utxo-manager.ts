@@ -11,9 +11,13 @@ import { createLogger } from "@airchive/logger";
 import { buildConsolidationTx } from "./tx-builder.js";
 import {
   BroadcastPriority,
-  type ArcBroadcaster,
+  type Broadcaster,
 } from "./broadcaster.js";
-import { utxoPoolBalance, utxoPoolCount } from "./metrics.js";
+import {
+  utxoLocksReclaimedTotal,
+  utxoPoolBalance,
+  utxoPoolCount,
+} from "./metrics.js";
 
 const log = createLogger({ service: "blockchain-writer:utxo" });
 
@@ -24,7 +28,7 @@ interface WocUtxo {
   height: number;
 }
 
-interface UtxoPoolState {
+export interface UtxoPoolState {
   balance: number;
   utxoCount: number;
   unlockedUtxoCount: number;
@@ -33,11 +37,34 @@ interface UtxoPoolState {
 }
 
 const MIN_USABLE_SATS = 120;
-const ORPHAN_SPEND_COOLDOWN_MS = 15_000;
-const CHAIN_PROPAGATION_COOLDOWN_MS = 3_000;
-const REFILL_PROPAGATION_COOLDOWN_MS = 5_000;
+const ORPHAN_SPEND_COOLDOWN_MS = 1_000;
+const CHAIN_PROPAGATION_COOLDOWN_MS = 0;
+const REFILL_PROPAGATION_COOLDOWN_MS = 500;
 const RECONCILE_COOLDOWN_MS = 60_000;
 const MAX_CONCURRENT_RECONCILES = 2;
+
+/**
+ * A lock is held only for the duration of one build-and-broadcast. Anything
+ * still locked well beyond that lost its owner to a crash or an unhandled
+ * rejection, and holding it forever silently shrinks the spendable pool.
+ */
+export const UTXO_LOCK_TTL_MS = 2 * 60 * 1_000;
+
+/**
+ * Raised when an aircraft's pool still holds rows but none can be spent. The
+ * pool cannot fix this itself — only reconciliation against the chain can.
+ */
+export class StalePoolError extends Error {
+  constructor(
+    readonly icao: string,
+    readonly residualRows: number,
+  ) {
+    super(
+      `No spendable UTXOs for aircraft ${icao} despite ${residualRows} pool row(s) — pool is stale`,
+    );
+    this.name = "StalePoolError";
+  }
+}
 
 export class UtxoManager {
   private readonly utxoCooldownUntil = new Map<string, number>();
@@ -54,8 +81,23 @@ export class UtxoManager {
   async bootstrap(icao: string, address: string): Promise<boolean> {
     const existing = await getUtxoCount(this.db, icao);
     if (existing > 0) {
-      log.info({ icao, count: existing }, "UTXO pool already populated, skipping bootstrap");
-      await this.refreshMetrics(icao);
+      const state = await this.checkBalance(icao);
+      // A populated pool is not necessarily a usable one: every row may be dust
+      // or a phantom left by a spend the network dropped. Trusting the row count
+      // alone left such wallets permanently unable to spend.
+      if (state.unlockedUtxoCount === 0) {
+        log.warn(
+          { icao, rows: existing },
+          "UTXO pool has rows but none are spendable — reconciling against chain instead of skipping",
+        );
+        await this.reconcile(icao, address);
+        return true;
+      }
+      log.info(
+        { icao, count: existing, spendable: state.unlockedUtxoCount },
+        "UTXO pool already populated, skipping bootstrap",
+      );
+      this.setMetricsFromState(icao, state);
       return false;
     }
 
@@ -90,7 +132,7 @@ export class UtxoManager {
     return true;
   }
 
-  async acquireUtxo(icao: string): Promise<UTXORecord> {
+  async acquireUtxo(icao: string, minReadyReserve = 0): Promise<UTXORecord> {
     const key = icao.toUpperCase();
     this.pruneExpiredCooldowns();
 
@@ -100,20 +142,39 @@ export class UtxoManager {
         .where("satoshis", ">=", MIN_USABLE_SATS)
         .orderBy("satoshis", "desc") as UTXORecord[];
 
-      const ready = candidates.find(
+      const readyCandidates = candidates.filter(
         (utxo) => !this.isUtxoCooling(utxo.txid, utxo.vout),
       );
 
-      if (!ready) {
+      if (readyCandidates.length === 0) {
         if (candidates.length > 0) {
           throw new Error(`UTXO spend cooling down for aircraft ${key}`);
+        }
+        // Nothing spendable. If rows still exist they are locked, dust, or
+        // phantoms left by a spend the network never accepted — all of which
+        // need chain truth to resolve, not another refill.
+        const residual = await this.db("utxo_pool")
+          .where({ aircraft_icao: icao })
+          .count<[{ count: string }]>({ count: "*" })
+          .first();
+        const residualRows = Number(residual?.count ?? 0);
+        if (residualRows > 0) {
+          throw new StalePoolError(key, residualRows);
         }
         throw new Error(`No available UTXOs for aircraft ${icao}`);
       }
 
+      if (minReadyReserve > 0 && readyCandidates.length <= minReadyReserve) {
+        throw new Error(
+          `UTXO ready reserve protected for aircraft ${key} (ready=${readyCandidates.length}, reserve=${minReadyReserve})`,
+        );
+      }
+
+      const ready = readyCandidates[0]!;
+
       const locked = await this.db("utxo_pool")
         .where({ txid: ready.txid, vout: ready.vout, is_locked: false })
-        .update({ is_locked: true });
+        .update({ is_locked: true, locked_at: this.db.fn.now() });
 
       if (locked > 0) {
         return ready;
@@ -121,6 +182,65 @@ export class UtxoManager {
     }
 
     throw new Error(`UTXO acquisition contention for aircraft ${icao}`);
+  }
+
+  /**
+   * Frees locks held past the TTL, but only for outputs the chain still says
+   * are unspent.
+   *
+   * A lock outlives its owner in two very different situations: the broadcast
+   * never happened, in which case the output is still spendable; or the
+   * broadcast did happen and the writer lost track of it, in which case the
+   * output is gone. Unlocking blindly treats the second case as the first and
+   * hands the same output to the next write, producing a conflicting spend
+   * whose rejection then invalidates every transaction chained behind it.
+   *
+   * Reconciling each affected wallet first removes the outputs that are truly
+   * spent; whatever survives is safe to unlock.
+   */
+  async reclaimStaleLocks(
+    resolveAddress?: (icao: string) => string,
+    ttlMs = UTXO_LOCK_TTL_MS,
+  ): Promise<number> {
+    const cutoff = new Date(Date.now() - ttlMs);
+
+    const staleQuery = () =>
+      this.db("utxo_pool")
+        .where({ is_locked: true })
+        .where((builder) => {
+          void builder.where("locked_at", "<", cutoff).orWhereNull("locked_at");
+        });
+
+    const affected = await staleQuery().distinct("aircraft_icao") as Array<{
+      aircraft_icao: string;
+    }>;
+    if (affected.length === 0) return 0;
+
+    if (resolveAddress) {
+      for (const { aircraft_icao: icao } of affected) {
+        try {
+          await this.reconcile(icao, resolveAddress(icao));
+        } catch (err) {
+          log.warn(
+            { err, icao },
+            "Could not reconcile before reclaiming locks — leaving them held",
+          );
+        }
+      }
+    }
+
+    // Rows deleted by reconciliation were spent, so this only unlocks the ones
+    // the chain still recognises.
+    const reclaimed = await staleQuery().update({ is_locked: false, locked_at: null });
+
+    if (reclaimed > 0) {
+      utxoLocksReclaimedTotal.inc({ pool: "aircraft" }, reclaimed);
+      log.warn(
+        { reclaimed, aircraft: affected.length, ttlMs },
+        "Reclaimed aircraft UTXO locks the chain confirms are still unspent",
+      );
+    }
+    return reclaimed;
   }
 
   delaySpendRetries(
@@ -141,7 +261,7 @@ export class UtxoManager {
   async releaseUtxo(txid: string, vout: number): Promise<void> {
     await this.db("utxo_pool")
       .where({ txid, vout })
-      .update({ is_locked: false });
+      .update({ is_locked: false, locked_at: null });
   }
 
   async deleteStaleUtxo(txid: string, vout: number): Promise<void> {
@@ -152,6 +272,34 @@ export class UtxoManager {
     }
   }
 
+  /**
+   * Drops every pool entry created by a transaction the network refused.
+   *
+   * A rejected transaction's change output does not exist, but the writer
+   * recorded it locally the moment it broadcast. Left in place it becomes the
+   * parent of the aircraft's next write, which is then rejected for spending a
+   * non-existent input, and so on — one rejection quietly ends all further
+   * writes for that aircraft. Removing the phantom outputs breaks that chain,
+   * and the caller reconciles against the chain to recover the real ones.
+   */
+  async invalidateOutputsOf(txid: string): Promise<number> {
+    const normalised = txid.trim();
+    const rows = await this.db("utxo_pool")
+      .where({ txid: normalised })
+      .select("vout") as Array<{ vout: number }>;
+    if (rows.length === 0) return 0;
+
+    const deleted = await this.db("utxo_pool").where({ txid: normalised }).delete();
+    for (const row of rows) {
+      this.clearUtxoCooldown(normalised, row.vout);
+    }
+    log.warn(
+      { txid: normalised.slice(0, 12), deleted },
+      "Purged phantom outputs of a rejected transaction",
+    );
+    return deleted;
+  }
+
   async recordSpend(
     spentTxid: string,
     spentVout: number,
@@ -160,7 +308,7 @@ export class UtxoManager {
     changeSats: number,
     changeLockingScript: string,
     icao: string,
-  ): Promise<void> {
+  ): Promise<UtxoPoolState> {
     await this.db.transaction(async (trx: Knex.Transaction) => {
       await trx("utxo_pool")
         .where({ txid: spentTxid, vout: spentVout })
@@ -192,7 +340,7 @@ export class UtxoManager {
         CHAIN_PROPAGATION_COOLDOWN_MS,
       );
     }
-    await this.refreshMetrics(icao);
+    return await this.refreshMetrics(icao);
   }
 
   async addUtxo(
@@ -201,8 +349,8 @@ export class UtxoManager {
     vout: number,
     satoshis: number,
     lockingScript: string,
-  ): Promise<void> {
-    await this.addUtxos(icao, [{
+  ): Promise<UtxoPoolState> {
+    return await this.addUtxos(icao, [{
       txid,
       vout,
       satoshis,
@@ -218,7 +366,7 @@ export class UtxoManager {
       satoshis: number;
       lockingScript: string;
     }>,
-  ): Promise<void> {
+  ): Promise<UtxoPoolState> {
     for (const output of outputs) {
       await insertUtxo(this.db, {
         aircraft_icao: icao,
@@ -234,7 +382,7 @@ export class UtxoManager {
         REFILL_PROPAGATION_COOLDOWN_MS,
       );
     }
-    await this.refreshMetrics(icao);
+    return await this.refreshMetrics(icao);
   }
 
   async reconcile(icao: string, address: string): Promise<void> {
@@ -327,7 +475,7 @@ export class UtxoManager {
   async consolidate(
     icao: string,
     privateKey: PrivateKey,
-    broadcaster: ArcBroadcaster,
+    broadcaster: Broadcaster,
     threshold: number,
   ): Promise<void> {
     const count = await getUtxoCount(this.db, icao);
@@ -535,13 +683,19 @@ export class UtxoManager {
     }
   }
 
-  private async refreshMetrics(icao: string): Promise<void> {
+  private setMetricsFromState(icao: string, state: Pick<UtxoPoolState, "balance" | "utxoCount">): void {
+    utxoPoolBalance.set({ icao }, state.balance);
+    utxoPoolCount.set({ icao }, state.utxoCount);
+  }
+
+  private async refreshMetrics(icao: string): Promise<UtxoPoolState> {
     try {
-      const { balance, utxoCount } = await this.checkBalance(icao);
-      utxoPoolBalance.set({ icao }, balance);
-      utxoPoolCount.set({ icao }, utxoCount);
+      const state = await this.checkBalance(icao);
+      this.setMetricsFromState(icao, state);
+      return state;
     } catch {
       // Non-critical; swallow metrics refresh errors
+      return await this.checkBalance(icao);
     }
   }
 }

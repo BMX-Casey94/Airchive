@@ -1,0 +1,11 @@
+[Unit]
+Description=Reload Airchive nginx so renewed certificates take effect
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/airchive
+# A reload is cheap and idempotent, so this runs unconditionally rather than
+# trying to detect whether certbot replaced anything overnight.
+ExecStart=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.prod.yml exec -T nginx nginx -s reload

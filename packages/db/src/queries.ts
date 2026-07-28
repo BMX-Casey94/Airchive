@@ -332,6 +332,7 @@ export async function insertTxResult(
     size_bytes: result.size_bytes,
     flight_id: result.flight_id,
     chronicle_validated: result.chronicle_validated ?? false,
+    op_return: result.op_return ? Buffer.from(result.op_return) : null,
   });
 }
 
@@ -425,6 +426,8 @@ export interface FundingUtxoRow {
   satoshis: number;
   locking_script: string;
   is_locked: boolean;
+  /** When the lock was taken, so locks orphaned by a crash can be reclaimed. */
+  locked_at?: Date | null;
   created_at: Date;
 }
 
@@ -474,7 +477,7 @@ export async function acquireFundingUtxo(
 
     await trx("funding_utxo_pool")
       .where({ txid: utxo.txid, vout: utxo.vout })
-      .update({ is_locked: true });
+      .update({ is_locked: true, locked_at: trx.fn.now() });
 
     return utxo;
   });
@@ -487,7 +490,24 @@ export async function releaseFundingUtxo(
 ): Promise<void> {
   await db("funding_utxo_pool")
     .where({ txid, vout })
-    .update({ is_locked: false });
+    .update({ is_locked: false, locked_at: null });
+}
+
+/**
+ * Reclaim funding locks held past `ttlMs`. Mirrors the aircraft-pool sweep so a
+ * crash mid-refill cannot permanently strand treasury capacity.
+ */
+export async function reclaimStaleFundingLocks(
+  db: Knex,
+  ttlMs: number,
+): Promise<number> {
+  const cutoff = new Date(Date.now() - ttlMs);
+  return db("funding_utxo_pool")
+    .where({ is_locked: true })
+    .where((builder) => {
+      void builder.where("locked_at", "<", cutoff).orWhereNull("locked_at");
+    })
+    .update({ is_locked: false, locked_at: null });
 }
 
 export async function deleteFundingUtxo(
@@ -501,13 +521,87 @@ export async function deleteFundingUtxo(
 export async function unlockAllFundingUtxos(db: Knex): Promise<number> {
   return db("funding_utxo_pool")
     .where({ is_locked: true })
-    .update({ is_locked: false });
+    .update({ is_locked: false, locked_at: null });
 }
 
 export async function unlockAllAircraftUtxos(db: Knex): Promise<number> {
   return db("utxo_pool")
     .where({ is_locked: true })
-    .update({ is_locked: false });
+    .update({ is_locked: false, locked_at: null });
+}
+
+/* ── Funding state machine ──────────────────────────────────── */
+
+export const TREASURY_SCOPE = "TREASURY";
+
+export type FundingStateName = "HEALTHY" | "LOW" | "DRY" | "RECOVERING";
+
+export interface FundingStateRow {
+  scope: string;
+  state: FundingStateName;
+  balance_sats: string | number;
+  utxo_count: number;
+  state_since: Date;
+  last_checked_at: Date | null;
+  last_alert_at: Date | null;
+  next_poll_at: Date | null;
+  consecutive_dry_polls: number;
+  burn_sats_per_hour: string | number;
+  details: Record<string, unknown>;
+  updated_at: Date;
+}
+
+export interface FundingStateUpdate {
+  state: FundingStateName;
+  balance_sats: number;
+  utxo_count: number;
+  /** Only bumped when the state actually changes, so it measures dwell time. */
+  resetSince: boolean;
+  next_poll_at?: Date | null;
+  consecutive_dry_polls?: number;
+  burn_sats_per_hour?: number;
+  last_alert_at?: Date | null;
+  details?: Record<string, unknown>;
+}
+
+export async function getFundingState(
+  db: Knex,
+  scope: string,
+): Promise<FundingStateRow | undefined> {
+  return db("funding_state").where({ scope }).first();
+}
+
+export async function getAllFundingStates(db: Knex): Promise<FundingStateRow[]> {
+  return db("funding_state").orderBy("scope", "asc");
+}
+
+export async function upsertFundingState(
+  db: Knex,
+  scope: string,
+  update: FundingStateUpdate,
+): Promise<void> {
+  const now = db.fn.now();
+  const row: Record<string, unknown> = {
+    scope,
+    state: update.state,
+    balance_sats: update.balance_sats,
+    utxo_count: update.utxo_count,
+    last_checked_at: now,
+    updated_at: now,
+  };
+  if (update.resetSince) row.state_since = now;
+  if (update.next_poll_at !== undefined) row.next_poll_at = update.next_poll_at;
+  if (update.consecutive_dry_polls !== undefined) {
+    row.consecutive_dry_polls = update.consecutive_dry_polls;
+  }
+  if (update.burn_sats_per_hour !== undefined) {
+    row.burn_sats_per_hour = Math.max(0, Math.round(update.burn_sats_per_hour));
+  }
+  if (update.last_alert_at !== undefined) row.last_alert_at = update.last_alert_at;
+  if (update.details !== undefined) row.details = JSON.stringify(update.details);
+
+  const { scope: _scope, ...merge } = row;
+  await db("funding_state").insert(row).onConflict("scope").merge(merge);
 }
 
 export async function getAircraftConfig(

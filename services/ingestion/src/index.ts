@@ -18,6 +18,8 @@ import {
 } from "./demo-replay.js";
 import {
   getMetricsServer,
+  dedupDecisionsTotal,
+  mergedRecordsTotal,
   recordsTotal,
   trackedAircraftCount,
 } from "./metrics.js";
@@ -68,12 +70,21 @@ async function main(): Promise<void> {
   );
 
   const airports = await loadAirports();
-  log.info({ count: airports.count }, "Airport database loaded");
+  if (airports.count === 0) {
+    log.warn(
+      { count: 0 },
+      "Airport database is empty — origin/destination detection and airport-proximity "
+        + "write-rate boosting are disabled. Run `pnpm --filter @airchive/airports run fetch:airports`.",
+    );
+  } else {
+    log.info({ count: airports.count }, "Airport database loaded");
+  }
 
   const redis = new Redis({
     host: config.redis.host,
     port: config.redis.port,
     maxRetriesPerRequest: 3,
+    keepAlive: 10_000,
     retryStrategy(times) {
       if (times > 10) return null;
       return Math.min(times * 500, 5000);
@@ -184,8 +195,18 @@ async function main(): Promise<void> {
 
       const sources = await Promise.all(fetches);
       const merged = mergeRecords(sources);
+      if (merged.length > 0) {
+        mergedRecordsTotal.inc(merged.length);
+      }
 
       const toPublish = merged.filter((r) => dedup.shouldPublish(r));
+      if (toPublish.length > 0) {
+        dedupDecisionsTotal.inc({ decision: "published" }, toPublish.length);
+      }
+      const suppressedCount = Math.max(0, merged.length - toPublish.length);
+      if (suppressedCount > 0) {
+        dedupDecisionsTotal.inc({ decision: "suppressed" }, suppressedCount);
+      }
 
       if (toPublish.length > 0) {
         await publisher.publishBatch(toPublish);

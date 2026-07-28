@@ -114,7 +114,46 @@ export interface ArcCallbackPayload {
   txid: string;
   txStatus: string;
   blockHeight?: number;
+  blockHash?: string;
   merklePath?: string;
+  /**
+   * The upstream's reason. A rejection without one is undiagnosable, and every
+   * rejection reason implies a different fix — a missing input, a fee below
+   * policy and a malformed script are not the same incident.
+   */
+  extraInfo?: string;
+  competingTxs?: string[];
+}
+
+/**
+ * The contract every broadcast upstream satisfies, so Arcade and ARC are
+ * interchangeable at the call sites without those sites knowing which is live.
+ */
+export interface Broadcaster {
+  /**
+   * True when the upstream withholds a success outcome until the network has
+   * actually seen the transaction. Call sites use this to decide whether an
+   * orphan-mempool result may be treated optimistically: with a gate in place
+   * an orphan outcome is a genuine failure, without one it is only "not yet".
+   */
+  readonly hasSeenOnNetworkGate?: boolean;
+  broadcast(
+    tx: Transaction,
+    icao?: string,
+    options?: BroadcastOptions,
+  ): Promise<BroadcastOutcome>;
+  getState(): ArcBroadcasterState;
+  getLimits(): Pick<ArcBroadcasterConfig, "maxConcurrentBroadcasts" | "maxQueueDepth">;
+  isDegraded(): boolean;
+  setupCallbackReceiver(port: number): void;
+  closeCallbackReceiver(): Promise<void>;
+  on(event: "status-update", listener: (payload: ArcCallbackPayload) => void): this;
+}
+
+export interface ArcEndpointConfig {
+  name: string;
+  url: string;
+  apiKey?: string;
 }
 
 export interface ArcBroadcasterConfig {
@@ -125,6 +164,7 @@ export interface ArcBroadcasterConfig {
   circuitFailureThreshold: number;
   circuitWindowMs: number;
   circuitOpenMs: number;
+  emitStateMetrics?: boolean;
 }
 
 export interface ArcBroadcasterState {
@@ -174,9 +214,11 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export class ArcBroadcaster extends EventEmitter {
+class SingleArcBroadcaster extends EventEmitter {
   private readonly arc: ARC;
   private readonly config: ArcBroadcasterConfig;
+  private readonly upstreamName: string;
+  private readonly emitStateMetrics: boolean;
   private callbackServer: Server | null = null;
   private readonly queue: QueuedBroadcast[] = [];
   private inFlight = 0;
@@ -186,12 +228,15 @@ export class ArcBroadcaster extends EventEmitter {
   private breakerResumeTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
+    upstreamName: string,
     arcUrl: string,
-    apiKey: string,
+    apiKey: string | undefined,
     config?: Partial<ArcBroadcasterConfig>,
   ) {
     super();
     this.config = { ...DEFAULT_CONFIG, ...config };
+    this.upstreamName = upstreamName;
+    this.emitStateMetrics = config?.emitStateMetrics ?? true;
     this.arc = new ARC(arcUrl, {
       apiKey,
       httpClient: nodeFetchHttpClient(),
@@ -322,6 +367,7 @@ export class ArcBroadcaster extends EventEmitter {
         });
         log.info(
           {
+            upstream: this.upstreamName,
             txid: outcome.txid,
             icao: label,
             kind: task.options.kind,
@@ -346,6 +392,7 @@ export class ArcBroadcaster extends EventEmitter {
         txBroadcastRetryTotal.inc({ kind: task.options.kind, reason: outcome.code ?? "unknown" });
         log.debug(
           {
+            upstream: this.upstreamName,
             icao: label,
             kind: task.options.kind,
             attempt: attempt + 1,
@@ -457,7 +504,14 @@ export class ArcBroadcaster extends EventEmitter {
 
     if (isDependency) {
       log.warn(
-        { icao: label, kind, latency, code: outcome.code, description: outcome.description },
+        {
+          upstream: this.upstreamName,
+          icao: label,
+          kind,
+          latency,
+          code: outcome.code,
+          description: outcome.description,
+        },
         `Broadcast dependency pending: ${outcome.description ?? outcome.code ?? "unknown"}`,
       );
       return;
@@ -465,7 +519,14 @@ export class ArcBroadcaster extends EventEmitter {
 
     if (isLocalBackpressure) {
       log.debug(
-        { icao: label, kind, latency, code: outcome.code, description: outcome.description },
+        {
+          upstream: this.upstreamName,
+          icao: label,
+          kind,
+          latency,
+          code: outcome.code,
+          description: outcome.description,
+        },
         "Broadcast skipped due to local backpressure",
       );
       return;
@@ -473,14 +534,28 @@ export class ArcBroadcaster extends EventEmitter {
 
     if (isTransient) {
       log.warn(
-        { icao: label, kind, latency, code: outcome.code, description: outcome.description },
+        {
+          upstream: this.upstreamName,
+          icao: label,
+          kind,
+          latency,
+          code: outcome.code,
+          description: outcome.description,
+        },
         `Broadcast transient failure: ${outcome.description ?? outcome.code ?? "unknown"}`,
       );
       return;
     }
 
     log.error(
-      { icao: label, kind, latency, code: outcome.code, description: outcome.description },
+      {
+        upstream: this.upstreamName,
+        icao: label,
+        kind,
+        latency,
+        code: outcome.code,
+        description: outcome.description,
+      },
       `Broadcast rejected: ${outcome.description ?? outcome.code ?? "unknown"}`,
     );
   }
@@ -536,6 +611,7 @@ export class ArcBroadcaster extends EventEmitter {
       this.scheduleBreakerResume();
       log.warn(
         {
+          upstream: this.upstreamName,
           failuresInWindow: this.transientFailureTimes.length,
           windowMs: this.config.circuitWindowMs,
           openMs: this.config.circuitOpenMs,
@@ -552,9 +628,12 @@ export class ArcBroadcaster extends EventEmitter {
   }
 
   private updateStateMetrics(): void {
-    txBroadcastQueueDepth.set(this.queue.length);
-    txBroadcastInFlight.set(this.inFlight);
-    txBroadcastBreakerOpen.set(this.breakerOpenUntil > Date.now() ? 1 : 0);
+    if (this.emitStateMetrics) {
+      txBroadcastQueueDepth.set(this.queue.length);
+      txBroadcastInFlight.set(this.inFlight);
+      txBroadcastBreakerOpen.set(this.breakerOpenUntil > Date.now() ? 1 : 0);
+    }
+    this.emit("state-change");
   }
 
   private scheduleBreakerResume(): void {
@@ -593,19 +672,19 @@ export class ArcBroadcaster extends EventEmitter {
     );
 
     this.callbackServer.listen(port, () => {
-      log.info({ port }, "ARC callback receiver listening");
+      log.info({ upstream: this.upstreamName, port }, "ARC callback receiver listening");
     });
   }
 
   async closeCallbackReceiver(): Promise<void> {
     return new Promise((resolve) => {
-      if (!this.callbackServer) {
-        resolve();
-        return;
-      }
       if (this.breakerResumeTimer) {
         clearTimeout(this.breakerResumeTimer);
         this.breakerResumeTimer = null;
+      }
+      if (!this.callbackServer) {
+        resolve();
+        return;
       }
       this.callbackServer.close(() => resolve());
     });
@@ -658,5 +737,135 @@ export class ArcBroadcaster extends EventEmitter {
       res.writeHead(500);
       res.end();
     });
+  }
+}
+
+export class ArcBroadcaster extends EventEmitter implements Broadcaster {
+  private readonly broadcasters: SingleArcBroadcaster[];
+  private readonly primaryBroadcaster: SingleArcBroadcaster;
+
+  constructor(
+    endpoints: ArcEndpointConfig[],
+    config?: Partial<ArcBroadcasterConfig>,
+  ) {
+    super();
+
+    if (endpoints.length === 0) {
+      throw new Error("At least one ARC endpoint must be configured");
+    }
+
+    this.broadcasters = endpoints.map((endpoint) =>
+      new SingleArcBroadcaster(
+        endpoint.name,
+        endpoint.url,
+        endpoint.apiKey,
+        { ...config, emitStateMetrics: false },
+      ));
+    this.primaryBroadcaster = this.broadcasters[0]!;
+
+    this.primaryBroadcaster.on("status-update", (payload: ArcCallbackPayload) => {
+      this.emit("status-update", payload);
+    });
+    for (const broadcaster of this.broadcasters) {
+      broadcaster.on("state-change", () => {
+        this.updateStateMetrics();
+      });
+    }
+
+    this.updateStateMetrics();
+  }
+
+  async broadcast(
+    tx: Transaction,
+    icao?: string,
+    options?: BroadcastOptions,
+  ): Promise<BroadcastOutcome> {
+    const preferred = this.selectBroadcaster(icao);
+    return preferred.broadcast(tx, icao, options);
+  }
+
+  getState(): ArcBroadcasterState {
+    const states = this.broadcasters.map((broadcaster) => broadcaster.getState());
+    const circuitOpen = states.length > 0 && states.every((state) => state.circuitOpen);
+    const circuitOpenRemainingMs = circuitOpen
+      ? Math.min(...states.map((state) => state.circuitOpenRemainingMs))
+      : 0;
+
+    return {
+      inFlight: states.reduce((sum, state) => sum + state.inFlight, 0),
+      queueDepth: states.reduce((sum, state) => sum + state.queueDepth, 0),
+      circuitOpen,
+      circuitOpenRemainingMs,
+    };
+  }
+
+  getLimits(): Pick<ArcBroadcasterConfig, "maxConcurrentBroadcasts" | "maxQueueDepth"> {
+    return this.broadcasters.reduce(
+      (sum, broadcaster) => {
+        const limits = broadcaster.getLimits();
+        sum.maxConcurrentBroadcasts += limits.maxConcurrentBroadcasts;
+        sum.maxQueueDepth += limits.maxQueueDepth;
+        return sum;
+      },
+      { maxConcurrentBroadcasts: 0, maxQueueDepth: 0 },
+    );
+  }
+
+  isDegraded(): boolean {
+    return this.broadcasters.every((broadcaster) => broadcaster.isDegraded());
+  }
+
+  setupCallbackReceiver(port: number): void {
+    this.primaryBroadcaster.setupCallbackReceiver(port);
+  }
+
+  async closeCallbackReceiver(): Promise<void> {
+    await Promise.all(this.broadcasters.map((broadcaster) => broadcaster.closeCallbackReceiver()));
+  }
+
+  private selectBroadcaster(icao?: string): SingleArcBroadcaster {
+    const ordered = this.getOrderedBroadcasters(icao);
+    const available = ordered.find((broadcaster) => {
+      const state = broadcaster.getState();
+      const limits = broadcaster.getLimits();
+      return !state.circuitOpen && state.queueDepth < limits.maxQueueDepth;
+    });
+    return available ?? ordered[0] ?? this.primaryBroadcaster;
+  }
+
+  private getOrderedBroadcasters(icao?: string): SingleArcBroadcaster[] {
+    if (this.broadcasters.length <= 1) {
+      return this.broadcasters;
+    }
+
+    if (!icao) {
+      return [...this.broadcasters].sort((a, b) => this.getLoadScore(a) - this.getLoadScore(b));
+    }
+
+    const start = this.hashIcao(icao) % this.broadcasters.length;
+    return this.broadcasters.map(
+      (_unused, index) => this.broadcasters[(start + index) % this.broadcasters.length]!,
+    );
+  }
+
+  private getLoadScore(broadcaster: SingleArcBroadcaster): number {
+    const state = broadcaster.getState();
+    return state.queueDepth * 1000 + state.inFlight;
+  }
+
+  private hashIcao(icao: string): number {
+    const input = icao.trim().toUpperCase();
+    let hash = 0;
+    for (let i = 0; i < input.length; i++) {
+      hash = ((hash * 31) + input.charCodeAt(i)) >>> 0;
+    }
+    return hash;
+  }
+
+  private updateStateMetrics(): void {
+    const state = this.getState();
+    txBroadcastQueueDepth.set(state.queueDepth);
+    txBroadcastInFlight.set(state.inFlight);
+    txBroadcastBreakerOpen.set(state.circuitOpen ? 1 : 0);
   }
 }

@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 800" width="1200" height="800">
+    <defs>
+      <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0%" stop-color="#0a0a12"/>
+        <stop offset="100%" stop-color="#121826"/>
+      </linearGradient>
+      <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+        <stop offset="0%" stop-color="#00e6ff"/>
+        <stop offset="100%" stop-color="#003fff"/>
+      </linearGradient>
+    </defs>
+    <rect width="1200" height="800" fill="url(#bg)"/>
+    <rect x="40" y="40" width="1120" height="720" fill="none" stroke="url(#accent)" stroke-width="4" rx="16"/>
+    <rect x="60" y="60" width="1080" height="4" fill="url(#accent)"/>
+    <rect x="60" y="736" width="1080" height="4" fill="url(#accent)"/>
+
+    <text x="600" y="180" text-anchor="middle" fill="#9aa7b8" font-family="monospace" font-size="28" letter-spacing="8">CERTIFICATE OF PARTICIPATION</text>
+
+    <text x="600" y="290" text-anchor="middle" fill="#b8b8c0" font-family="sans-serif" font-size="28">This certifies that</text>
+
+    <text x="600" y="380" text-anchor="middle" fill="#ffffff" font-family="sans-serif" font-weight="700" font-size="64">Casey Atkins</text>
+
+    <text x="600" y="450" text-anchor="middle" fill="#b8b8c0" font-family="sans-serif" font-size="28">participated as Builder in</text>
+
+    <text x="600" y="540" text-anchor="middle" fill="#00e6ff" font-family="sans-serif" font-weight="600" font-size="44">Open Run Agentic Pay Hackathon</text>
+
+    <text x="600" y="610" text-anchor="middle" fill="#9aa7b8" font-family="sans-serif" font-size="22" font-style="italic">Project: Airchive</text>
+
+    <text x="120" y="690" fill="#9aa7b8" font-family="monospace" font-size="20">ISSUED BY</text>
+    <text x="120" y="720" fill="#ffffff" font-family="sans-serif" font-size="26">BSV Association</text>
+
+    <text x="1080" y="690" text-anchor="end" fill="#9aa7b8" font-family="monospace" font-size="20">DATE</text>
+    <text x="1080" y="720" text-anchor="end" fill="#ffffff" font-family="sans-serif" font-size="26">2026-04-17</text>
+  </svg>

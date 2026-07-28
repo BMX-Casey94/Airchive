@@ -101,8 +101,8 @@ importers:
         specifier: workspace:*
         version: link:../types
       '@bsv/sdk':
-        specifier: ^1.1.0
-        version: 1.10.4
+        specifier: ^2.0.13
+        version: 2.0.13
     devDependencies:
       rimraf:
         specifier: ^6.0.0
@@ -213,6 +213,9 @@ importers:
       '@airchive/logger':
         specifier: workspace:*
         version: link:../../packages/logger
+      '@airchive/telemetry-codec':
+        specifier: workspace:*
+        version: link:../../packages/telemetry-codec
       '@airchive/types':
         specifier: workspace:*
         version: link:../../packages/types
@@ -297,8 +300,8 @@ importers:
         specifier: workspace:*
         version: link:../../packages/types
       '@bsv/sdk':
-        specifier: ^1.1.0
-        version: 1.10.4
+        specifier: ^2.0.13
+        version: 2.0.13
       ioredis:
         specifier: ^5.4.0
         version: 5.10.1
@@ -321,6 +324,9 @@ importers:
       typescript:
         specifier: ^5.7.0
         version: 5.9.3
+      vitest:
+        specifier: ^3.0.0
+        version: 3.2.4(@types/node@22.19.17)(jiti@1.21.7)(terser@5.46.1)(tsx@4.21.0)
 
   services/gateway:
     dependencies:
@@ -330,6 +336,9 @@ importers:
       '@airchive/logger':
         specifier: workspace:*
         version: link:../../packages/logger
+      '@airchive/telemetry-codec':
+        specifier: workspace:*
+        version: link:../../packages/telemetry-codec
       '@airchive/types':
         specifier: workspace:*
         version: link:../../packages/types
@@ -478,9 +487,6 @@ packages:
 
   '@bsv/payment-express-middleware@2.0.1':
     resolution: {integrity: sha512-pFit3zEi6R2ixFWugXb6WgRoEFNXmmwRaV0oO3ala1gobtJIjc0WEJEASUQD6NYraEt7ql4xHDSkIWcisKO27g==}
-
-  '@bsv/sdk@1.10.4':
-    resolution: {integrity: sha512-NuEXWwtuZ3WbER9wLtm33QCfhVwLyTyAzGholOeHo1imNDLLe7d2HADmf8hlSqAkNud3Y03S2poRc6aJMRWDrA==}
 
   '@bsv/sdk@2.0.13':
     resolution: {integrity: sha512-VV25sV6oB1Piu7tTEMta+B29IRcq7Xpj1ohuk8RZRT656onop1YbA3oTnYf6stleWnbvsZeOciwH7Xppvs1QWw==}
@@ -3040,8 +3046,6 @@ snapshots:
       express: 5.2.1
     transitivePeerDependencies:
       - supports-color
-
-  '@bsv/sdk@1.10.4': {}
 
   '@bsv/sdk@2.0.13': {}
 

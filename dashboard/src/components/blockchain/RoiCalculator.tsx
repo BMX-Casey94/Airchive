@@ -5,18 +5,22 @@ import { useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 
 /**
- * Weighted-average tx/s during active flight, derived from Airchive's
- * actual write-rate table and a typical commercial phase mix:
- *   CRUISE  70% @ 3s  = 0.333 tx/s
- *   CLIMB   8%  @ 1s  = 1.000 tx/s
- *   DESCENT 7%  @ 2s  = 0.500 tx/s
- *   APPROACH 5% @ 2s  = 0.500 tx/s
- *   TAKEOFF 2%  @ 1s  = 1.000 tx/s
- *   LANDING 2%  @ 1s  = 1.000 tx/s
- *   TAXI    6%  @ 15s = 0.067 tx/s
- *   Weighted ≈ 0.39 tx/s
+ * Weighted-average tx/s during active flight, derived from DEFAULT_WRITE_RATES
+ * and a typical commercial phase mix. Every airborne phase sits at the 1s
+ * source floor, because ADS-B does not update faster than that:
+ *   CRUISE   70% @ 1s = 1.000 tx/s
+ *   CLIMB     8% @ 1s = 1.000 tx/s
+ *   DESCENT   7% @ 1s = 1.000 tx/s
+ *   APPROACH  5% @ 1s = 1.000 tx/s
+ *   TAKEOFF   2% @ 1s = 1.000 tx/s
+ *   LANDING   2% @ 1s = 1.000 tx/s
+ *   TAXI      6% @ 2s = 0.500 tx/s
+ *   Weighted ≈ 0.97 tx/s
+ *
+ * This is a ceiling: duplicate-suppression drops samples that carry no new
+ * information, so real spend runs below the figure shown here.
  */
-const ADAPTIVE_TX_PER_SECOND = 0.39;
+const ADAPTIVE_TX_PER_SECOND = 0.97;
 
 const BSV_PRICE_GBP = 11.9;
 
@@ -73,16 +77,15 @@ export function RoiCalculator({ className }: { className?: string }) {
   const constantGbp = constantBsv * BSV_PRICE_GBP;
   const adaptiveGbp = adaptiveBsv * BSV_PRICE_GBP;
 
-  const savingsGbp = constantGbp - adaptiveGbp;
-  const savingsPct =
-    constantGbp > 0 ? Math.min(100, Math.max(0, (savingsGbp / constantGbp) * 100)) : 0;
+  const perAircraftGbp = aircraft > 0 ? adaptiveGbp / aircraft : 0;
+  const perHourGbp = hoursPerDay > 0 ? perAircraftGbp / hoursPerDay : 0;
 
   const animConstantTx = useAnimatedNumber(constantTx);
   const animAdaptiveTx = useAnimatedNumber(adaptiveTx);
   const animConstantGbp = useAnimatedNumber(constantGbp);
   const animAdaptiveGbp = useAnimatedNumber(adaptiveGbp);
-  const animSavingsGbp = useAnimatedNumber(savingsGbp);
-  const animSavingsPct = useAnimatedNumber(savingsPct);
+  const animPerAircraftGbp = useAnimatedNumber(perAircraftGbp);
+  const animPerHourGbp = useAnimatedNumber(perHourGbp);
 
   const adaptiveSats = adaptiveTx * SATS_PER_TX;
   const animAdaptiveSats = useAnimatedNumber(adaptiveSats);
@@ -105,8 +108,8 @@ export function RoiCalculator({ className }: { className?: string }) {
           On-Chain Write Cost Calculator
         </h2>
         <p className="mx-auto mt-2 max-w-2xl text-center text-sm text-hud-muted">
-          Compare a naive 1 tx/s per in-flight aircraft against Airchive&apos;s adaptive
-          phase-based write rate. Adjust the sliders to model your fleet.
+          What it costs to archive every second of every flight, on chain, at
+          full fidelity. Adjust the sliders to model your fleet.
         </p>
 
         {/* Sliders */}
@@ -168,22 +171,26 @@ export function RoiCalculator({ className }: { className?: string }) {
         {/* Results cards */}
         <div className="mt-8 grid gap-4 md:grid-cols-3">
           <div className="rounded-lg border border-panel-border/50 bg-deep-navy/40 p-5">
-            <span className="hud-label text-alert-red/80">Naive 1 tx/s</span>
+            <span className="hud-label text-hud-muted">Sampling ceiling</span>
             <p className="mt-2 data-readout text-2xl text-white">
               {intFormatter.format(Math.round(animConstantTx))}
             </p>
-            <p className="text-xs text-hud-muted">transactions / day</p>
+            <p className="text-xs text-hud-muted">
+              transactions / day at 1 tx/s
+            </p>
             <p className="mt-2 text-sm font-semibold text-neon-amber">
               {gbpFormatter.format(animConstantGbp)}
             </p>
           </div>
 
           <div className="rounded-lg border border-electric-cyan/30 bg-electric-cyan/[0.04] p-5">
-            <span className="hud-label text-electric-cyan">Airchive adaptive</span>
+            <span className="hud-label text-electric-cyan">Airchive modelled</span>
             <p className="mt-2 data-readout text-2xl text-electric-cyan">
               {intFormatter.format(Math.round(animAdaptiveTx))}
             </p>
-            <p className="text-xs text-hud-muted">transactions / day</p>
+            <p className="text-xs text-hud-muted">
+              transactions / day across the phase mix
+            </p>
             <p className="mt-2 text-sm font-semibold text-neon-amber">
               {gbpFormatter.format(animAdaptiveGbp)}
             </p>
@@ -193,15 +200,15 @@ export function RoiCalculator({ className }: { className?: string }) {
           </div>
 
           <div className="rounded-lg border border-signal-green/30 bg-signal-green/[0.04] p-5">
-            <span className="hud-label text-signal-green">Savings</span>
+            <span className="hud-label text-signal-green">Per aircraft</span>
             <p className="mt-2 text-2xl font-bold text-signal-green">
-              {gbpFormatter.format(animSavingsGbp)}
+              {gbpFormatter.format(animPerAircraftGbp)}
             </p>
-            <p className="text-xs text-hud-muted">per day vs naive approach</p>
+            <p className="text-xs text-hud-muted">per aircraft, per day</p>
             <p className="mt-2 data-readout text-lg text-signal-green">
-              {animSavingsPct.toFixed(1)}%
+              {gbpFormatter.format(animPerHourGbp)}
             </p>
-            <p className="text-xs text-hud-muted">lower chain footprint</p>
+            <p className="text-xs text-hud-muted">per flight hour</p>
           </div>
         </div>
 
@@ -231,21 +238,27 @@ export function RoiCalculator({ className }: { className?: string }) {
               </tr>
               <tr className="border-b border-panel-border/20">
                 <td className="px-4 py-2">DESCENT / APPROACH</td>
-                <td className="px-4 py-2 data-readout">2s</td>
-                <td className="px-4 py-2 data-readout">0.50</td>
+                <td className="px-4 py-2 data-readout">1s</td>
+                <td className="px-4 py-2 data-readout">1.00</td>
                 <td className="px-4 py-2 text-hud-muted">~12%</td>
               </tr>
               <tr className="border-b border-panel-border/20 bg-electric-cyan/[0.02]">
                 <td className="px-4 py-2 font-medium text-electric-cyan">CRUISE</td>
-                <td className="px-4 py-2 data-readout">3s</td>
-                <td className="px-4 py-2 data-readout">0.33</td>
+                <td className="px-4 py-2 data-readout">1s</td>
+                <td className="px-4 py-2 data-readout">1.00</td>
                 <td className="px-4 py-2 text-hud-muted">~70%</td>
               </tr>
-              <tr>
+              <tr className="border-b border-panel-border/20">
                 <td className="px-4 py-2">TAXI</td>
-                <td className="px-4 py-2 data-readout">15s</td>
-                <td className="px-4 py-2 data-readout">0.07</td>
+                <td className="px-4 py-2 data-readout">2s</td>
+                <td className="px-4 py-2 data-readout">0.50</td>
                 <td className="px-4 py-2 text-hud-muted">~6%</td>
+              </tr>
+              <tr>
+                <td className="px-4 py-2">PARKED</td>
+                <td className="px-4 py-2 data-readout">60s</td>
+                <td className="px-4 py-2 data-readout">0.02</td>
+                <td className="px-4 py-2 text-hud-muted">not in flight</td>
               </tr>
             </tbody>
           </table>
@@ -254,7 +267,7 @@ export function RoiCalculator({ className }: { className?: string }) {
         <div className="mt-5 flex flex-wrap items-center gap-x-6 gap-y-1 text-[11px] text-hud-muted">
           <span>BSV price: <strong className="text-slate-300">£{BSV_PRICE_GBP.toFixed(2)}</strong></span>
           <span>Avg fee: <strong className="text-slate-300">{SATS_PER_TX} sats/tx</strong> (110 sat/KB × ~738 bytes)</span>
-          <span>Effective rate: <strong className="text-slate-300">~{ADAPTIVE_TX_PER_SECOND} tx/s</strong> (weighted avg)</span>
+          <span>Effective rate: <strong className="text-slate-300">~{ADAPTIVE_TX_PER_SECOND} tx/s</strong> (weighted avg, before duplicate suppression)</span>
           <span>Emergency: <strong className="text-alert-red/80">1s</strong> (squawk 7700/7600/7500)</span>
         </div>
       </div>

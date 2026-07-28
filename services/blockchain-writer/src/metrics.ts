@@ -5,6 +5,7 @@ import {
   Registry,
   collectDefaultMetrics,
 } from "prom-client";
+import { RecordType } from "@airchive/types";
 
 export const registry = new Registry();
 collectDefaultMetrics({ register: registry });
@@ -56,6 +57,20 @@ export const txBroadcastBreakerOpen = new Gauge({
   registers: [registry],
 });
 
+export const writerWriteIngressTotal = new Counter({
+  name: "airchive_writer_write_ingress_total",
+  help: "Total write attempts entering the blockchain writer",
+  labelNames: ["path", "record_type"] as const,
+  registers: [registry],
+});
+
+export const writerWriteOutcomesTotal = new Counter({
+  name: "airchive_writer_write_outcomes_total",
+  help: "Total write outcomes inside the blockchain writer",
+  labelNames: ["path", "record_type", "outcome"] as const,
+  registers: [registry],
+});
+
 export const utxoPoolBalance = new Gauge({
   name: "airchive_utxo_pool_balance_sats",
   help: "UTXO pool balance per aircraft in satoshis",
@@ -87,3 +102,114 @@ export const fundingPoolCount = new Gauge({
   help: "Number of UTXOs in the treasury/funding pool",
   registers: [registry],
 });
+
+export const refillOutcomesTotal = new Counter({
+  name: "airchive_refill_outcomes_total",
+  help: "Auto-refill attempt outcomes by distinct cause",
+  labelNames: ["outcome"] as const,
+  registers: [registry],
+});
+
+export const treasuryDry = new Gauge({
+  name: "airchive_treasury_dry",
+  help: "1 when the treasury could not supply a funding UTXO on the last attempt",
+  registers: [registry],
+});
+
+export const aircraftDryCount = new Gauge({
+  name: "airchive_aircraft_dry_count",
+  help: "Aircraft in the tracked fleet with no spendable UTXOs",
+  registers: [registry],
+});
+
+export const arcadeSubmissionsTotal = new Counter({
+  name: "airchive_arcade_submissions_total",
+  help: "Transactions submitted to Arcade by outcome",
+  labelNames: ["outcome"] as const,
+  registers: [registry],
+});
+
+export const arcadeFallbackTotal = new Counter({
+  name: "airchive_arcade_fallback_total",
+  help: "Transactions routed to the ARC fallback instead of Arcade",
+  labelNames: ["reason"] as const,
+  registers: [registry],
+});
+
+export const arcadeBatchSize = new Histogram({
+  name: "airchive_arcade_batch_size",
+  help: "Transactions coalesced into a single Arcade batch submission",
+  buckets: [1, 2, 5, 10, 25, 50, 100],
+  registers: [registry],
+});
+
+export const arcadeSseConnected = new Gauge({
+  name: "airchive_arcade_sse_connected",
+  help: "1 while the Arcade SSE status stream is connected",
+  registers: [registry],
+});
+
+export const arcadeStatusEventsTotal = new Counter({
+  name: "airchive_arcade_status_events_total",
+  help: "Transaction status events received from the Arcade SSE stream",
+  labelNames: ["status"] as const,
+  registers: [registry],
+});
+
+export const utxoLocksReclaimedTotal = new Counter({
+  name: "airchive_utxo_locks_reclaimed_total",
+  help: "UTXO locks reclaimed after exceeding the lock TTL",
+  labelNames: ["pool"] as const,
+  registers: [registry],
+});
+
+export const headerFetchTotal = new Counter({
+  name: "airchive_spv_header_fetch_total",
+  help: "Block header fetches by outcome",
+  labelNames: ["outcome"] as const,
+  registers: [registry],
+});
+
+export const headersStoredGauge = new Gauge({
+  name: "airchive_spv_headers_stored",
+  help: "Block headers held locally for merkle proof verification",
+  registers: [registry],
+});
+
+export const spvVerificationsTotal = new Counter({
+  name: "airchive_spv_verifications_total",
+  help: "Merkle proof verification attempts by outcome",
+  labelNames: ["outcome"] as const,
+  registers: [registry],
+});
+
+export const fundingStateGauge = new Gauge({
+  name: "airchive_funding_state",
+  help: "Funding state machine position (0 HEALTHY, 1 LOW, 2 DRY, 3 RECOVERING)",
+  labelNames: ["scope"] as const,
+  registers: [registry],
+});
+
+export const fundingRunwayHours = new Gauge({
+  name: "airchive_funding_runway_hours",
+  help: "Estimated hours of treasury runway at the observed burn rate",
+  registers: [registry],
+});
+
+export const fundingRecoveriesTotal = new Counter({
+  name: "airchive_funding_recoveries_total",
+  help: "Completed treasury recoveries after a dry period",
+  registers: [registry],
+});
+
+export function recordTypeMetricLabel(recordType: RecordType): string {
+  switch (recordType) {
+    case RecordType.FLIGHT_EVENT:
+      return "flight_event";
+    case RecordType.TELEMETRY_DELTA:
+      return "telemetry_delta";
+    case RecordType.TELEMETRY:
+    default:
+      return "telemetry";
+  }
+}

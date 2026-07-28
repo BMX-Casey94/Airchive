@@ -12,7 +12,20 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY --from=deps /app/dashboard/node_modules ./dashboard/node_modules
 COPY tsconfig.base.json ./
 COPY dashboard ./dashboard
+
+# NEXT_PUBLIC_* values are inlined into the browser bundle at build time, so
+# they must be supplied here rather than at runtime. Behind the nginx proxy
+# these should be same-origin (https://<host> and wss://<host>/ws).
+ARG NEXT_PUBLIC_GATEWAY_URL=http://localhost:4000
+ARG NEXT_PUBLIC_WS_URL=ws://localhost:4001
+ARG NEXT_PUBLIC_CESIUM_ION_TOKEN=""
+ENV NEXT_PUBLIC_GATEWAY_URL=$NEXT_PUBLIC_GATEWAY_URL
+ENV NEXT_PUBLIC_WS_URL=$NEXT_PUBLIC_WS_URL
+ENV NEXT_PUBLIC_CESIUM_ION_TOKEN=$NEXT_PUBLIC_CESIUM_ION_TOKEN
 ENV NEXT_TELEMETRY_DISABLED=1
+# next.config.ts only emits the standalone server when this is set, and the
+# runner stage copies exactly that output.
+ENV NEXT_OUTPUT=standalone
 RUN pnpm --filter @airchive/dashboard run build
 
 FROM base AS runner

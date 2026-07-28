@@ -9,7 +9,7 @@ import { AnalystAgent } from "./analyst-agent.js";
 import { MonitorAgent } from "./monitor-agent.js";
 import { AgentActivityPublisher } from "./activity-publisher.js";
 import { DirectPaymentSender } from "./direct-payment.js";
-import { registry } from "./metrics.js";
+import { agentBalanceSats, agentHealthy, registry } from "./metrics.js";
 
 const log = createLogger({ service: "agent-marketplace" });
 
@@ -94,6 +94,9 @@ async function main(): Promise<void> {
     port: config.redis.port,
     lazyConnect: true,
     retryStrategy: (times) => Math.min(times * 500, 5_000),
+  });
+  redis.on("error", (err) => {
+    log.warn({ err: err.message }, "Agent Marketplace Redis error");
   });
   await redis.connect();
   log.info("Redis connected");
@@ -205,22 +208,30 @@ async function main(): Promise<void> {
   const wrappedAnalystWallet = wrapWalletWithDirectPay(analystWallet, "analyst", "collector");
 
   const collector = new CollectorAgent(redis, db, config.trackedAircraft, activityPub);
-  const analyst = new AnalystAgent(collector, activityPub, config.analysisIntervalMs);
+  const analyst = new AnalystAgent(
+    collector,
+    activityPub,
+    config.analysisIntervalMs,
+    db,
+    directPay,
+  );
   const monitor = new MonitorAgent(
     collector,
     activityPub,
     config.trackedAircraft,
     config.monitorIntervalMs,
+    db,
+    directPay,
   );
 
   await collector.start(collectorWallet);
   await activityPub.publishStatus("collector", "running");
 
   await analyst.start(wrappedAnalystWallet);
-  await activityPub.publishStatus("analyst", "running");
+  await activityPub.publishStatus("analyst", analyst.getHealth().status);
 
   await monitor.start(wrappedMonitorWallet);
-  await activityPub.publishStatus("monitor", "running");
+  await activityPub.publishStatus("monitor", monitor.getHealth().status);
 
   const metricsServer = createHttpServer((_req, res) => {
     registry
@@ -238,12 +249,45 @@ async function main(): Promise<void> {
     log.info({ port: config.metricsPort }, "Agent metrics server listening");
   });
 
-  // Re-broadcast agent status every 30s so late-connecting dashboards see "running"
+  // The heartbeat reports what each agent is actually achieving. It previously
+  // asserted "running" unconditionally, so a wallet with no funds and no
+  // inscription ever landing still looked completely healthy.
   const STATUS_HEARTBEAT_MS = 30_000;
+
+  async function readBalance(wallet: { getBalance?: () => Promise<{ spendableSatoshis?: number }> }): Promise<number | undefined> {
+    try {
+      const balance = await wallet.getBalance?.();
+      return balance?.spendableSatoshis;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async function publishHealth(): Promise<void> {
+    const collectorBalance = await readBalance(collectorWallet);
+    if (collectorBalance !== undefined) {
+      agentBalanceSats.set({ agent: "collector" }, collectorBalance);
+    }
+    await activityPub.publishStatus("collector", "running", collectorBalance);
+    agentHealthy.set({ agent: "collector" }, 1);
+
+    for (const [name, agent, wallet] of [
+      ["analyst", analyst, analystWallet],
+      ["monitor", monitor, monitorWallet],
+    ] as const) {
+      const health = agent.getHealth();
+      const balance = await readBalance(wallet);
+      if (balance !== undefined) agentBalanceSats.set({ agent: name }, balance);
+      agentHealthy.set({ agent: name }, health.status === "running" ? 1 : 0);
+      await activityPub.publishStatus(name, health.status, balance);
+      if (health.status !== "running") {
+        log.warn({ agent: name, detail: health.detail }, "Agent is not fully healthy");
+      }
+    }
+  }
+
   const statusHeartbeat = setInterval(() => {
-    void activityPub.publishStatus("collector", "running");
-    void activityPub.publishStatus("analyst", "running");
-    void activityPub.publishStatus("monitor", "running");
+    void publishHealth();
   }, STATUS_HEARTBEAT_MS);
 
   log.info(

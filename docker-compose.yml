@@ -1,23 +1,56 @@
-version: "3.9"
+# Airchive service topology.
+#
+# CRITICAL — host vs in-network ports. Every application service loads the host
+# `.env` via `env_file`, and that file carries the *host-side* values
+# (POSTGRES_PORT=15432, because Windows reserves 5432). Inside this network the
+# containers must reach the container-side ports instead, so each service that
+# talks to Postgres or Redis pins POSTGRES_PORT/REDIS_PORT in its
+# `environment:` block — `environment` wins over `env_file`. If you add a new
+# service that touches either datastore, it needs the same two overrides or it
+# will silently try to dial 15432 inside the network and hang on startup.
+#
+# The published host ports below are for local development and operator access.
+# In production, drop everything except nginx's 80/443 (or firewall them) so
+# Postgres, Redis, the gateway, and Arcade are not reachable off-box.
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
 
 services:
   postgres:
     image: postgres:16-alpine
     container_name: airchive-postgres
     restart: unless-stopped
+    # Six services each hold a connection pool. The image default of 100 leaves
+    # no headroom once every pool reaches its ceiling at once, and the failure
+    # mode is opaque: unrelated queries start returning "remaining connection
+    # slots are reserved for roles with the SUPERUSER attribute". Keep this
+    # comfortably above (service count x POSTGRES_POOL_MAX).
+    command:
+      - postgres
+      - -c
+      - max_connections=${POSTGRES_MAX_CONNECTIONS:-200}
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-airchive}
       POSTGRES_USER: ${POSTGRES_USER:-airchive}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-airchive_dev}
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      # Host-side publish port only. Deliberately NOT ${POSTGRES_PORT} — that
+      # variable is the port applications dial, and in-network that is 5432.
+      - "${POSTGRES_HOST_PORT:-15432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    networks:
+      - airchive
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-airchive}"]
       interval: 5s
       timeout: 3s
       retries: 5
+    logging: *default-logging
 
   redis:
     image: redis:7-alpine
@@ -25,14 +58,88 @@ services:
     restart: unless-stopped
     command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      - "${REDIS_HOST_PORT:-6379}:6379"
     volumes:
       - redisdata:/data
+    networks:
+      - airchive
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
+    logging: *default-logging
+
+  # Self-hosted Arcade — the Teranode-native BSV broadcaster
+  # (github.com/bsv-blockchain/arcade). Serves the Arc-compatible API the
+  # blockchain-writer's ArcadeBroadcaster speaks: POST /tx, POST /txs,
+  # GET /tx/{txid}, GET /events?callbackToken=... (SSE) and GET /health.
+  #
+  # OPERATOR MUST CONFIRM, in order of risk:
+  #  1. The image tag below is a real published multi-arch-ish artefact: the
+  #     tag list, manifest and image config of ghcr.io/bsv-blockchain/arcade
+  #     were read straight from the GHCR registry API, and v0.5.2 is the
+  #     newest semver tag (ENTRYPOINT ["arcade"], alpine base). It publishes
+  #     linux/amd64 only, so on ARM hosts pin a newer tag or build from source.
+  #  2. Port 3011 is what this repo's client expects and what upstream's README
+  #     documents, but v0.5.2's own config.example.yaml defaults `api.port` to
+  #     8080 with a separate `health.port` of 8081. ARCADE_API_PORT below moves
+  #     the API (and its /health route, which v0.5.2 registers on the API
+  #     server) onto 3011. Verify with `GET /health` after first boot.
+  #  3. Arcade normally starts from a config.yaml. Everything here is set
+  #     through ARCADE_*-prefixed viper overrides so no config file is needed;
+  #     if the pinned build refuses to boot without one, mount a config.yaml
+  #     and add `command: ["--config", "/etc/arcade/config.yaml"]`.
+  #  4. GET /policy is documented for Arc clients but is not among the routes
+  #     v0.5.2 registers. Do not rely on it.
+  #
+  # Note the deliberate absence of `env_file: .env`: every ARCADE_*-prefixed
+  # variable is a viper config key for this container, so feeding it the host
+  # .env would both leak wallet seeds and API keys into a third-party image and
+  # silently reinterpret variables such as ARCADE_CALLBACK_TOKEN (which belongs
+  # to the blockchain-writer) as Arcade's Merkle Service bearer token.
+  arcade:
+    image: ghcr.io/bsv-blockchain/arcade:v0.5.2
+    container_name: airchive-arcade
+    restart: unless-stopped
+    environment:
+      ARCADE_MODE: all
+      ARCADE_LOG_LEVEL: ${ARCADE_LOG_LEVEL:-info}
+      ARCADE_NETWORK: ${ARCADE_NETWORK:-mainnet}
+      ARCADE_API_HOST: 0.0.0.0
+      ARCADE_API_PORT: "3011"
+      ARCADE_HEALTH_PORT: "8081"
+      ARCADE_STORAGE_PATH: /data
+      # Zero-dependency profile: embedded Pebble KV store and the in-process
+      # broker, so no Aerospike or Kafka is required.
+      ARCADE_STORE_BACKEND: pebble
+      ARCADE_STORE_PEBBLE_PATH: /data/pebble
+      ARCADE_KAFKA_BACKEND: memory
+      ARCADE_KAFKA_CONSUMER_GROUP: arcade
+      ARCADE_CHAINTRACKS_SERVER_ENABLED: "true"
+      ARCADE_P2P_DATAHUB_DISCOVERY: "true"
+      # Required: at least one Teranode broadcast endpoint, comma-separated.
+      ARCADE_TERANODE_BROADCAST_URLS: ${ARCADE_TERANODE_BROADCAST_URLS:-https://arc.taal.com}
+      ARCADE_TERANODE_AUTH_TOKEN: ${ARCADE_TERANODE_AUTH_TOKEN:-}
+      # Leave the Merkle Service URL empty to keep the integration off. If you
+      # set it, Arcade also requires a callback token or it refuses to start.
+      ARCADE_MERKLE_SERVICE_URL: ${ARCADE_MERKLE_SERVICE_URL:-}
+    ports:
+      # Loopback-only by default: this is an unauthenticated broadcast API.
+      - "${ARCADE_BIND_ADDR:-127.0.0.1}:${ARCADE_HOST_PORT:-3011}:3011"
+    volumes:
+      - arcadedata:/data
+    networks:
+      - airchive
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3011/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      # Chaintracks header bootstrap and libp2p peer discovery take a while on
+      # a cold volume.
+      start_period: 120s
+    logging: *default-logging
 
   ingestion:
     build:
@@ -46,6 +153,16 @@ services:
     env_file: .env
     environment:
       REDIS_HOST: redis
+      REDIS_PORT: 6379
+    networks:
+      - airchive
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9090/metrics || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging: *default-logging
 
   blockchain-writer:
     build:
@@ -58,10 +175,29 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      arcade:
+        # Deliberately service_started, not service_healthy: the broadcaster
+        # health-checks Arcade itself and falls back to the ARC upstream, so a
+        # cold-syncing Arcade must not hold up telemetry writes.
+        condition: service_started
     env_file: .env
     environment:
       REDIS_HOST: redis
+      REDIS_PORT: 6379
       POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      ARCADE_URL: http://arcade:3011
+      # Pinned so the healthcheck below and the service agree on the port.
+      METRICS_PORT: 9091
+    networks:
+      - airchive
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9091/metrics || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 45s
+    logging: *default-logging
 
   overlay-node:
     build:
@@ -75,8 +211,18 @@ services:
     env_file: .env
     environment:
       POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
     ports:
       - "${OVERLAY_PORT:-4010}:4010"
+    networks:
+      - airchive
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:4010/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging: *default-logging
 
   gateway:
     build:
@@ -92,10 +238,27 @@ services:
     env_file: .env
     environment:
       REDIS_HOST: redis
+      REDIS_PORT: 6379
       POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      # The gateway fetches raw transactions from Arcade to decode OP_RETURN
+      # envelopes for the explorer. Without this it would inherit the public
+      # endpoint from .env and route in-cluster reads out over the internet.
+      ARCADE_URL: http://arcade:3011
     ports:
       - "${GATEWAY_PORT:-4000}:4000"
+      # WebSocket listener; nginx proxies /ws to this port.
       - "${GATEWAY_WS_PORT:-4001}:4001"
+    networks:
+      - airchive
+    healthcheck:
+      # Returns 503 unless both Postgres and Redis are reachable.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:4000/api/system/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging: *default-logging
 
   alert-engine:
     build:
@@ -111,34 +274,117 @@ services:
     env_file: .env
     environment:
       REDIS_HOST: redis
+      REDIS_PORT: 6379
       POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+    networks:
+      - airchive
+    healthcheck:
+      # This service exposes no HTTP surface, so the check is process liveness.
+      # The character class stops the pattern from matching the health probe's
+      # own command line, which would make the check pass unconditionally.
+      test: ["CMD-SHELL", "pgrep -f 'alert-engine/dist/inde[x].js' > /dev/null || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging: *default-logging
+
+  agent-marketplace:
+    build:
+      context: .
+      dockerfile: services/agent-marketplace/Dockerfile
+    container_name: airchive-agent-marketplace
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+    networks:
+      - airchive
+    healthcheck:
+      # The Prometheus server answers on every path, so any request proves the
+      # process is up and the event loop is not wedged.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:${AGENT_METRICS_PORT:-9093}/ || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      # Three agent wallets are created against a remote storage service on
+      # boot, each with a 30s timeout before it falls back to a stub wallet.
+      start_period: 150s
+    logging: *default-logging
 
   dashboard:
     build:
       context: .
       dockerfile: dashboard/Dockerfile
+      # NEXT_PUBLIC_* values are inlined into the browser bundle at build time,
+      # so they are passed as build args rather than environment. Behind this
+      # proxy they must be same-origin, which is what the defaults below assume
+      # once PUBLIC_ORIGIN is set to the deployed domain.
+      args:
+        NEXT_PUBLIC_GATEWAY_URL: ${PUBLIC_ORIGIN:-http://localhost:4000}
+        # The gateway's socket is mounted at /ws, so the fallback carries the
+        # path too — omitting it produces a bundle that silently never connects.
+        NEXT_PUBLIC_WS_URL: ${PUBLIC_WS_ORIGIN:-ws://localhost:4001/ws}
+        NEXT_PUBLIC_CESIUM_ION_TOKEN: ${NEXT_PUBLIC_CESIUM_ION_TOKEN:-}
     container_name: airchive-dashboard
     restart: unless-stopped
     depends_on:
-      - gateway
+      gateway:
+        condition: service_healthy
     env_file: .env
     ports:
       - "3000:3000"
+    networks:
+      - airchive
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging: *default-logging
 
   nginx:
-    image: nginx:alpine
+    image: nginx:1.27-alpine
     container_name: airchive-nginx
     restart: unless-stopped
     depends_on:
-      - gateway
-      - dashboard
+      gateway:
+        condition: service_healthy
+      dashboard:
+        condition: service_healthy
     ports:
       - "80:80"
       - "443:443"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./nginx/ssl:/etc/nginx/ssl:ro
+      # Expected filenames are documented at the top of nginx/nginx.conf.
+      - ./nginx/certs:/etc/nginx/certs:ro
+      - ./nginx/acme:/var/www/certbot:ro
+    networks:
+      - airchive
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging: *default-logging
+
+networks:
+  airchive:
+    driver: bridge
 
 volumes:
   pgdata:
   redisdata:
+  arcadedata:

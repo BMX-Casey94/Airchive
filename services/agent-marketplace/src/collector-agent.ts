@@ -102,6 +102,9 @@ export class CollectorAgent {
     }
 
     this.subscriber = this.redis.duplicate({ lazyConnect: true });
+    this.subscriber.on("error", (err) => {
+      log.warn({ err: err.message }, "Collector Redis subscriber error");
+    });
     await this.subscriber.connect();
 
     const channels = this.trackedAircraft.map((icao) => `telemetry:${icao}`);

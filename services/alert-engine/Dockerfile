@@ -30,5 +30,8 @@ COPY --from=build /app/packages/logger/package.json packages/logger/
 COPY --from=build /app/services/alert-engine/dist services/alert-engine/dist
 COPY --from=build /app/services/alert-engine/package.json services/alert-engine/
 COPY --from=deps /app/node_modules ./node_modules
+COPY deploy/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 USER node
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["node", "services/alert-engine/dist/index.js"]

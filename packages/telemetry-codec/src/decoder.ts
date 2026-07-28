@@ -24,7 +24,9 @@ function isRecordTypeByte(b: number): b is RecordType {
   return (
     b === RecordType.TELEMETRY ||
     b === RecordType.FLIGHT_EVENT ||
-    b === RecordType.TELEMETRY_DELTA
+    b === RecordType.TELEMETRY_DELTA ||
+    b === RecordType.AGENT_ANALYSIS ||
+    b === RecordType.AGENT_MONITOR
   );
 }
 
@@ -97,6 +99,73 @@ export function parseOpReturnPayload(data: Uint8Array): {
   };
 }
 
+/**
+ * Reassembles the flat envelope from an on-chain OP_RETURN locking script.
+ *
+ * On chain each field is a separate script push, whereas `parseOpReturnPayload`
+ * reads the contiguous form stored alongside each transaction. This bridges the
+ * two so a transaction fetched from the network decodes through the same path
+ * as one read from the database.
+ *
+ * Returns null for any script that is not an AIRCHIVE OP_RETURN, since callers
+ * routinely scan every output of a transaction.
+ */
+export function flattenOpReturnScript(script: Uint8Array): Uint8Array | null {
+  let i = 0;
+  // OP_FALSE OP_RETURN is the canonical prefix; a bare OP_RETURN is tolerated
+  // because it remains valid and some tooling omits the leading zero.
+  if (script[i] === 0x00) i += 1;
+  if (script[i] !== 0x6a) return null;
+  i += 1;
+
+  const pushes: Uint8Array[] = [];
+  while (i < script.length) {
+    const opcode = script[i]!;
+    i += 1;
+
+    let length: number;
+    if (opcode > 0 && opcode <= 75) {
+      length = opcode;
+    } else if (opcode === 0x4c) {
+      if (i + 1 > script.length) return null;
+      length = script[i]!;
+      i += 1;
+    } else if (opcode === 0x4d) {
+      if (i + 2 > script.length) return null;
+      length = script[i]! | (script[i + 1]! << 8);
+      i += 2;
+    } else if (opcode === 0x4e) {
+      if (i + 4 > script.length) return null;
+      length =
+        script[i]!
+        | (script[i + 1]! << 8)
+        | (script[i + 2]! << 16)
+        | (script[i + 3]! << 24);
+      i += 4;
+    } else {
+      // A non-push opcode inside the data region means this is not our envelope.
+      return null;
+    }
+
+    if (i + length > script.length) return null;
+    pushes.push(script.subarray(i, i + length));
+    i += length;
+  }
+
+  // Protocol id, version, ICAO, timestamp, record type, payload.
+  if (pushes.length !== 6) return null;
+  if (!bytesEqual(pushes[0]!, PROTOCOL_ID_BYTES)) return null;
+
+  const total = pushes.reduce((sum, push) => sum + push.length, 0);
+  const flat = new Uint8Array(total);
+  let offset = 0;
+  for (const push of pushes) {
+    flat.set(push, offset);
+    offset += push.length;
+  }
+  return flat;
+}
+
 export function decodeTelemetryPayload(payload: Uint8Array): TelemetryRecord {
   return decode(payload) as TelemetryRecord;
 }
@@ -105,4 +174,8 @@ export function decodeFlightEventPayload(
   payload: Uint8Array,
 ): FlightEventRecord {
   return decode(payload) as FlightEventRecord;
+}
+
+export function decodeAgentPayload(payload: Uint8Array): Record<string, unknown> {
+  return decode(payload) as Record<string, unknown>;
 }

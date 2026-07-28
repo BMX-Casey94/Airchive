@@ -7,6 +7,7 @@ import { registerAuth } from "./plugins/auth.js";
 import { fleetRoutes, updateAircraftState } from "./routes/fleet.js";
 import { historyRoutes } from "./routes/history.js";
 import { flightRoutes } from "./routes/flights.js";
+import { explorerRoutes } from "./routes/explorer.js";
 import { alertRoutes } from "./routes/alerts.js";
 import { metricsRoutes } from "./routes/metrics.js";
 import { auditRoutes } from "./routes/audit.js";
@@ -32,13 +33,24 @@ async function main(): Promise<void> {
   await db.raw("SELECT 1");
   log.info("Database connected");
 
-  const redis = new Redis({ host: config.redis.host, port: config.redis.port, lazyConnect: true });
+  const redis = new Redis({
+    host: config.redis.host,
+    port: config.redis.port,
+    lazyConnect: true,
+    retryStrategy: (times) => Math.min(times * 500, 5_000),
+  });
+  redis.on("error", (err) => {
+    log.warn({ err: err.message }, "Gateway Redis error");
+  });
   await redis.connect();
   log.info("Redis connected");
 
   (app as any).redis = redis;
 
   const subscriber = redis.duplicate();
+  subscriber.on("error", (err) => {
+    log.warn({ err: err.message }, "Gateway Redis subscriber error");
+  });
   await subscriber.connect();
   await subscriber.subscribe("broadcast");
   subscriber.on("message", (_channel: string, message: string) => {
@@ -51,6 +63,7 @@ async function main(): Promise<void> {
   await app.register(fleetRoutes);
   await app.register(historyRoutes);
   await app.register(flightRoutes);
+  await app.register(explorerRoutes);
   await app.register(alertRoutes);
   await app.register(metricsRoutes);
   await app.register(auditRoutes);

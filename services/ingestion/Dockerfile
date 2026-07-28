@@ -38,5 +38,8 @@ COPY --from=build /app/packages/flight-phase/package.json packages/flight-phase/
 COPY --from=build /app/services/ingestion/dist services/ingestion/dist
 COPY --from=build /app/services/ingestion/package.json services/ingestion/
 COPY --from=deps /app/node_modules ./node_modules
+COPY deploy/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 USER node
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["node", "services/ingestion/dist/index.js"]

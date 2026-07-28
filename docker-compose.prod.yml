@@ -1,0 +1,185 @@
+# Production overlay for the VPS. Apply on top of the base topology:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# What this changes, and why:
+#
+#  1. SECRETS. The base file feeds every service the plaintext `.env`. Here the
+#     sensitive values are supplied as Docker secrets mounted at /run/secrets
+#     and resolved by deploy/docker-entrypoint.sh through the *_FILE convention,
+#     so the wallet seed, funding WIF, database password and API keys never
+#     appear in `docker inspect`, in the shell history, or in a world-readable
+#     file. Keep the remaining non-sensitive settings in `.env`.
+#
+#  2. EXPOSURE. Only nginx publishes ports. Postgres, Redis, Arcade, the
+#     gateway, the overlay node and the dashboard become reachable only from
+#     inside the compose network, which is the whole point of running behind a
+#     real domain rather than an ephemeral tunnel.
+#
+#  3. DURABILITY. Verified nightly Postgres dumps with retention, plus certbot
+#     renewal for the TLS material nginx reads from ./nginx/certs.
+#
+# Create the secret files first, readable only by root:
+#
+#   sudo install -d -m 0700 /etc/airchive/secrets
+#   printf '%s' 'value' | sudo tee /etc/airchive/secrets/wallet_master_seed >/dev/null
+#   sudo chmod 0400 /etc/airchive/secrets/*
+#
+# and remove those same keys from `.env` so there is exactly one source.
+
+secrets:
+  postgres_password:
+    file: /etc/airchive/secrets/postgres_password
+  wallet_master_seed:
+    file: /etc/airchive/secrets/wallet_master_seed
+  funding_wallet_wif:
+    file: /etc/airchive/secrets/funding_wallet_wif
+  taal_arc_api_key:
+    file: /etc/airchive/secrets/taal_arc_api_key
+  jwt_secret:
+    file: /etc/airchive/secrets/jwt_secret
+
+services:
+  postgres:
+    ports: !override []
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-airchive}
+      POSTGRES_USER: ${POSTGRES_USER:-airchive}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+
+  redis:
+    ports: !override []
+
+  arcade:
+    ports: !override []
+
+  overlay-node:
+    ports: !override []
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+
+  gateway:
+    ports: !override []
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      JWT_SECRET_FILE: /run/secrets/jwt_secret
+    secrets:
+      - postgres_password
+      - jwt_secret
+
+  ingestion:
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+
+  blockchain-writer:
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      WALLET_MASTER_SEED_FILE: /run/secrets/wallet_master_seed
+      FUNDING_WALLET_WIF_FILE: /run/secrets/funding_wallet_wif
+      TAAL_ARC_API_KEY_FILE: /run/secrets/taal_arc_api_key
+    secrets:
+      - postgres_password
+      - wallet_master_seed
+      - funding_wallet_wif
+      - taal_arc_api_key
+
+  alert-engine:
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+
+  agent-marketplace:
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      WALLET_MASTER_SEED_FILE: /run/secrets/wallet_master_seed
+    secrets:
+      - postgres_password
+      - wallet_master_seed
+
+  dashboard:
+    ports: !override []
+
+  nginx:
+    volumes: !override
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      # Certbot's deploy hook dereferences its symlinked live/ directory into
+      # here, so nginx reads plain files at the paths nginx.conf expects.
+      - ./nginx/certs:/etc/nginx/certs:ro
+      - ./nginx/acme:/var/www/certbot:ro
+
+  # Verified nightly dumps. Uses the Postgres image so pg_dump and pg_restore
+  # match the server version exactly — a mismatch is the usual reason a restore
+  # fails at the worst possible moment.
+  postgres-backup:
+    image: postgres:16-alpine
+    container_name: airchive-postgres-backup
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-airchive}
+      POSTGRES_USER: ${POSTGRES_USER:-airchive}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+    secrets:
+      - postgres_password
+    volumes:
+      - ./deploy/backup/pg-backup.sh:/usr/local/bin/pg-backup.sh:ro
+      - ./deploy/backup/pg-restore.sh:/usr/local/bin/pg-restore.sh:ro
+      - ${BACKUP_PATH:-./backups}:/backups
+    entrypoint: ["/bin/sh", "/usr/local/bin/pg-backup.sh"]
+    networks:
+      - airchive
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # Renewal only. Issue the first certificate before the first `up`, using the
+  # one-shot command in deploy/README.md, otherwise nginx has no certificate to
+  # read and will not start.
+  certbot:
+    image: certbot/certbot:latest
+    container_name: airchive-certbot
+    restart: unless-stopped
+    volumes:
+      - ./nginx/letsencrypt:/etc/letsencrypt
+      - ./nginx/acme:/var/www/certbot
+      # Writable: the deploy hook copies the renewed material here.
+      - ./nginx/certs:/certs
+    # Twice daily is what Let's Encrypt recommends; renewal is a no-op until
+    # the certificate is inside its 30-day window. The deploy hook runs only
+    # when a certificate was actually replaced. $RENEWED_LINEAGE is set by
+    # certbot to the live/ directory, and `cp -L` dereferences its symlinks so
+    # nginx never has to follow a link out of its own mount.
+    #
+    # nginx reads certificates once at startup, so a renewal needs
+    # `docker compose exec nginx nginx -s reload` — see deploy/README.md for
+    # the systemd timer that does this.
+    entrypoint: >
+      /bin/sh -c "trap exit TERM;
+      while :; do
+      certbot renew --webroot -w /var/www/certbot --quiet
+      --deploy-hook 'cp -L $$RENEWED_LINEAGE/fullchain.pem /certs/fullchain.pem
+      && cp -L $$RENEWED_LINEAGE/privkey.pem /certs/privkey.pem
+      && cp -L $$RENEWED_LINEAGE/chain.pem /certs/chain.pem';
+      sleep 12h & wait $${!}; done"
+    networks:
+      - airchive
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

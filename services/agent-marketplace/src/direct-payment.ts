@@ -162,14 +162,23 @@ export class DirectPaymentSender {
     fromLabel: string,
     text: string,
   ): Promise<{ txid: string; feeSats: number }> {
+    return this.inscribeScript(fromLabel, buildTextOpReturn(new TextEncoder().encode(text)));
+  }
+
+  /**
+   * Inscribes a prebuilt OP_RETURN script, which is how agent records carry the
+   * AIRCHIVE header rather than a bare JSON blob no parser recognises.
+   */
+  async inscribeScript(
+    fromLabel: string,
+    scriptBytes: number[],
+  ): Promise<{ txid: string; feeSats: number; sizeBytes: number }> {
     const senderKey = this.keys.get(fromLabel);
     if (!senderKey) throw new Error(`Unknown sender: ${fromLabel}`);
 
     const senderAddress = senderKey.toAddress();
     const utxos = await this.fetchUtxos(senderAddress);
 
-    const dataBytes = new TextEncoder().encode(text);
-    const scriptBytes = buildTextOpReturn(dataBytes);
     const opReturnScript = Script.fromBinary(scriptBytes);
 
     const opReturnOutputSize = 8 + varintLen(scriptBytes.length) + scriptBytes.length;
@@ -216,11 +225,11 @@ export class DirectPaymentSender {
     }
 
     log.info(
-      { from: fromLabel, txid: result.txid, fee, dataLen: dataBytes.length },
+      { from: fromLabel, txid: result.txid, fee, scriptLen: scriptBytes.length },
       "Direct OP_RETURN inscription sent",
     );
 
-    return { txid: result.txid, feeSats: fee };
+    return { txid: result.txid, feeSats: fee, sizeBytes: tx.toBinary().length };
   }
 
   private async fetchUtxos(address: string): Promise<WocUtxo[]> {

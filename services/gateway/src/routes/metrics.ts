@@ -1,7 +1,13 @@
 import type { FastifyInstance } from "fastify";
-import { getDb } from "@airchive/db";
+import { getDb, getFundingState, TREASURY_SCOPE } from "@airchive/db";
 
 type CountRow = { total: string | number } | undefined;
+
+/**
+ * The writer only re-evaluates funding on its own cadence, so a stale row means
+ * the writer is not running rather than that funding is fine.
+ */
+const FUNDING_STALE_AFTER_MS = 120_000;
 
 export async function metricsRoutes(app: FastifyInstance): Promise<void> {
   const startTime = Date.now();
@@ -72,6 +78,60 @@ export async function metricsRoutes(app: FastifyInstance): Promise<void> {
         pending_today: pendingTodayNum,
         failed_today: failedNum,
         tx_per_second: txPerSecond,
+      },
+    });
+  });
+
+  app.get("/api/system/funding", async (_request, reply) => {
+    const db = getDb();
+    const row = await getFundingState(db, TREASURY_SCOPE).catch(() => undefined);
+
+    if (!row) {
+      return reply.send({
+        success: true,
+        data: {
+          state: "UNKNOWN",
+          reason: "The blockchain writer has not reported funding health yet",
+          balance_sats: 0,
+          utxo_count: 0,
+          runway_hours: null,
+          pending_writes: 0,
+          stale: true,
+        },
+      });
+    }
+
+    const [pendingCount, dryAircraft] = await Promise.all([
+      (db("pending_writes").count("* as total").first() as Promise<CountRow>)
+        .catch(() => ({ total: 0 })),
+      (db("utxo_pool")
+        .where({ is_locked: false })
+        .countDistinct("aircraft_icao as total")
+        .first() as Promise<CountRow>).catch(() => ({ total: 0 })),
+    ]);
+
+    const lastChecked = row.last_checked_at ? new Date(row.last_checked_at) : null;
+    const stale =
+      lastChecked === null || Date.now() - lastChecked.getTime() > FUNDING_STALE_AFTER_MS;
+    const balance = Number(row.balance_sats ?? 0);
+    const burn = Number(row.burn_sats_per_hour ?? 0);
+
+    return reply.send({
+      success: true,
+      data: {
+        state: row.state,
+        balance_sats: balance,
+        utxo_count: row.utxo_count,
+        burn_sats_per_hour: burn,
+        runway_hours: burn > 0 ? balance / burn : null,
+        state_since: row.state_since,
+        last_checked_at: row.last_checked_at,
+        next_poll_at: row.next_poll_at,
+        consecutive_dry_polls: row.consecutive_dry_polls,
+        pending_writes: Number(pendingCount?.total ?? 0),
+        funded_aircraft: Number(dryAircraft?.total ?? 0),
+        details: row.details,
+        stale,
       },
     });
   });

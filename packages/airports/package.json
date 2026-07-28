@@ -10,16 +10,16 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/",
     "test": "vitest run",
-    "fetch-data": "tsx src/fetch-airports.ts"
+    "fetch:airports": "tsx src/fetch-airports.ts"
   },
   "dependencies": {
     "@airchive/types": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "typescript": "^5.7.0",
     "rimraf": "^6.0.0",
-    "vitest": "^3.0.0",
-    "tsx": "^4.19.0"
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
   }
 }
