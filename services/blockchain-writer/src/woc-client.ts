@@ -31,7 +31,7 @@ export class WocRateLimitedError extends Error {
   readonly retryAfterMs: number;
 
   constructor(retryAfterMs: number) {
-    super(`WhatsOnChain rate limited; retry in ${Math.round(retryAfterMs / 1_000)}s`);
+    super(`Chain lookup rate limited; retry in ${Math.round(retryAfterMs / 1_000)}s`);
     this.name = "WocRateLimitedError";
     this.retryAfterMs = retryAfterMs;
   }
@@ -47,6 +47,13 @@ export class WocUnavailableError extends Error {
 export interface WocClientOptions {
   baseUrl: string;
   apiKey?: string;
+  /**
+   * Header that carries the API key. WhatsOnChain uses `Authorization`;
+   * Bitails uses `apikey`. Defaults to Authorization.
+   */
+  apiKeyHeader?: string;
+  /** Low-cardinality name for logs and metrics (e.g. whatsonchain, bananablocks). */
+  name?: string;
   maxRequestsPerSecond?: number;
   maxConcurrent?: number;
 }
@@ -75,7 +82,9 @@ interface WocBulkStatusRow {
   txid?: string;
   hash?: string;
   blockhash?: string;
+  blockHash?: string;
   blockheight?: number;
+  blockHeight?: number;
   confirmations?: number;
   error?: string;
 }
@@ -85,7 +94,9 @@ export const WOC_BULK_LIMIT = 20;
 
 export class WocClient {
   readonly baseUrl: string;
+  readonly name: string;
   private readonly apiKey?: string;
+  private readonly apiKeyHeader: string;
   private readonly maxRps: number;
   private readonly maxConcurrent: number;
 
@@ -99,20 +110,23 @@ export class WocClient {
 
   constructor(options: WocClientOptions) {
     this.baseUrl = options.baseUrl.replace(/\/+$/, "");
+    this.name = options.name?.trim() || "whatsonchain";
     this.apiKey = options.apiKey?.trim() || undefined;
+    this.apiKeyHeader = options.apiKeyHeader?.trim() || "Authorization";
     this.maxRps = Math.max(1, options.maxRequestsPerSecond ?? DEFAULT_MAX_RPS);
     this.maxConcurrent = Math.max(1, options.maxConcurrent ?? DEFAULT_MAX_CONCURRENT);
 
     log.info(
       {
+        provider: this.name,
         endpoint: this.baseUrl,
         maxRequestsPerSecond: this.maxRps,
         maxConcurrent: this.maxConcurrent,
         authenticated: Boolean(this.apiKey),
       },
       this.apiKey
-        ? "WhatsOnChain client ready (authenticated)"
-        : "WhatsOnChain client ready — no WOC_API_KEY set, running on the free tier budget",
+        ? `Chain provider ready (authenticated): ${this.name}`
+        : `Chain provider ready on free-tier budget: ${this.name}`,
     );
   }
 
@@ -159,7 +173,8 @@ export class WocClient {
       for (const row of rows) {
         const txid = (row.txid ?? row.hash ?? "").toLowerCase();
         if (!txid || row.error) continue;
-        const blockHeight = Number(row.blockheight ?? 0);
+        // WhatsOnChain uses `blockheight`; BananaBlocks uses `blockHeight`.
+        const blockHeight = Number(row.blockheight ?? row.blockHeight ?? 0);
         if (!(blockHeight > 0)) continue;
         statuses.set(txid, {
           txid,
@@ -181,7 +196,7 @@ export class WocClient {
 
     try {
       const headers: Record<string, string> = { Accept: "application/json" };
-      if (this.apiKey) headers.Authorization = this.apiKey;
+      if (this.apiKey) headers[this.apiKeyHeader] = this.apiKey;
       if (body !== undefined) headers["Content-Type"] = "application/json";
 
       const res = await fetch(`${this.baseUrl}${path}`, {
@@ -193,25 +208,41 @@ export class WocClient {
 
       if (res.status === 429) {
         const cooldown = this.noteRateLimited(res.headers.get("retry-after"));
-        wocRequestsTotal.inc({ label: options.label, outcome: "rate_limited" });
+        wocRequestsTotal.inc({
+          label: options.label,
+          outcome: "rate_limited",
+          provider: this.name,
+        });
         throw new WocRateLimitedError(cooldown);
       }
 
       if (res.status === 404 && options.allowNotFound) {
         this.noteSuccess();
-        wocRequestsTotal.inc({ label: options.label, outcome: "not_found" });
+        wocRequestsTotal.inc({
+          label: options.label,
+          outcome: "not_found",
+          provider: this.name,
+        });
         return null;
       }
 
       if (!res.ok) {
-        wocRequestsTotal.inc({ label: options.label, outcome: "error" });
+        wocRequestsTotal.inc({
+          label: options.label,
+          outcome: "error",
+          provider: this.name,
+        });
         throw new WocUnavailableError(
-          `WhatsOnChain ${res.status} for ${options.label}`,
+          `${this.name} returned ${res.status} for ${options.label}`,
         );
       }
 
       this.noteSuccess();
-      wocRequestsTotal.inc({ label: options.label, outcome: "ok" });
+      wocRequestsTotal.inc({
+        label: options.label,
+        outcome: "ok",
+        provider: this.name,
+      });
       return (await res.json()) as T;
     } finally {
       this.inFlight--;
@@ -240,8 +271,12 @@ export class WocClient {
     this.cooldownUntil = Date.now() + cooldown;
 
     log.warn(
-      { cooldownMs: cooldown, consecutive: this.consecutiveRateLimits },
-      "WhatsOnChain rate limited — pausing all WoC traffic",
+      {
+        provider: this.name,
+        cooldownMs: cooldown,
+        consecutive: this.consecutiveRateLimits,
+      },
+      "Chain provider rate limited — pausing traffic to this upstream",
     );
     return cooldown;
   }

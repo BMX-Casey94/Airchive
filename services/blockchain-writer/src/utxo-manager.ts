@@ -18,7 +18,7 @@ import {
   utxoPoolBalance,
   utxoPoolCount,
 } from "./metrics.js";
-import type { WocClient } from "./woc-client.js";
+import type { ChainLookup } from "./chain-lookup.js";
 
 const log = createLogger({ service: "blockchain-writer:utxo" });
 
@@ -76,7 +76,7 @@ export class UtxoManager {
 
   constructor(
     private readonly db: Knex,
-    private readonly woc: WocClient,
+    private readonly woc: ChainLookup,
   ) {}
 
   async bootstrap(icao: string, address: string): Promise<boolean> {

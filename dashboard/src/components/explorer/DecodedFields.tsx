@@ -16,12 +16,27 @@ interface FieldSpec {
   /** Sort order within the rendered list; lower comes first. */
   group: number;
   describe?: (value: unknown) => string | null;
+  /** Wide narrative / nested objects span the full grid rather than a cell. */
+  wide?: boolean;
 }
 
 const SQUAWK_MEANING: Record<string, string> = {
   "7500": "Unlawful interference (hijack)",
   "7600": "Radio failure",
   "7700": "General emergency",
+};
+
+const EVENT_LABELS: Record<string, string> = {
+  TAKEOFF: "Take-off",
+  LANDING: "Landing",
+  TAXI_START: "Taxi start",
+  TAXI_END: "Taxi end",
+  PARKED: "Parked",
+  EMERGENCY: "Emergency",
+  APPROACH: "Approach",
+  CLIMB: "Climb",
+  CRUISE: "Cruise",
+  DESCENT: "Descent",
 };
 
 const FIELD_SPECS: Record<string, FieldSpec> = {
@@ -85,12 +100,38 @@ const FIELD_SPECS: Record<string, FieldSpec> = {
   alert: { label: "Alert flag", group: 7 },
   spi: { label: "Ident (SPI) active", group: 7 },
   flight_id: { label: "Flight session", group: 7 },
-  event: { label: "Flight event", group: 7 },
+  event: {
+    label: "Flight event",
+    group: 0,
+    describe: (value) => EVENT_LABELS[String(value)] ?? null,
+  },
   phase: { label: "Flight phase", group: 7 },
+  type: { label: "Record kind", group: 0 },
+
+  // Flight-event envelope fields. The narrative `summary` and nested
+  // `flight_stats` are what used to blow out of the grid: they are wide by
+  // design and rendered as their own full-width rows.
+  summary: { label: "Summary", group: 8, wide: true },
+  airport_icao: { label: "Airport ICAO", group: 8 },
+  airport_name: { label: "Airport name", group: 8 },
+  destination_icao: { label: "Destination ICAO", group: 8 },
+  destination_name: { label: "Destination name", group: 8 },
+  est_flight_time_min: { label: "Estimated flight time", unit: "min", group: 8 },
+  flight_stats: { label: "Flight statistics", group: 8, wide: true },
 };
 
 /** Field names whose numeric value is epoch milliseconds, not a measurement. */
 const EPOCH_FIELDS = new Set(["ts", "timestamp", "time"]);
+
+/** Nested object keys we know how to label when expanding `flight_stats`. */
+const NESTED_LABELS: Record<string, { label: string; unit?: string }> = {
+  duration_min: { label: "Duration", unit: "min" },
+  distance_miles: { label: "Distance", unit: "miles" },
+  max_alt_ft: { label: "Maximum altitude", unit: "ft" },
+  avg_gs_kts: { label: "Average ground speed", unit: "kts" },
+  total_tx_count: { label: "Telemetry writes", unit: undefined },
+  total_bsv_sats: { label: "Fees spent", unit: "sats" },
+};
 
 function humaniseKey(key: string): string {
   return key
@@ -98,7 +139,7 @@ function humaniseKey(key: string): string {
     .replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
-function formatValue(key: string, value: unknown, spec?: FieldSpec): string {
+function formatScalar(key: string, value: unknown, unit?: string): string {
   if (value === null || value === undefined || value === "") return "—";
 
   if (typeof value === "boolean") return value ? "Yes" : "No";
@@ -110,16 +151,29 @@ function formatValue(key: string, value: unknown, spec?: FieldSpec): string {
     const formatted = Number.isInteger(value)
       ? value.toLocaleString("en-GB")
       : value.toLocaleString("en-GB", { maximumFractionDigits: 6 });
-    return spec?.unit ? `${formatted} ${spec.unit}` : formatted;
+    return unit ? `${formatted} ${unit}` : formatted;
   }
 
   if (Array.isArray(value)) {
     return value.length === 0 ? "None" : value.map(String).join(", ");
   }
 
-  if (typeof value === "object") return JSON.stringify(value);
+  return unit ? `${String(value)} ${unit}` : String(value);
+}
 
-  return spec?.unit ? `${String(value)} ${spec.unit}` : String(value);
+interface ObjectEntry {
+  label: string;
+  value: string;
+}
+
+function expandObject(value: Record<string, unknown>): ObjectEntry[] {
+  return Object.entries(value).map(([key, nested]) => {
+    const known = NESTED_LABELS[key];
+    return {
+      label: known?.label ?? humaniseKey(key),
+      value: formatScalar(key, nested, known?.unit),
+    };
+  });
 }
 
 interface ReadableRow {
@@ -128,20 +182,30 @@ interface ReadableRow {
   value: string;
   note: string | null;
   group: number;
+  wide: boolean;
+  /** Expanded nested object shown as labelled lines instead of a JSON blob. */
+  entries: ObjectEntry[] | null;
 }
 
 export function readableFields(fields: Record<string, unknown>): ReadableRow[] {
   return Object.entries(fields)
     .map(([key, value]) => {
       const spec = FIELD_SPECS[key];
+      const isObject =
+        value !== null
+        && typeof value === "object"
+        && !Array.isArray(value);
+
       return {
         key,
         label: spec?.label ?? humaniseKey(key),
-        value: formatValue(key, value, spec),
+        value: isObject ? "" : formatScalar(key, value, spec?.unit),
         note: spec?.describe?.(value) ?? null,
-        // Unmapped fields sort last rather than being hidden — the archive
-        // should never quietly drop something it wrote on-chain.
         group: spec?.group ?? 99,
+        wide: Boolean(spec?.wide) || isObject || (
+          typeof value === "string" && value.length > 80
+        ),
+        entries: isObject ? expandObject(value as Record<string, unknown>) : null,
       };
     })
     .sort((a, b) => a.group - b.group || a.label.localeCompare(b.label));
@@ -170,8 +234,11 @@ export default function DecodedFields({
     );
   }
 
+  const compactRows = rows.filter((row) => !row.wide);
+  const wideRows = rows.filter((row) => row.wide);
+
   return (
-    <div className="space-y-2">
+    <div className="min-w-0 space-y-2 overflow-hidden">
       <div className="flex items-center justify-between gap-3">
         <p className="hud-label text-[9px]">Decoded fields ({rows.length})</p>
         <div
@@ -201,40 +268,80 @@ export default function DecodedFields({
       {view === "json" ? (
         <pre
           className={clsx(
-            "overflow-auto rounded-lg border border-panel-border bg-space-black p-3 font-mono text-electric-cyan/80",
+            "max-w-full overflow-x-auto rounded-lg border border-panel-border bg-space-black p-3 font-mono text-electric-cyan/80 whitespace-pre-wrap break-all",
             size === "full" ? "max-h-96 text-xs p-4" : "max-h-60 text-[10px]",
           )}
         >
           {JSON.stringify(fields, null, 2)}
         </pre>
       ) : (
-        <dl
-          className={clsx(
-            "grid gap-x-6 gap-y-1.5 rounded-lg border border-panel-border/60 bg-space-black/50 p-3",
-            size === "full"
-              ? "grid-cols-1 md:grid-cols-2 xl:grid-cols-3"
-              : "grid-cols-1 sm:grid-cols-2 lg:grid-cols-3",
-          )}
-        >
-          {rows.map((row) => (
+        <div className="min-w-0 space-y-3 overflow-hidden rounded-lg border border-panel-border/60 bg-space-black/50 p-3">
+          <dl
+            className={clsx(
+              "grid min-w-0 gap-x-6 gap-y-1.5",
+              size === "full"
+                ? "grid-cols-1 md:grid-cols-2 xl:grid-cols-3"
+                : "grid-cols-1 sm:grid-cols-2 lg:grid-cols-3",
+            )}
+          >
+            {compactRows.map((row) => (
+              <div
+                key={row.key}
+                className="flex min-w-0 items-baseline justify-between gap-3 border-b border-panel-border/25 py-1 last:border-0"
+              >
+                <dt
+                  className="min-w-0 shrink truncate text-[11px] text-hud-muted"
+                  title={row.key}
+                >
+                  {row.label}
+                </dt>
+                <dd className="min-w-0 max-w-[65%] text-right">
+                  <span className="block break-words font-mono text-[11px] tabular-nums text-white/90">
+                    {row.value}
+                  </span>
+                  {row.note && (
+                    <span className="block text-[9px] text-neon-amber">{row.note}</span>
+                  )}
+                </dd>
+              </div>
+            ))}
+          </dl>
+
+          {wideRows.map((row) => (
             <div
               key={row.key}
-              className="flex items-baseline justify-between gap-3 border-b border-panel-border/25 py-1 last:border-0"
+              className="min-w-0 border-t border-panel-border/40 pt-2 first:border-0 first:pt-0"
             >
-              <dt className="min-w-0 truncate text-[11px] text-hud-muted" title={row.key}>
+              <p className="hud-label text-[9px]" title={row.key}>
                 {row.label}
-              </dt>
-              <dd className="shrink-0 text-right">
-                <span className="font-mono text-[11px] tabular-nums text-white/90">
+              </p>
+              {row.entries ? (
+                <dl className="mt-1.5 grid min-w-0 grid-cols-1 gap-x-6 gap-y-1 sm:grid-cols-2 lg:grid-cols-3">
+                  {row.entries.map((entry) => (
+                    <div
+                      key={entry.label}
+                      className="flex min-w-0 items-baseline justify-between gap-3"
+                    >
+                      <dt className="min-w-0 truncate text-[11px] text-hud-muted">
+                        {entry.label}
+                      </dt>
+                      <dd className="min-w-0 max-w-[65%] break-words text-right font-mono text-[11px] tabular-nums text-white/90">
+                        {entry.value}
+                      </dd>
+                    </div>
+                  ))}
+                </dl>
+              ) : (
+                <p className="mt-1 break-words text-[12px] leading-relaxed text-white/85">
                   {row.value}
-                </span>
-                {row.note && (
-                  <span className="block text-[9px] text-neon-amber">{row.note}</span>
-                )}
-              </dd>
+                </p>
+              )}
+              {row.note && (
+                <p className="mt-1 text-[9px] text-neon-amber">{row.note}</p>
+              )}
             </div>
           ))}
-        </dl>
+        </div>
       )}
     </div>
   );

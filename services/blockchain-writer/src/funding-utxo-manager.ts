@@ -16,7 +16,7 @@ import {
   derivePubKeyHash,
   estimateRefillFee,
 } from "./tx-builder.js";
-import type { WocClient } from "./woc-client.js";
+import type { ChainLookup } from "./chain-lookup.js";
 import {
   BroadcastPriority,
   type Broadcaster,
@@ -76,7 +76,7 @@ export class FundingUtxoManager {
 
   constructor(
     private readonly db: Knex,
-    private readonly woc: WocClient,
+    private readonly woc: ChainLookup,
   ) {}
 
   /**

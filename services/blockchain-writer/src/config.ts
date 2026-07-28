@@ -32,6 +32,15 @@ export interface Config {
   wocApiUrl: string;
   wocApiKey?: string;
   wocMaxRequestsPerSecond: number;
+  /** GorillaPool BananaBlocks — WoC-compatible confirmations/proofs/headers. */
+  bananaBlocksUrl: string;
+  bananaBlocksEnabled: boolean;
+  bananaBlocksMaxRequestsPerSecond: number;
+  /** Bitails — preferred for address/UTXO reconciliation under WoC pressure. */
+  bitailsUrl: string;
+  bitailsEnabled: boolean;
+  bitailsApiKey?: string;
+  bitailsMaxRequestsPerSecond: number;
   walletMasterSeed: string;
   fundingWalletWif: string;
   trackedAircraft: string[];
@@ -170,6 +179,22 @@ export function loadConfig(): Config {
     // The free tier allows roughly 3 requests/second per IP. Raise this only
     // alongside a paid WOC_API_KEY, or the writer earns itself a 429 cooldown.
     wocMaxRequestsPerSecond: Number(optionalEnv("WOC_MAX_RPS", "3")),
+    bananaBlocksUrl: optionalEnv(
+      "BANANABLOCKS_API_URL",
+      "https://bananablocks.com/api/v1/bsv/main",
+    ),
+    // Enabled by default: same dialect as WhatsOnChain for status/proofs/headers,
+    // so a WoC 429 fails over instead of freezing confirmations.
+    bananaBlocksEnabled: optionalEnv("BANANABLOCKS_ENABLED", "true") !== "false",
+    bananaBlocksMaxRequestsPerSecond: Number(
+      optionalEnv("BANANABLOCKS_MAX_RPS", "5"),
+    ),
+    bitailsUrl: optionalEnv("BITAILS_API_URL", "https://api.bitails.io"),
+    // Preferred for address/UTXO lookups. Free tier is ~10 RPS / 1_000/day —
+    // disable if you prefer to keep all UTXO traffic on WhatsOnChain.
+    bitailsEnabled: optionalEnv("BITAILS_ENABLED", "true") !== "false",
+    bitailsApiKey: process.env.BITAILS_API_KEY?.trim() || undefined,
+    bitailsMaxRequestsPerSecond: Number(optionalEnv("BITAILS_MAX_RPS", "8")),
     walletMasterSeed,
     fundingWalletWif: requireEnv("FUNDING_WALLET_WIF"),
     trackedAircraft: requireEnv("TRACKED_AIRCRAFT")

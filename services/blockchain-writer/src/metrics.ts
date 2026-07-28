@@ -199,8 +199,8 @@ export const spvVerificationsTotal = new Counter({
 
 export const wocRequestsTotal = new Counter({
   name: "airchive_woc_requests_total",
-  help: "WhatsOnChain requests by call site and outcome",
-  labelNames: ["label", "outcome"] as const,
+  help: "Chain-data requests by provider, call site and outcome",
+  labelNames: ["label", "outcome", "provider"] as const,
   registers: [registry],
 });
 

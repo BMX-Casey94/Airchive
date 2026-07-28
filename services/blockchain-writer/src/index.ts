@@ -45,7 +45,7 @@ import { WriteBuffer } from "./write-buffer.js";
 import { ConfirmationPoller } from "./confirmation-poller.js";
 import { FundingStateMachine } from "./funding-state.js";
 import { HeaderStore } from "./header-store.js";
-import { WocClient } from "./woc-client.js";
+import { buildChainLookup } from "./chain-lookup.js";
 import { recordUnverifiedProof, recordVerifiedProof, verifyBump } from "./spv.js";
 import { buildFlightEventTx, buildTelemetryTx, computeTxid } from "./tx-builder.js";
 import {
@@ -374,13 +374,26 @@ async function main(): Promise<void> {
 
   const broadcaster: Broadcaster = arcadeBroadcaster ?? arcBroadcaster;
 
-  // Every chain lookup in this process shares one budget. WhatsOnChain rate
-  // limits per IP, so uncoordinated callers starve each other and, worse,
-  // starve the reconciliation that recovers from the resulting failures.
-  const woc = new WocClient({
-    baseUrl: config.wocApiUrl,
-    apiKey: config.wocApiKey,
-    maxRequestsPerSecond: config.wocMaxRequestsPerSecond,
+  // Independent providers share the work so a WhatsOnChain 429 no longer
+  // freezes confirmations and wallet reconciliation at the same time.
+  // BananaBlocks covers status/proofs/headers; Bitails prefers UTXO lookups.
+  const woc = buildChainLookup({
+    woc: {
+      baseUrl: config.wocApiUrl,
+      apiKey: config.wocApiKey,
+      maxRequestsPerSecond: config.wocMaxRequestsPerSecond,
+    },
+    bananaBlocks: {
+      enabled: config.bananaBlocksEnabled,
+      baseUrl: config.bananaBlocksUrl,
+      maxRequestsPerSecond: config.bananaBlocksMaxRequestsPerSecond,
+    },
+    bitails: {
+      enabled: config.bitailsEnabled,
+      baseUrl: config.bitailsUrl,
+      apiKey: config.bitailsApiKey,
+      maxRequestsPerSecond: config.bitailsMaxRequestsPerSecond,
+    },
   });
 
   const utxoManager = new UtxoManager(db, woc);

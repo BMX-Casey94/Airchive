@@ -2,7 +2,7 @@ import type { Knex } from "knex";
 import { Hash } from "@bsv/sdk";
 import { createLogger } from "@airchive/logger";
 import { headerFetchTotal, headersStoredGauge, spvVerificationsTotal } from "./metrics.js";
-import type { WocClient } from "./woc-client.js";
+import type { ChainLookup } from "./chain-lookup.js";
 
 const log = createLogger({ service: "blockchain-writer:headers" });
 
@@ -45,7 +45,7 @@ export class HeaderStore {
 
   constructor(
     private readonly db: Knex,
-    private readonly woc: WocClient,
+    private readonly woc: ChainLookup,
   ) {}
 
   async isValidRootForHeight(root: string, height: number): Promise<boolean> {

@@ -5,7 +5,8 @@ import { createLogger } from "@airchive/logger";
 import { spvVerificationsTotal } from "./metrics.js";
 import type { HeaderStore } from "./header-store.js";
 import { recordUnverifiedProof, recordVerifiedProof, verifyBump } from "./spv.js";
-import { isWocUnavailable, type WocClient } from "./woc-client.js";
+import type { ChainLookup } from "./chain-lookup.js";
+import { isWocUnavailable } from "./woc-client.js";
 
 const log = createLogger({ service: "blockchain-writer:confirmation-poller" });
 
@@ -66,7 +67,7 @@ export class ConfirmationPoller {
 
   constructor(
     private readonly db: Knex,
-    private readonly woc: WocClient,
+    private readonly woc: ChainLookup,
     private readonly headers: HeaderStore,
     private readonly arcadeUrl?: string,
     private readonly arcadeApiKey?: string,

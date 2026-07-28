@@ -10,7 +10,8 @@ import {
 import type { FundingUtxoManager } from "./funding-utxo-manager.js";
 import { buildRefillTx, derivePubKeyHash, estimateRefillFee } from "./tx-builder.js";
 import { agentRefillOutcomesTotal, agentWalletBalance } from "./metrics.js";
-import { isWocUnavailable, type WocClient } from "./woc-client.js";
+import type { ChainLookup } from "./chain-lookup.js";
+import { isWocUnavailable } from "./woc-client.js";
 
 const log = createLogger({ service: "blockchain-writer:agent-refill" });
 
@@ -94,7 +95,7 @@ export class AgentWalletRefiller {
     private readonly broadcaster: Broadcaster,
     private readonly fundingUtxoManager: FundingUtxoManager,
     private readonly targets: AgentWalletTarget[],
-    private readonly woc: WocClient,
+    private readonly woc: ChainLookup,
   ) {}
 
   start(): void {
