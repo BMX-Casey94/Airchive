@@ -57,12 +57,46 @@ function formatRunway(hours: number | null): string {
   return `${Math.round(hours * 60)}m`;
 }
 
-export default function FundingStatus() {
+interface FundingStatusProps {
+  /**
+   * "banner" renders nothing at all unless the treasury is dry or the writer
+   * has stopped reporting. The full panel sits at the foot of the dashboard,
+   * and a dry treasury halts every write — too important to leave below the
+   * fold, too noisy to show permanently when nothing is wrong.
+   */
+  variant?: "panel" | "banner";
+}
+
+export default function FundingStatus({ variant = "panel" }: FundingStatusProps) {
   const { data, error, isLoading } = useSWR<FundingResponse>(
     `${apiBaseUrl}/api/system/funding`,
     fetcher,
     { refreshInterval: 15_000, dedupingInterval: 10_000 },
   );
+
+  if (variant === "banner") {
+    const funding = data?.data;
+    // The panel below already reports load failures; repeating them here would
+    // put the same message on screen twice.
+    if (isLoading || error || !funding) return null;
+
+    const urgent = funding.state === "DRY" || funding.stale;
+    if (!urgent) return null;
+
+    return (
+      <div className="panel-alert flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-2">
+        <span className="hud-label text-alert-red animate-pulse">
+          {funding.state === "DRY" ? "Treasury dry" : "Writer not reporting"}
+        </span>
+        <span className="text-[11px] text-alert-red/80">
+          {funding.state === "DRY"
+            ? `${funding.pending_writes.toLocaleString("en-GB")} writes held — `
+              + "send funds and the system resumes on its own."
+            : "Funding health is stale; the blockchain writer may be down."}
+        </span>
+      </div>
+    );
+  }
 
   if (isLoading) {
     return (

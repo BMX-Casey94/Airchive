@@ -174,11 +174,10 @@ export default function DashboardPage() {
       <DashboardLogo />
 
       <div className="grid grid-cols-1 gap-3 lg:gap-4 lg:grid-cols-12 auto-rows-min">
-        {/* ── Treasury health: a dry wallet stops every write ─── */}
-        <section className="lg:col-span-12">
-          <Suspense fallback={<PanelSkeleton className="h-24" />}>
-            <FundingStatus />
-          </Suspense>
+        {/* Renders only when the treasury is dry or the writer has gone
+            quiet; the full panel lives at the foot of the page. */}
+        <section className="lg:col-span-12 empty:hidden">
+          <FundingStatus variant="banner" />
         </section>
 
         {/* ── Row 1: 3D Globe (full width, hero) ──────────── */}
@@ -227,6 +226,13 @@ export default function DashboardPage() {
         <section className="lg:col-span-4">
           <Suspense fallback={<PanelSkeleton className="h-72" />}>
             <AlertsPanel />
+          </Suspense>
+        </section>
+
+        {/* ── Row 6: Treasury health ───────────────────────── */}
+        <section className="lg:col-span-12">
+          <Suspense fallback={<PanelSkeleton className="h-24" />}>
+            <FundingStatus />
           </Suspense>
         </section>
       </div>
