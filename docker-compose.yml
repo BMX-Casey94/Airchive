@@ -150,10 +150,17 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
     env_file: .env
     environment:
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      # Ingestion persists flight sessions and aircraft config, so it needs the
+      # same in-cluster Postgres override as the other services. Without it the
+      # container inherits the developer machine's host and port from .env.
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
     networks:
       - airchive
     healthcheck:
