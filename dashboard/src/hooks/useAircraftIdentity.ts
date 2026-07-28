@@ -3,6 +3,7 @@
 import useSWR from "swr";
 import { apiBaseUrl, fetcher } from "@/lib/api";
 import { TRACKED_AIRCRAFT_MAP } from "@/lib/tracked-aircraft";
+import { resolveAircraftDescription } from "@/lib/aircraft-types";
 
 /** Beyond this the transponder is treated as quiet rather than live. */
 const LIVE_WINDOW_MS = 120_000;
@@ -81,15 +82,21 @@ export function useAircraftIdentity(
   const live = Number.isFinite(lastSeen) && lastSeen > 0
     && Date.now() - lastSeen < LIVE_WINDOW_MS;
 
+  const typeCode =
+    clean(row?.aircraft_type)
+    ?? clean(staticInfo?.type)
+    ?? clean(fallback?.typeCode);
+
   return {
     icao: upper,
     registration:
       clean(row?.reg) ?? clean(staticInfo?.reg) ?? clean(fallback?.registration),
-    typeCode:
-      clean(row?.aircraft_type)
-      ?? clean(staticInfo?.type)
-      ?? clean(fallback?.typeCode),
-    description: clean(staticInfo?.desc) ?? clean(fallback?.description),
+    typeCode,
+    description: resolveAircraftDescription(
+      clean(staticInfo?.desc),
+      clean(fallback?.description),
+      typeCode,
+    ),
     operator: clean(staticInfo?.operator),
     callsign: clean(row?.callsign) ?? clean(fallback?.callsign),
     phase: clean(row?.flight_phase),
