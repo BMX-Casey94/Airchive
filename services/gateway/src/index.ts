@@ -21,6 +21,12 @@ async function main(): Promise<void> {
 
   const app = Fastify({ logger: false });
 
+  if (config.corsOrigin === "*") {
+    log.warn(
+      "CORS_ORIGIN is '*': any site can read this API from a visitor's browser. "
+        + "Set it to a comma-separated list of the dashboard origins.",
+    );
+  }
   await app.register(import("@fastify/cors"), { origin: config.corsOrigin });
   await app.register(import("@fastify/rate-limit"), {
     max: 100,
