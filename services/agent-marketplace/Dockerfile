@@ -7,6 +7,7 @@ COPY pnpm-lock.yaml pnpm-workspace.yaml package.json ./
 COPY packages/types/package.json packages/types/
 COPY packages/db/package.json packages/db/
 COPY packages/logger/package.json packages/logger/
+COPY packages/telemetry-codec/package.json packages/telemetry-codec/
 COPY services/agent-marketplace/package.json services/agent-marketplace/
 RUN pnpm install --frozen-lockfile --prod=false
 
@@ -17,18 +18,16 @@ COPY pnpm-lock.yaml pnpm-workspace.yaml package.json tsconfig.base.json ./
 COPY packages/types packages/types
 COPY packages/db packages/db
 COPY packages/logger packages/logger
+COPY packages/telemetry-codec packages/telemetry-codec
 COPY services/agent-marketplace services/agent-marketplace
-# This repo ships no .dockerignore, so the source copies above can drag in the
-# host's node_modules, compiled dist output and tsc caches. Clear them, so the
-# Linux dependency trees from `deps` are authoritative and `tsc -b` cannot skip
-# work on the strength of a stale tsbuildinfo.
-RUN rm -rf node_modules packages/*/node_modules services/agent-marketplace/node_modules \
-      packages/*/dist packages/*/*.tsbuildinfo \
-      services/agent-marketplace/dist services/agent-marketplace/*.tsbuildinfo
+# pnpm links each package's binaries into that package's own node_modules/.bin,
+# so the root tree alone leaves `tsc` unresolvable inside every workspace
+# package.
 COPY --from=deps /app/node_modules ./node_modules
 COPY --from=deps /app/packages/types/node_modules packages/types/node_modules
 COPY --from=deps /app/packages/db/node_modules packages/db/node_modules
 COPY --from=deps /app/packages/logger/node_modules packages/logger/node_modules
+COPY --from=deps /app/packages/telemetry-codec/node_modules packages/telemetry-codec/node_modules
 COPY --from=deps /app/services/agent-marketplace/node_modules services/agent-marketplace/node_modules
 RUN pnpm -r --filter @airchive/agent-marketplace... run build
 
@@ -40,6 +39,8 @@ COPY --from=build /app/packages/db/dist packages/db/dist
 COPY --from=build /app/packages/db/package.json packages/db/
 COPY --from=build /app/packages/logger/dist packages/logger/dist
 COPY --from=build /app/packages/logger/package.json packages/logger/
+COPY --from=build /app/packages/telemetry-codec/dist packages/telemetry-codec/dist
+COPY --from=build /app/packages/telemetry-codec/package.json packages/telemetry-codec/
 COPY --from=build /app/services/agent-marketplace/dist services/agent-marketplace/dist
 COPY --from=build /app/services/agent-marketplace/package.json services/agent-marketplace/
 COPY --from=deps /app/node_modules ./node_modules
@@ -49,6 +50,7 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY --from=deps /app/packages/types/node_modules packages/types/node_modules
 COPY --from=deps /app/packages/db/node_modules packages/db/node_modules
 COPY --from=deps /app/packages/logger/node_modules packages/logger/node_modules
+COPY --from=deps /app/packages/telemetry-codec/node_modules packages/telemetry-codec/node_modules
 COPY --from=deps /app/services/agent-marketplace/node_modules services/agent-marketplace/node_modules
 COPY deploy/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh

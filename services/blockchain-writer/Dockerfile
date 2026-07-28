@@ -13,14 +13,25 @@ COPY services/blockchain-writer/package.json services/blockchain-writer/
 RUN pnpm install --frozen-lockfile --prod=false
 
 FROM base AS build
-COPY --from=deps /app/node_modules ./node_modules
-COPY tsconfig.base.json ./
+# The workspace manifests are needed here too, otherwise `pnpm -r --filter`
+# below has no workspace root to resolve the filter against.
+COPY pnpm-lock.yaml pnpm-workspace.yaml package.json tsconfig.base.json ./
 COPY packages/types packages/types
 COPY packages/crypto packages/crypto
 COPY packages/telemetry-codec packages/telemetry-codec
 COPY packages/db packages/db
 COPY packages/logger packages/logger
 COPY services/blockchain-writer services/blockchain-writer
+# pnpm links each package's binaries into that package's own node_modules/.bin,
+# so the root tree alone leaves `tsc` unresolvable inside every workspace
+# package.
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=deps /app/packages/types/node_modules packages/types/node_modules
+COPY --from=deps /app/packages/crypto/node_modules packages/crypto/node_modules
+COPY --from=deps /app/packages/telemetry-codec/node_modules packages/telemetry-codec/node_modules
+COPY --from=deps /app/packages/db/node_modules packages/db/node_modules
+COPY --from=deps /app/packages/logger/node_modules packages/logger/node_modules
+COPY --from=deps /app/services/blockchain-writer/node_modules services/blockchain-writer/node_modules
 RUN pnpm -r --filter @airchive/blockchain-writer... run build
 
 FROM base AS runner
@@ -38,6 +49,15 @@ COPY --from=build /app/packages/logger/package.json packages/logger/
 COPY --from=build /app/services/blockchain-writer/dist services/blockchain-writer/dist
 COPY --from=build /app/services/blockchain-writer/package.json services/blockchain-writer/
 COPY --from=deps /app/node_modules ./node_modules
+# pnpm keeps each project's runtime dependencies in that project's own
+# node_modules as relative symlinks into /app/node_modules/.pnpm, so the
+# per-project link farms have to come across or nothing resolves at runtime.
+COPY --from=deps /app/packages/types/node_modules packages/types/node_modules
+COPY --from=deps /app/packages/crypto/node_modules packages/crypto/node_modules
+COPY --from=deps /app/packages/telemetry-codec/node_modules packages/telemetry-codec/node_modules
+COPY --from=deps /app/packages/db/node_modules packages/db/node_modules
+COPY --from=deps /app/packages/logger/node_modules packages/logger/node_modules
+COPY --from=deps /app/services/blockchain-writer/node_modules services/blockchain-writer/node_modules
 COPY deploy/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 USER node

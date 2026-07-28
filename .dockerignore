@@ -1,0 +1,35 @@
+# Without this the build context carries the host's dependency trees and build
+# output into every image. On a workspace this is not merely slow: a Windows or
+# macOS node_modules copied over the Linux one from `deps` produces binaries
+# that cannot run, and a stale tsbuildinfo convinces `tsc -b` there is nothing
+# to rebuild.
+node_modules
+**/node_modules
+
+dist
+**/dist
+*.tsbuildinfo
+**/*.tsbuildinfo
+
+.next
+**/.next
+coverage
+**/coverage
+test-results
+playwright-report
+
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+*.log
+
+.turbo
+tmp
+dashboard/public/cesium
+
+# Deployment material that no image needs baked in.
+nginx/certs
+nginx/acme
+nginx/letsencrypt
