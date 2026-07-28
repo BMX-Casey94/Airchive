@@ -12,10 +12,10 @@
 #     file. The entrypoint starts as root (secrets are root:root 0400), loads
 #     them, then drops to the `node` user. Keep non-sensitive settings in `.env`.
 #
-#  2. EXPOSURE. Only nginx publishes ports. Postgres, Redis, Arcade, the
-#     gateway, the overlay node and the dashboard become reachable only from
-#     inside the compose network, which is the whole point of running behind a
-#     real domain rather than an ephemeral tunnel.
+#  2. EXPOSURE. Postgres, Redis, Arcade, the overlay node and the dashboard
+#     publish nothing on the host. The gateway keeps its loopback-only ports so
+#     a host-side Cloudflare tunnel (cloudflared → 127.0.0.1:4000/4001) can
+#     reach the API without exposing it on the public interface.
 #
 #  3. DURABILITY. Verified nightly Postgres dumps with retention, plus certbot
 #     renewal for the TLS material nginx reads from ./nginx/certs.
@@ -76,7 +76,9 @@ services:
       - postgres_password
 
   gateway:
-    ports: !override []
+    # Keep the base file's 127.0.0.1 publishes. Clearing them here is what made
+    # api.airchive.uk return Cloudflare 502 — cloudflared runs on the host and
+    # has nowhere to dial if the ports are network-internal only.
     environment:
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
       JWT_SECRET_FILE: /run/secrets/jwt_secret
