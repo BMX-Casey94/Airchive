@@ -80,6 +80,11 @@ interface TxRow {
 
 interface TelemetrySampleDTO {
   callsign: string | null;
+  /** Identity carried in the envelope itself, so the explorer can name an
+   *  aircraft from its own on-chain records rather than live fleet state. */
+  registration: string | null;
+  aircraftType: string | null;
+  aircraftDesc: string | null;
   latitude: number | null;
   longitude: number | null;
   altitudeFt: number | null;
@@ -196,6 +201,9 @@ function telemetryFromFields(
 ): TelemetrySampleDTO {
   return {
     callsign: stringOrNull(fields.callsign),
+    registration: stringOrNull(fields.reg),
+    aircraftType: stringOrNull(fields.aircraft_type),
+    aircraftDesc: stringOrNull(fields.aircraft_desc),
     latitude: finiteOrNull(fields.lat),
     longitude: finiteOrNull(fields.lon),
     altitudeFt: finiteOrNull(fields.alt_baro) ?? finiteOrNull(fields.alt_geom),

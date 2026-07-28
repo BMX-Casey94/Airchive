@@ -92,6 +92,10 @@ export interface PhaseSegment {
 /* ── Decoded telemetry attached to a transaction row ─────── */
 export interface TelemetrySample {
   callsign: string | null;
+  /** Identity read from the on-chain envelope, not from live fleet state. */
+  registration?: string | null;
+  aircraftType?: string | null;
+  aircraftDesc?: string | null;
   latitude: number | null;
   longitude: number | null;
   altitudeFt: number | null;

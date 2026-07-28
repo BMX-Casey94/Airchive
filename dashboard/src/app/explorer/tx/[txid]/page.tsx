@@ -16,7 +16,12 @@ import {
   TxStatusBadge,
   recordTypeLabel,
 } from "@/components/explorer/ExplorerChrome";
+import DecodedFields from "@/components/explorer/DecodedFields";
 import type { DecodedPayload, TxResultDTO } from "@/types/dashboard";
+
+function asText(value: unknown): string | null {
+  return typeof value === "string" && value.trim() !== "" ? value.trim() : null;
+}
 
 function Field({
   label,
@@ -92,7 +97,14 @@ export default function TxExplorerPage({
       { revalidateOnFocus: false },
     );
 
-  const identity = useAircraftIdentity(tx?.aircraftIcao ?? "");
+  // This transaction's own envelope names the aircraft when neither live fleet
+  // state nor the static registry knows it.
+  const identity = useAircraftIdentity(tx?.aircraftIcao ?? "", {
+    registration: asText(decoded?.fields.reg),
+    typeCode: asText(decoded?.fields.aircraft_type),
+    description: asText(decoded?.fields.aircraft_desc),
+    callsign: asText(decoded?.fields.callsign),
+  });
 
   if (txLoading) {
     return (
@@ -236,16 +248,7 @@ export default function TxExplorerPage({
             <div className="space-y-4">
               <TelemetryGrid fields={decoded.fields} />
 
-              {Object.keys(decoded.fields).length > 0 && (
-                <details open>
-                  <summary className="hud-label cursor-pointer select-none text-[9px] transition-colors hover:text-electric-cyan">
-                    All decoded fields ({Object.keys(decoded.fields).length})
-                  </summary>
-                  <pre className="mt-2 max-h-96 overflow-auto rounded-lg border border-panel-border bg-space-black p-4 font-mono text-xs text-electric-cyan/80">
-                    {JSON.stringify(decoded.fields, null, 2)}
-                  </pre>
-                </details>
-              )}
+              <DecodedFields fields={decoded.fields} size="full" />
 
               <details>
                 <summary className="hud-label cursor-pointer select-none text-[9px] transition-colors hover:text-neon-amber">

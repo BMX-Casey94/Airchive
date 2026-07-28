@@ -43,14 +43,30 @@ function clean(value: string | null | undefined): string | null {
 }
 
 /**
+ * Identity read from an aircraft's own on-chain records. Supplied by the
+ * explorer pages, which already hold decoded envelopes carrying `aircraft_desc`
+ * — the archive can name an aircraft the live fleet has never reported.
+ */
+export interface AircraftIdentityFallback {
+  registration?: string | null;
+  typeCode?: string | null;
+  description?: string | null;
+  callsign?: string | null;
+}
+
+/**
  * Resolves who an ICAO hex code actually belongs to.
  *
  * The explorer only ever receives a hex code in the URL, which tells a reader
  * nothing. Live fleet state is authoritative when the aircraft is transmitting;
- * the static registry fills in registration, type and operator when it is not,
- * so the page identifies the aircraft even when it has been parked for days.
+ * the static registry and the aircraft's own on-chain envelopes fill in
+ * registration, type and operator when it is not, so the page identifies the
+ * aircraft even when it has been parked for days.
  */
-export function useAircraftIdentity(icao: string): AircraftIdentity {
+export function useAircraftIdentity(
+  icao: string,
+  fallback?: AircraftIdentityFallback,
+): AircraftIdentity {
   const upper = icao.trim().toUpperCase();
   const { data, isLoading } = useSWR<FleetResponse>(
     `${apiBaseUrl}/api/fleet`,
@@ -67,11 +83,15 @@ export function useAircraftIdentity(icao: string): AircraftIdentity {
 
   return {
     icao: upper,
-    registration: clean(row?.reg) ?? clean(staticInfo?.reg),
-    typeCode: clean(row?.aircraft_type) ?? clean(staticInfo?.type),
-    description: clean(staticInfo?.desc),
+    registration:
+      clean(row?.reg) ?? clean(staticInfo?.reg) ?? clean(fallback?.registration),
+    typeCode:
+      clean(row?.aircraft_type)
+      ?? clean(staticInfo?.type)
+      ?? clean(fallback?.typeCode),
+    description: clean(staticInfo?.desc) ?? clean(fallback?.description),
     operator: clean(staticInfo?.operator),
-    callsign: clean(row?.callsign),
+    callsign: clean(row?.callsign) ?? clean(fallback?.callsign),
     phase: clean(row?.flight_phase),
     walletAddress: clean(row?.wallet_address),
     live,

@@ -20,6 +20,7 @@ import {
   TxStatusBadge,
   recordTypeLabel,
 } from "@/components/explorer/ExplorerChrome";
+import DecodedFields from "@/components/explorer/DecodedFields";
 import DateTimePicker from "@/components/ui/DateTimePicker";
 import type { DecodedPayload, FlightPhase, TxResultDTO } from "@/types/dashboard";
 
@@ -132,16 +133,7 @@ function DecodedPayloadPanel({ txid }: { txid: string }) {
         </div>
       </div>
 
-      {fieldCount > 0 && (
-        <details>
-          <summary className="hud-label cursor-pointer select-none text-[10px] transition-colors hover:text-electric-cyan">
-            Decoded fields ({fieldCount})
-          </summary>
-          <pre className="mt-2 max-h-60 overflow-auto rounded-lg border border-panel-border bg-space-black p-3 font-mono text-[10px] text-electric-cyan/80">
-            {JSON.stringify(data.fields, null, 2)}
-          </pre>
-        </details>
-      )}
+      {fieldCount > 0 && <DecodedFields fields={data.fields} />}
 
       <details>
         <summary className="hud-label cursor-pointer select-none text-[10px] transition-colors hover:text-neon-amber">
@@ -245,7 +237,6 @@ export default function AircraftExplorerPage({
 }) {
   const { icao } = use(params);
   const upperIcao = icao.toUpperCase();
-  const identity = useAircraftIdentity(icao);
 
   const [page, setPage] = useState(0);
   const [timeFrom, setTimeFrom] = useState("");
@@ -290,6 +281,23 @@ export default function AircraftExplorerPage({
 
   const filtered = Boolean(timeFrom || timeTo || recordType);
   const exportable = (summary?.data.total ?? 0) > 0 || (data?.length ?? 0) > 0;
+
+  // An aircraft parked for days is absent from live fleet state, but its own
+  // envelopes still carry `aircraft_desc` — so the header names it from the
+  // archive rather than reporting "type unknown".
+  const onChainIdentity = useMemo(() => {
+    const sample = data?.find((tx) => tx.telemetry?.aircraftDesc
+      || tx.telemetry?.registration
+      || tx.telemetry?.aircraftType);
+    return {
+      registration: sample?.telemetry?.registration ?? null,
+      typeCode: sample?.telemetry?.aircraftType ?? null,
+      description: sample?.telemetry?.aircraftDesc ?? null,
+      callsign: sample?.telemetry?.callsign ?? null,
+    };
+  }, [data]);
+
+  const identity = useAircraftIdentity(icao, onChainIdentity);
 
   /**
    * Downloads the full filtered history from the gateway — not the current
@@ -406,9 +414,13 @@ export default function AircraftExplorerPage({
           label="SPV verified"
           value={stats ? stats.spvVerified.toLocaleString("en-GB") : "—"}
           sub={
-            stats && stats.total > 0
-              ? `${Math.round((stats.spvVerified / stats.total) * 100)}% of writes`
-              : undefined
+            !stats || stats.total === 0
+              ? undefined
+              : stats.mined === 0
+                // A proof can only be checked once a block contains the write,
+                // so 0% here means "nothing mined yet", not "verification off".
+                ? "awaiting first confirmation"
+                : `${Math.round((stats.spvVerified / stats.total) * 100)}% of writes`
           }
           tone="green"
         />
@@ -436,8 +448,9 @@ export default function AircraftExplorerPage({
         />
       </div>
 
-      {/* ── Filters ───────────────────────────────────────── */}
-      <div className="panel space-y-3 p-4">
+      {/* Raised above the ledger: the calendar popover overflows this panel and
+          the table below it opens its own stacking context via backdrop-blur. */}
+      <div className="panel relative z-30 space-y-3 p-4">
         <div className="flex flex-wrap items-center gap-2">
           {RECORD_TYPE_FILTERS.map((filter) => (
             <button
