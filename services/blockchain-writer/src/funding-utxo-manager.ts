@@ -16,6 +16,7 @@ import {
   derivePubKeyHash,
   estimateRefillFee,
 } from "./tx-builder.js";
+import type { WocClient } from "./woc-client.js";
 import {
   BroadcastPriority,
   type Broadcaster,
@@ -75,7 +76,7 @@ export class FundingUtxoManager {
 
   constructor(
     private readonly db: Knex,
-    private readonly wocApiUrl: string,
+    private readonly woc: WocClient,
   ) {}
 
   /**
@@ -695,15 +696,14 @@ export class FundingUtxoManager {
   }
 
   private async fetchFromChain(address: string): Promise<WocUtxo[]> {
-    const url = `${this.wocApiUrl}/address/${address}/unspent`;
-    const res = await fetch(url, {
-      headers: { Accept: "application/json" },
-      signal: AbortSignal.timeout(15_000),
-    });
-    if (!res.ok) {
-      throw new Error(`WoC fetch failed for funding wallet: ${res.status}`);
+    const utxos = await this.woc.getJson<WocUtxo[]>(
+      `/address/${address}/unspent`,
+      { label: "funding_unspent", timeoutMs: 15_000 },
+    );
+    if (!utxos) {
+      throw new Error("WoC fetch returned no body for the funding wallet");
     }
-    return (await res.json()) as WocUtxo[];
+    return utxos;
   }
 
   private async refreshMetrics(): Promise<void> {

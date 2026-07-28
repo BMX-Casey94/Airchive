@@ -45,6 +45,7 @@ import { WriteBuffer } from "./write-buffer.js";
 import { ConfirmationPoller } from "./confirmation-poller.js";
 import { FundingStateMachine } from "./funding-state.js";
 import { HeaderStore } from "./header-store.js";
+import { WocClient } from "./woc-client.js";
 import { recordUnverifiedProof, recordVerifiedProof, verifyBump } from "./spv.js";
 import { buildFlightEventTx, buildTelemetryTx, computeTxid } from "./tx-builder.js";
 import {
@@ -372,8 +373,18 @@ async function main(): Promise<void> {
   }
 
   const broadcaster: Broadcaster = arcadeBroadcaster ?? arcBroadcaster;
-  const utxoManager = new UtxoManager(db, config.wocApiUrl);
-  const fundingUtxoManager = new FundingUtxoManager(db, config.wocApiUrl);
+
+  // Every chain lookup in this process shares one budget. WhatsOnChain rate
+  // limits per IP, so uncoordinated callers starve each other and, worse,
+  // starve the reconciliation that recovers from the resulting failures.
+  const woc = new WocClient({
+    baseUrl: config.wocApiUrl,
+    apiKey: config.wocApiKey,
+    maxRequestsPerSecond: config.wocMaxRequestsPerSecond,
+  });
+
+  const utxoManager = new UtxoManager(db, woc);
+  const fundingUtxoManager = new FundingUtxoManager(db, woc);
   const writeBuffer = new WriteBuffer(db, broadcaster, utxoManager, vault);
   const autoRefill = new AutoRefillMonitor(
     config,
@@ -387,7 +398,7 @@ async function main(): Promise<void> {
   writeBuffer.setAutoRefill(autoRefill);
   let confirmationPoller: ConfirmationPoller | null = null;
 
-  const headerStore = new HeaderStore(db, config.wocApiUrl);
+  const headerStore = new HeaderStore(db, woc);
   const initialHeaders = await headerStore.syncTip();
   log.info(
     { synced: initialHeaders, tip: await headerStore.currentHeight() },
@@ -1103,12 +1114,13 @@ async function main(): Promise<void> {
     broadcaster,
     fundingUtxoManager,
     resolveAgentTargets(),
+    woc,
   );
   agentRefiller.start();
 
   confirmationPoller = new ConfirmationPoller(
     db,
-    config.wocApiUrl,
+    woc,
     headerStore,
     arcadeBroadcaster?.baseUrl,
     config.arcade.apiKey,

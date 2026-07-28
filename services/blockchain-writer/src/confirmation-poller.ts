@@ -5,6 +5,7 @@ import { createLogger } from "@airchive/logger";
 import { spvVerificationsTotal } from "./metrics.js";
 import type { HeaderStore } from "./header-store.js";
 import { recordUnverifiedProof, recordVerifiedProof, verifyBump } from "./spv.js";
+import { isWocUnavailable, type WocClient } from "./woc-client.js";
 
 const log = createLogger({ service: "blockchain-writer:confirmation-poller" });
 
@@ -65,7 +66,7 @@ export class ConfirmationPoller {
 
   constructor(
     private readonly db: Knex,
-    private readonly wocApiUrl: string,
+    private readonly woc: WocClient,
     private readonly headers: HeaderStore,
     private readonly arcadeUrl?: string,
     private readonly arcadeApiKey?: string,
@@ -166,26 +167,21 @@ export class ConfirmationPoller {
    * WhatsOnChain remains a proof source only. Its answer is never taken at face
    * value: the branch is recomputed and matched against a locally verified
    * header, so a wrong or hostile response fails closed.
+   *
+   * Only called for transactions the bulk status pass has already placed in a
+   * block, so one proof request is spent per genuine confirmation rather than
+   * two per pending row per cycle.
    */
-  private async verifyViaWoc(txid: string): Promise<{ blockHeight: number } | null> {
-    const [statusRes, proofRes] = await Promise.all([
-      fetch(`${this.wocApiUrl}/tx/${txid}`, {
-        headers: { Accept: "application/json" },
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      }),
-      fetch(`${this.wocApiUrl}/tx/${txid}/proof/tsc`, {
-        headers: { Accept: "application/json" },
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      }),
-    ]);
+  private async verifyViaWoc(
+    txid: string,
+    blockHeight: number,
+  ): Promise<{ blockHeight: number } | null> {
+    const proofs = await this.woc.getJson<TscProof[]>(`/tx/${txid}/proof/tsc`, {
+      label: "tsc_proof",
+      timeoutMs: REQUEST_TIMEOUT_MS,
+      allowNotFound: true,
+    });
 
-    if (!statusRes.ok || !proofRes.ok) return null;
-
-    const status = (await statusRes.json()) as { blockheight?: number; confirmations?: number };
-    const blockHeight = Number(status.blockheight ?? 0);
-    if (!(blockHeight > 0)) return null;
-
-    const proofs = (await proofRes.json()) as TscProof[];
     const proof = proofs?.[0];
     if (!proof || !Array.isArray(proof.nodes)) return null;
 
@@ -208,7 +204,10 @@ export class ConfirmationPoller {
     return { blockHeight };
   }
 
-  private async processPendingRow(row: PendingTxRow): Promise<number> {
+  private async processPendingRow(
+    row: PendingTxRow,
+    wocBlockHeight: number | undefined,
+  ): Promise<number> {
     const txid = row.txid;
     try {
       const arcade = await this.fetchArcadeProof(txid);
@@ -247,15 +246,25 @@ export class ConfirmationPoller {
         return 0;
       }
 
-      const woc = await this.verifyViaWoc(txid);
-      if (woc) {
-        await this.db("tx_results").where({ txid }).update({
-          status: "MINED",
-          block_height: woc.blockHeight,
-          spv_verified: true,
-        });
-        await this.publishMined(row, woc.blockHeight);
-        return 1;
+      if (wocBlockHeight !== undefined) {
+        const woc = await this.verifyViaWoc(txid, wocBlockHeight);
+        if (woc) {
+          await this.db("tx_results").where({ txid }).update({
+            status: "MINED",
+            block_height: woc.blockHeight,
+            spv_verified: true,
+          });
+          await this.publishMined(row, woc.blockHeight);
+          return 1;
+        }
+
+        // In a block but not yet provable — usually the header for that height
+        // has not synced. Record the height so the row is not mistaken for one
+        // the network never saw, and let the next cycle finish the proof.
+        await this.db("tx_results")
+          .where({ txid })
+          .update({ block_height: wocBlockHeight });
+        return 0;
       }
 
       // Nothing anywhere after a full day means it never propagated.
@@ -269,6 +278,32 @@ export class ConfirmationPoller {
       log.debug({ err, txid }, "Proof check failed for transaction");
       return 0;
     }
+  }
+
+  /**
+   * Block heights for every pending txid, keyed lower-case. An empty map means
+   * "none are mined"; a WoC outage yields an empty map too, which costs a cycle
+   * rather than risking a wrong terminal verdict.
+   */
+  private async fetchWocBlockHeights(txids: string[]): Promise<Map<string, number>> {
+    const heights = new Map<string, number>();
+    try {
+      const statuses = await this.woc.fetchTxStatuses(txids);
+      if (!statuses) return heights;
+      for (const [txid, status] of statuses) {
+        heights.set(txid, status.blockHeight);
+      }
+    } catch (err) {
+      if (isWocUnavailable(err)) {
+        log.warn(
+          { pending: txids.length, reason: (err as Error).message },
+          "Confirmation cycle could not reach WhatsOnChain — retrying next cycle",
+        );
+      } else {
+        log.error({ err }, "Bulk confirmation status lookup failed");
+      }
+    }
+    return heights;
   }
 
   private async publishMined(row: PendingTxRow, blockHeight: number): Promise<void> {
@@ -329,10 +364,19 @@ export class ConfirmationPoller {
 
       this.switchToCatchupState();
 
+      // One bulk lookup answers "is it in a block?" for the whole batch. The
+      // previous per-row pair of requests meant a 200-row cycle asked
+      // WhatsOnChain 400 times every ten seconds, which is well past the free
+      // tier's budget — so it answered 429, nothing could be confirmed, the
+      // backlog never drained, and the poller stayed in catch-up forever.
+      const mined = await this.fetchWocBlockHeights(pending.map((row) => row.txid));
+
       for (let i = 0; i < pending.length; i += POLL_CONCURRENCY) {
         const slice = pending.slice(i, i + POLL_CONCURRENCY);
         const results = await Promise.all(
-          slice.map((row) => this.processPendingRow(row)),
+          slice.map((row) =>
+            this.processPendingRow(row, mined.get(row.txid.toLowerCase())),
+          ),
         );
         confirmed += results.reduce((sum, value) => sum + value, 0);
 

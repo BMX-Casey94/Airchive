@@ -197,6 +197,25 @@ export const spvVerificationsTotal = new Counter({
   registers: [registry],
 });
 
+export const wocRequestsTotal = new Counter({
+  name: "airchive_woc_requests_total",
+  help: "WhatsOnChain requests by call site and outcome",
+  labelNames: ["label", "outcome"] as const,
+  registers: [registry],
+});
+
+export const wocRateLimitedTotal = new Counter({
+  name: "airchive_woc_rate_limited_total",
+  help: "WhatsOnChain responses that rate limited the writer",
+  registers: [registry],
+});
+
+export const wocQueueDepth = new Gauge({
+  name: "airchive_woc_queue_depth",
+  help: "Requests waiting for a slot in the shared WhatsOnChain budget",
+  registers: [registry],
+});
+
 export const fundingStateGauge = new Gauge({
   name: "airchive_funding_state",
   help: "Funding state machine position (0 HEALTHY, 1 LOW, 2 DRY, 3 RECOVERING)",

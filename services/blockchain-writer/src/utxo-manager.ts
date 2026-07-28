@@ -18,6 +18,7 @@ import {
   utxoPoolBalance,
   utxoPoolCount,
 } from "./metrics.js";
+import type { WocClient } from "./woc-client.js";
 
 const log = createLogger({ service: "blockchain-writer:utxo" });
 
@@ -75,7 +76,7 @@ export class UtxoManager {
 
   constructor(
     private readonly db: Knex,
-    private readonly wocApiUrl: string,
+    private readonly woc: WocClient,
   ) {}
 
   async bootstrap(icao: string, address: string): Promise<boolean> {
@@ -617,19 +618,15 @@ export class UtxoManager {
     );
   }
 
-  private fetchFromChain(address: string): Promise<WocUtxo[]> {
-    const url = `${this.wocApiUrl}/address/${address}/unspent`;
-    return fetch(url, {
-      headers: { Accept: "application/json" },
-      signal: AbortSignal.timeout(15_000),
-    }).then(async (res) => {
-      if (!res.ok) {
-        throw new Error(
-          `WoC UTXO fetch failed for ${address}: ${res.status} ${res.statusText}`,
-        );
-      }
-      return res.json() as Promise<WocUtxo[]>;
-    });
+  private async fetchFromChain(address: string): Promise<WocUtxo[]> {
+    const utxos = await this.woc.getJson<WocUtxo[]>(
+      `/address/${address}/unspent`,
+      { label: "address_unspent", timeoutMs: 15_000 },
+    );
+    if (!utxos) {
+      throw new Error(`WoC UTXO fetch returned no body for ${address}`);
+    }
+    return utxos;
   }
 
   private getOutpointKey(txid: string, vout: number): string {

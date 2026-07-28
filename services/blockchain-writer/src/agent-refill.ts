@@ -10,6 +10,7 @@ import {
 import type { FundingUtxoManager } from "./funding-utxo-manager.js";
 import { buildRefillTx, derivePubKeyHash, estimateRefillFee } from "./tx-builder.js";
 import { agentRefillOutcomesTotal, agentWalletBalance } from "./metrics.js";
+import { isWocUnavailable, type WocClient } from "./woc-client.js";
 
 const log = createLogger({ service: "blockchain-writer:agent-refill" });
 
@@ -21,6 +22,7 @@ export type AgentRefillOutcome =
   | "refilled"
   | "sufficient"
   | "treasury_dry"
+  | "chain_unavailable"
   | "cooldown"
   | "broadcast_deferred"
   | "broadcast_failed"
@@ -92,6 +94,7 @@ export class AgentWalletRefiller {
     private readonly broadcaster: Broadcaster,
     private readonly fundingUtxoManager: FundingUtxoManager,
     private readonly targets: AgentWalletTarget[],
+    private readonly woc: WocClient,
   ) {}
 
   start(): void {
@@ -136,6 +139,16 @@ export class AgentWalletRefiller {
           const outcome = await this.checkAndRefill(target);
           agentRefillOutcomesTotal.inc({ agent: target.label, outcome });
         } catch (err) {
+          // A rate-limited chain lookup is a deferral, not a fault: the next
+          // cycle retries, and logging it as an error buries real failures.
+          if (isWocUnavailable(err)) {
+            agentRefillOutcomesTotal.inc({ agent: target.label, outcome: "chain_unavailable" });
+            log.debug(
+              { agent: target.label, reason: (err as Error).message },
+              "Agent balance check deferred — WhatsOnChain unavailable",
+            );
+            continue;
+          }
           agentRefillOutcomesTotal.inc({ agent: target.label, outcome: "error" });
           log.error({ err, agent: target.label }, "Agent refill failed");
         }
@@ -271,13 +284,13 @@ export class AgentWalletRefiller {
    * service — so their balance is read from the chain rather than the database.
    */
   private async fetchUtxos(address: string): Promise<WocUtxo[]> {
-    const res = await fetch(`${this.config.wocApiUrl}/address/${address}/unspent`, {
-      headers: { Accept: "application/json" },
-      signal: AbortSignal.timeout(10_000),
-    });
-    if (!res.ok) {
-      throw new Error(`WhatsOnChain returned ${res.status} for ${address}`);
+    const utxos = await this.woc.getJson<WocUtxo[]>(
+      `/address/${address}/unspent`,
+      { label: "agent_unspent", timeoutMs: 10_000 },
+    );
+    if (!utxos) {
+      throw new Error(`WhatsOnChain returned no body for ${address}`);
     }
-    return (await res.json()) as WocUtxo[];
+    return utxos;
   }
 }

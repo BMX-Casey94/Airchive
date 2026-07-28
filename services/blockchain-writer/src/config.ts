@@ -30,6 +30,8 @@ export interface Config {
   arcEndpoints: ArcEndpointConfig[];
   arcCallbackPort: number;
   wocApiUrl: string;
+  wocApiKey?: string;
+  wocMaxRequestsPerSecond: number;
   walletMasterSeed: string;
   fundingWalletWif: string;
   trackedAircraft: string[];
@@ -164,6 +166,10 @@ export function loadConfig(): Config {
       "WOC_API_URL",
       "https://api.whatsonchain.com/v1/bsv/main",
     ),
+    wocApiKey: process.env.WOC_API_KEY?.trim() || undefined,
+    // The free tier allows roughly 3 requests/second per IP. Raise this only
+    // alongside a paid WOC_API_KEY, or the writer earns itself a 429 cooldown.
+    wocMaxRequestsPerSecond: Number(optionalEnv("WOC_MAX_RPS", "3")),
     walletMasterSeed,
     fundingWalletWif: requireEnv("FUNDING_WALLET_WIF"),
     trackedAircraft: requireEnv("TRACKED_AIRCRAFT")

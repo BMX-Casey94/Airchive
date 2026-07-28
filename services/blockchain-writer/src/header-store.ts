@@ -2,6 +2,7 @@ import type { Knex } from "knex";
 import { Hash } from "@bsv/sdk";
 import { createLogger } from "@airchive/logger";
 import { headerFetchTotal, headersStoredGauge, spvVerificationsTotal } from "./metrics.js";
+import type { WocClient } from "./woc-client.js";
 
 const log = createLogger({ service: "blockchain-writer:headers" });
 
@@ -44,7 +45,7 @@ export class HeaderStore {
 
   constructor(
     private readonly db: Knex,
-    private readonly wocApiUrl: string,
+    private readonly woc: WocClient,
   ) {}
 
   async isValidRootForHeight(root: string, height: number): Promise<boolean> {
@@ -84,16 +85,15 @@ export class HeaderStore {
   async syncTip(): Promise<number> {
     let stored = 0;
     try {
-      const res = await fetch(`${this.wocApiUrl}/block/headers`, {
-        headers: { Accept: "application/json" },
-        signal: AbortSignal.timeout(HEADER_FETCH_TIMEOUT_MS),
+      const payload = await this.woc.getJson<WocHeader[]>("/block/headers", {
+        label: "block_headers",
+        timeoutMs: HEADER_FETCH_TIMEOUT_MS,
       });
-      if (!res.ok) {
+      if (!payload) {
         headerFetchTotal.inc({ outcome: "error" });
         return 0;
       }
 
-      const payload = (await res.json()) as WocHeader[];
       // Ascending, so each header can be linked to the one before it.
       const headers = payload
         .map(toHeader)
@@ -151,16 +151,17 @@ export class HeaderStore {
 
   private async fetchHeader(height: number): Promise<BlockHeader | null> {
     try {
-      const res = await fetch(`${this.wocApiUrl}/block/${height}/header`, {
-        headers: { Accept: "application/json" },
-        signal: AbortSignal.timeout(HEADER_FETCH_TIMEOUT_MS),
+      const payload = await this.woc.getJson<WocHeader>(`/block/${height}/header`, {
+        label: "block_header",
+        timeoutMs: HEADER_FETCH_TIMEOUT_MS,
+        allowNotFound: true,
       });
-      if (!res.ok) {
-        headerFetchTotal.inc({ outcome: res.status === 404 ? "missing" : "error" });
+      if (!payload) {
+        headerFetchTotal.inc({ outcome: "missing" });
         return null;
       }
 
-      const header = toHeader((await res.json()) as WocHeader);
+      const header = toHeader(payload);
       if (!header) {
         headerFetchTotal.inc({ outcome: "invalid" });
         return null;
