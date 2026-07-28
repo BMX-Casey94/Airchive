@@ -138,10 +138,17 @@ material back into `nginx/certs`.
 cd /opt/airchive
 sudo mkdir -p /var/backups/airchive
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
-docker compose -f docker-compose.yml -f docker-compose.prod.yml run --rm \
-  --entrypoint "node" gateway node_modules/.bin/knex migrate:latest \
-  --knexfile packages/db/dist/knexfile.js
 docker compose -f docker-compose.yml -f docker-compose.prod.yml ps
+```
+
+Migrations need no separate step. The `migrate` service runs once against a
+healthy Postgres and every service that touches the database is gated on it
+exiting zero, so a fresh volume comes up with a complete schema and a failed
+migration halts the rollout rather than leaving services to crash-loop against
+missing tables. To see what it did:
+
+```bash
+docker compose logs migrate
 ```
 
 Verify:

@@ -141,6 +141,32 @@ services:
       start_period: 120s
     logging: *default-logging
 
+  # One-shot schema migration. Every service that touches Postgres waits for
+  # this to exit zero, so a fresh volume comes up with a complete schema and a
+  # failed migration stops the rollout instead of leaving services to crash-loop
+  # against missing tables. Re-running it is a no-op once the schema is current.
+  migrate:
+    build:
+      context: .
+      dockerfile: packages/db/Dockerfile
+    container_name: airchive-migrate
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      # Migrations take DDL locks and can legitimately run longer than the
+      # 30s ceiling the services apply to their own queries.
+      POSTGRES_STATEMENT_TIMEOUT_MS: ${MIGRATE_STATEMENT_TIMEOUT_MS:-300000}
+      POSTGRES_IDLE_TX_TIMEOUT_MS: ${MIGRATE_IDLE_TX_TIMEOUT_MS:-300000}
+      SERVICE_NAME: airchive-migrate
+    networks:
+      - airchive
+    logging: *default-logging
+
   ingestion:
     build:
       context: .
@@ -152,6 +178,8 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     env_file: .env
     environment:
       REDIS_HOST: redis
@@ -182,6 +210,8 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       arcade:
         # Deliberately service_started, not service_healthy: the broadcaster
         # health-checks Arcade itself and falls back to the ARC upstream, so a
@@ -215,6 +245,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     env_file: .env
     environment:
       POSTGRES_HOST: postgres
@@ -242,6 +274,8 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     env_file: .env
     environment:
       REDIS_HOST: redis
@@ -278,6 +312,8 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     env_file: .env
     environment:
       REDIS_HOST: redis
@@ -308,6 +344,8 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     env_file: .env
     environment:
       REDIS_HOST: redis

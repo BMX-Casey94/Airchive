@@ -55,6 +55,14 @@ services:
   arcade:
     ports: !override []
 
+  # The whole stack is gated on this container exiting zero, so if it is left
+  # reading a password that `.env` no longer carries, nothing starts at all.
+  migrate:
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+
   overlay-node:
     ports: !override []
     environment:

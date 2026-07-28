@@ -199,6 +199,12 @@ pnpm run db:migrate
 Redis, Arcade, all six services, the dashboard and nginx. For local development
 against `pnpm dev` processes, start only the dependencies as shown above.
 
+Under compose the schema is applied by a one-shot `migrate` service, and every
+service that touches Postgres waits for it to exit zero, so `pnpm run db:migrate`
+is only needed when running the services natively. Migrations are recorded
+without a file extension, so the same ledger is read whether they were applied
+from TypeScript source or from the compiled build in the container.
+
 Start all services (separate terminals or use a process manager):
 
 ```bash

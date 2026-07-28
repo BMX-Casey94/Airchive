@@ -1,8 +1,50 @@
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { readdir } from "node:fs/promises";
+import { basename, dirname, extname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { Knex } from "knex";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+// Locally the knex CLI loads this file as TypeScript from src/, but the
+// container runs the compiled build, where the migrations next to it are .js.
+// Deriving the extension from this file rather than hard-coding "ts" keeps one
+// knexfile correct in both places; hard-coding it makes the compiled runner
+// find zero migrations and report success against an empty database.
+const selfExtension = extname(__filename) || ".ts";
+const migrationDirectory = join(__dirname, "migrations");
+
+/**
+ * Records migrations under their bare name, with no file extension.
+ *
+ * Knex's default source names each applied migration after its filename, so the
+ * same migration is "001_initial_schema.ts" when applied from source and
+ * "001_initial_schema.js" when applied from the compiled build. The two ledgers
+ * are mutually unreadable: whichever ran second reports the other's entries as
+ * a corrupt migration directory and refuses to run. Dropping the extension
+ * makes one repository produce one ledger however it is invoked.
+ */
+class MigrationSource implements Knex.MigrationSource<string> {
+  async getMigrations(): Promise<string[]> {
+    const entries = await readdir(migrationDirectory);
+    return entries
+      .filter(
+        (file) =>
+          file.endsWith(selfExtension) && !file.endsWith(`.d${selfExtension}`),
+      )
+      .sort();
+  }
+
+  getMigrationName(file: string): string {
+    return basename(file, selfExtension);
+  }
+
+  async getMigration(file: string): Promise<Knex.Migration> {
+    // A file URL rather than a bare path: on Windows, dynamic import of an
+    // absolute path such as C:\... is rejected as an unknown protocol.
+    return import(pathToFileURL(join(migrationDirectory, file)).href) as Promise<Knex.Migration>;
+  }
+}
 
 // The knex CLI chdirs into the knexfile's directory, so a bare `.env` lookup
 // never finds the repo root. Load it explicitly; real environment variables
@@ -66,9 +108,13 @@ const config: Knex.Config = {
   },
   acquireConnectionTimeout: numberEnv("POSTGRES_ACQUIRE_TIMEOUT_MS", 60_000),
   migrations: {
-    directory: join(__dirname, "migrations"),
-    extension: "ts",
-    loadExtensions: [".ts"],
+    // No `directory` or `loadExtensions` here on purpose: knex treats any
+    // filesystem option as a request for its built-in source and silently
+    // discards migrationSource, with only a log line to say so. The directory
+    // is baked into the source above instead. `extension` is not a filesystem
+    // option in that sense and only tells `migrate:make` what to create.
+    extension: selfExtension.slice(1),
+    migrationSource: new MigrationSource(),
   },
 };
 
