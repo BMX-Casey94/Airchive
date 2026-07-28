@@ -14,7 +14,7 @@ function parseTrackedAircraft(raw: string | undefined): string[] {
 }
 
 export interface AlertEngineConfig {
-  redis: { host: string; port: number };
+  redis: { host: string; port: number; password: string | undefined };
   trackedAircraft: string[];
   notifications: {
     sendgridApiKey: string | undefined;
@@ -33,6 +33,7 @@ export function loadConfig(): AlertEngineConfig {
     redis: {
       host: process.env.REDIS_HOST ?? "127.0.0.1",
       port: envInt("REDIS_PORT", 6379),
+      password: process.env.REDIS_PASSWORD || undefined,
     },
     trackedAircraft: parseTrackedAircraft(process.env.TRACKED_AIRCRAFT),
     notifications: {

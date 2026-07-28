@@ -36,6 +36,7 @@ async function main(): Promise<void> {
   const redis = new Redis({
     host: config.redis.host,
     port: config.redis.port,
+    password: config.redis.password,
     lazyConnect: true,
     retryStrategy: (times) => Math.min(times * 500, 5_000),
   });

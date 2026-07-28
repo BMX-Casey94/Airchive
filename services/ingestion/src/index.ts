@@ -83,6 +83,7 @@ async function main(): Promise<void> {
   const redis = new Redis({
     host: config.redis.host,
     port: config.redis.port,
+    password: config.redis.password,
     maxRetriesPerRequest: 3,
     keepAlive: 10_000,
     retryStrategy(times) {

@@ -21,6 +21,7 @@ export interface IngestionConfig {
   redis: {
     host: string;
     port: number;
+    password: string | undefined;
   };
 }
 
@@ -59,6 +60,7 @@ export function getConfig(): IngestionConfig {
     redis: {
       host: process.env.REDIS_HOST ?? "127.0.0.1",
       port: envInt("REDIS_PORT", 6379),
+      password: process.env.REDIS_PASSWORD || undefined,
     },
   };
 }

@@ -1,5 +1,5 @@
 export interface AgentMarketplaceConfig {
-  redis: { host: string; port: number };
+  redis: { host: string; port: number; password: string | undefined };
   postgres: {
     host: string;
     port: number;
@@ -32,6 +32,7 @@ export function loadConfig(): AgentMarketplaceConfig {
     redis: {
       host: process.env.REDIS_HOST ?? "localhost",
       port: Number(process.env.REDIS_PORT ?? "6379"),
+      password: process.env.REDIS_PASSWORD || undefined,
     },
     postgres: {
       host: process.env.POSTGRES_HOST ?? "localhost",

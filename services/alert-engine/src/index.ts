@@ -147,6 +147,7 @@ async function main(): Promise<void> {
   const redisOpts = {
     host: config.redis.host,
     port: config.redis.port,
+    password: config.redis.password,
     lazyConnect: true,
     maxRetriesPerRequest: 3,
     retryStrategy(times: number) {

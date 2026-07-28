@@ -16,7 +16,10 @@ export class WsHub {
   private subscriber: Redis | null = null;
   private pingInterval: ReturnType<typeof setInterval> | null = null;
 
-  async start(server: Server, redisConfig: { host: string; port: number }): Promise<void> {
+  async start(
+    server: Server,
+    redisConfig: { host: string; port: number; password: string | undefined },
+  ): Promise<void> {
     this.wss = new WebSocketServer({ server, path: "/ws" });
 
     this.wss.on("connection", (ws) => {
@@ -45,7 +48,12 @@ export class WsHub {
       ws.on("error", () => this.clients.delete(client));
     });
 
-    this.subscriber = new Redis({ host: redisConfig.host, port: redisConfig.port, lazyConnect: true });
+    this.subscriber = new Redis({
+      host: redisConfig.host,
+      port: redisConfig.port,
+      password: redisConfig.password,
+      lazyConnect: true,
+    });
     await this.subscriber.connect();
     await this.subscriber.subscribe("broadcast", "txresult", "alerts", "phase", "agent:activity");
 

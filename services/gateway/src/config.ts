@@ -4,7 +4,7 @@ export interface GatewayConfig {
   jwtSecret: string;
   jwtExpiry: string;
   corsOrigin: string;
-  redis: { host: string; port: number };
+  redis: { host: string; port: number; password: string | undefined };
   nodeEnv: string;
 }
 
@@ -18,6 +18,7 @@ export function loadConfig(): GatewayConfig {
     redis: {
       host: process.env.REDIS_HOST ?? "127.0.0.1",
       port: parseInt(process.env.REDIS_PORT ?? "6379", 10),
+      password: process.env.REDIS_PASSWORD || undefined,
     },
     nodeEnv: process.env.NODE_ENV ?? "development",
   };

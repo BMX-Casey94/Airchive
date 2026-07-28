@@ -9,9 +9,21 @@
 # service that touches either datastore, it needs the same two overrides or it
 # will silently try to dial 15432 inside the network and hang on startup.
 #
-# The published host ports below are for local development and operator access.
-# In production, drop everything except nginx's 80/443 (or firewall them) so
-# Postgres, Redis, the gateway, and Arcade are not reachable off-box.
+# The published host ports below are for local development and operator access,
+# and every one of them binds to ${HOST_BIND_ADDR}, which defaults to loopback.
+# Only nginx listens on all interfaces, because only nginx is meant to face the
+# internet.
+#
+# Do not casually set HOST_BIND_ADDR to 0.0.0.0. Publishing a container port is
+# not filtered by firewalld: Docker writes its own rules into the DOCKER chain,
+# which is consulted before the firewalld zones, so a host that allows only
+# 22/80/443 will still expose anything published here. An unauthenticated Redis
+# reachable from the internet is a full host compromise — an attacker sets
+# `dir` and `dbfilename` and writes an SSH authorised_keys file — and Postgres
+# is only ever one weak password from the same outcome.
+#
+# A tunnel or reverse proxy running on the host reaches these through
+# 127.0.0.1, so loopback binding costs nothing operationally.
 
 x-logging: &default-logging
   driver: json-file
@@ -40,7 +52,7 @@ services:
     ports:
       # Host-side publish port only. Deliberately NOT ${POSTGRES_PORT} — that
       # variable is the port applications dial, and in-network that is 5432.
-      - "${POSTGRES_HOST_PORT:-15432}:5432"
+      - "${HOST_BIND_ADDR:-127.0.0.1}:${POSTGRES_HOST_PORT:-15432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     networks:
@@ -56,15 +68,31 @@ services:
     image: redis:7-alpine
     container_name: airchive-redis
     restart: unless-stopped
-    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    # Wrapped in a shell so REDIS_PASSWORD can be applied only when it is set:
+    # `--requirepass ""` is not the same as omitting it, and a compose list
+    # cannot express the condition. The `$$` escapes compose interpolation so
+    # the expansion happens in the container, keeping the password out of
+    # `docker inspect`'s command field.
+    command:
+      - sh
+      - -c
+      - exec redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+        $${REDIS_PASSWORD:+--requirepass "$$REDIS_PASSWORD"}
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
     ports:
-      - "${REDIS_HOST_PORT:-6379}:6379"
+      - "${HOST_BIND_ADDR:-127.0.0.1}:${REDIS_HOST_PORT:-6379}:6379"
     volumes:
       - redisdata:/data
     networks:
       - airchive
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # redis-cli exits non-zero on NOAUTH, so the password has to be supplied
+      # here too or enabling auth would mark the container permanently unhealthy
+      # and block every service gated on it.
+      test:
+        - CMD-SHELL
+        - redis-cli $${REDIS_PASSWORD:+-a "$$REDIS_PASSWORD"} --no-auth-warning ping | grep -q PONG
       interval: 5s
       timeout: 3s
       retries: 5
@@ -252,7 +280,7 @@ services:
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
     ports:
-      - "${OVERLAY_PORT:-4010}:4010"
+      - "${HOST_BIND_ADDR:-127.0.0.1}:${OVERLAY_PORT:-4010}:4010"
     networks:
       - airchive
     healthcheck:
@@ -287,9 +315,9 @@ services:
       # endpoint from .env and route in-cluster reads out over the internet.
       ARCADE_URL: http://arcade:3011
     ports:
-      - "${GATEWAY_PORT:-4000}:4000"
+      - "${HOST_BIND_ADDR:-127.0.0.1}:${GATEWAY_PORT:-4000}:4000"
       # WebSocket listener; nginx proxies /ws to this port.
-      - "${GATEWAY_WS_PORT:-4001}:4001"
+      - "${HOST_BIND_ADDR:-127.0.0.1}:${GATEWAY_WS_PORT:-4001}:4001"
     networks:
       - airchive
     healthcheck:
@@ -387,7 +415,7 @@ services:
         condition: service_healthy
     env_file: .env
     ports:
-      - "3000:3000"
+      - "${HOST_BIND_ADDR:-127.0.0.1}:${DASHBOARD_HOST_PORT:-3000}:3000"
     networks:
       - airchive
     healthcheck:
