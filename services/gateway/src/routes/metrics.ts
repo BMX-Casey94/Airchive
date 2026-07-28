@@ -1,5 +1,10 @@
 import type { FastifyInstance } from "fastify";
-import { getDb, getFundingState, TREASURY_SCOPE } from "@airchive/db";
+import {
+  getAgentDayMetrics,
+  getDb,
+  getFundingState,
+  TREASURY_SCOPE,
+} from "@airchive/db";
 
 type CountRow = { total: string | number } | undefined;
 
@@ -85,6 +90,37 @@ export async function metricsRoutes(app: FastifyInstance): Promise<void> {
     });
   });
 
+  /**
+   * Day totals for the Agent Marketplace tiles. Same UTC day boundary as
+   * `/api/metrics`, so Analytics "Today" and marketplace "Today" agree.
+   */
+  app.get("/api/agents/metrics", async (_request, reply) => {
+    const db = getDb();
+    const todayStartMs = new Date();
+    todayStartMs.setUTCHours(0, 0, 0, 0);
+
+    try {
+      const metrics = await getAgentDayMetrics(db, todayStartMs.getTime());
+      return reply.send({
+        success: true,
+        data: {
+          payments_today: metrics.payments,
+          earned_sats_today: metrics.earnedSats,
+          spent_sats_today: metrics.spentSats,
+          discoveries_today: metrics.discoveries,
+        },
+      });
+    } catch (err) {
+      // Pre-migration deployments should degrade to session counters rather
+      // than break the whole dashboard poll loop.
+      return reply.status(503).send({
+        success: false,
+        error:
+          err instanceof Error ? err.message : "Agent metrics unavailable",
+      });
+    }
+  });
+
   app.get("/api/system/funding", async (_request, reply) => {
     const db = getDb();
     const row = await getFundingState(db, TREASURY_SCOPE).catch(() => undefined);
@@ -95,6 +131,7 @@ export async function metricsRoutes(app: FastifyInstance): Promise<void> {
         data: {
           state: "UNKNOWN",
           reason: "The blockchain writer has not reported funding health yet",
+          treasury_address: null,
           balance_sats: 0,
           utxo_count: 0,
           runway_hours: null,
@@ -118,11 +155,15 @@ export async function metricsRoutes(app: FastifyInstance): Promise<void> {
       lastChecked === null || Date.now() - lastChecked.getTime() > FUNDING_STALE_AFTER_MS;
     const balance = Number(row.balance_sats ?? 0);
     const burn = Number(row.burn_sats_per_hour ?? 0);
+    const details = (row.details ?? {}) as Record<string, unknown>;
+    const treasuryAddress =
+      typeof details.treasuryAddress === "string" ? details.treasuryAddress : null;
 
     return reply.send({
       success: true,
       data: {
         state: row.state,
+        treasury_address: treasuryAddress,
         balance_sats: balance,
         utxo_count: row.utxo_count,
         burn_sats_per_hour: burn,

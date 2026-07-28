@@ -102,7 +102,7 @@ async function main(): Promise<void> {
   await redis.connect();
   log.info("Redis connected");
 
-  const activityPub = new AgentActivityPublisher(redis);
+  const activityPub = new AgentActivityPublisher(redis, db);
 
   log.info("Initialising Collector agent wallet...");
   const collectorWallet = await createAgentWallet(

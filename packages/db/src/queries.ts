@@ -654,3 +654,81 @@ export async function upsertAircraftConfig(
     .onConflict("icao")
     .merge(mergeRow);
 }
+
+/* ── Agent marketplace activity ─────────────────────────────── */
+
+export type AgentActivityEventType =
+  | "discovery"
+  | "transaction"
+  | "analysis"
+  | "message";
+
+export interface NewAgentActivity {
+  event_type: AgentActivityEventType;
+  agent: string;
+  timestamp: number;
+  data?: Record<string, unknown>;
+}
+
+export async function insertAgentActivity(
+  db: Knex,
+  event: NewAgentActivity,
+): Promise<void> {
+  await db("agent_activity").insert({
+    event_type: event.event_type,
+    agent: event.agent,
+    timestamp: event.timestamp,
+    data: event.data ?? {},
+  });
+}
+
+export interface AgentDayMetrics {
+  payments: number;
+  earnedSats: number;
+  spentSats: number;
+  discoveries: number;
+}
+
+/**
+ * Day totals for the marketplace tiles. UTC midnight matches `/api/metrics`,
+ * so Analytics and Agent Marketplace agree on what "today" means.
+ */
+export async function getAgentDayMetrics(
+  db: Knex,
+  sinceEpochMs: number,
+): Promise<AgentDayMetrics> {
+  const [payments, discoveries, earned, spent] = await Promise.all([
+    db("agent_activity")
+      .where({ event_type: "transaction" })
+      .where("timestamp", ">=", sinceEpochMs)
+      .count("* as total")
+      .first() as Promise<{ total?: string | number } | undefined>,
+    db("agent_activity")
+      .where({ event_type: "discovery" })
+      .where("timestamp", ">=", sinceEpochMs)
+      .count("* as total")
+      .first() as Promise<{ total?: string | number } | undefined>,
+    db("agent_activity")
+      .where({ event_type: "transaction", agent: "collector" })
+      .where("timestamp", ">=", sinceEpochMs)
+      .select(
+        db.raw("coalesce(sum((data->>'amountSats')::bigint), 0)::bigint as total"),
+      )
+      .first() as Promise<{ total?: string | number } | undefined>,
+    db("agent_activity")
+      .where({ event_type: "transaction" })
+      .whereNot({ agent: "collector" })
+      .where("timestamp", ">=", sinceEpochMs)
+      .select(
+        db.raw("coalesce(sum((data->>'amountSats')::bigint), 0)::bigint as total"),
+      )
+      .first() as Promise<{ total?: string | number } | undefined>,
+  ]);
+
+  return {
+    payments: Number(payments?.total ?? 0),
+    earnedSats: Number(earned?.total ?? 0),
+    spentSats: Number(spent?.total ?? 0),
+    discoveries: Number(discoveries?.total ?? 0),
+  };
+}

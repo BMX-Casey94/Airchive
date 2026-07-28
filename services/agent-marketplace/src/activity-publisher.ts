@@ -1,4 +1,6 @@
+import type { Knex } from "knex";
 import { Redis } from "ioredis";
+import { insertAgentActivity, type AgentActivityEventType } from "@airchive/db";
 import { createLogger } from "@airchive/logger";
 
 const log = createLogger({ service: "agent-activity" });
@@ -10,12 +12,21 @@ export interface AgentEvent {
   data: Record<string, unknown>;
 }
 
+const PERSISTED_TYPES = new Set<AgentActivityEventType>([
+  "discovery",
+  "transaction",
+  "analysis",
+  "message",
+]);
+
 export class AgentActivityPublisher {
   private readonly redis: Redis;
+  private readonly db: Knex;
   private readonly channel = "agent:activity";
 
-  constructor(redis: Redis) {
+  constructor(redis: Redis, db: Knex) {
     this.redis = redis;
+    this.db = db;
   }
 
   async publish(event: AgentEvent): Promise<void> {
@@ -23,6 +34,22 @@ export class AgentActivityPublisher {
       await this.redis.publish(this.channel, JSON.stringify(event));
     } catch (err) {
       log.debug({ err }, "Failed to publish agent activity");
+    }
+
+    // Status heartbeats fire every few seconds and carry no day-total meaning;
+    // everything else survives a reload so the marketplace tiles can be "today".
+    if (PERSISTED_TYPES.has(event.type as AgentActivityEventType)) {
+      void insertAgentActivity(this.db, {
+        event_type: event.type as AgentActivityEventType,
+        agent: event.agent,
+        timestamp: event.timestamp,
+        data: event.data,
+      }).catch((err) => {
+        log.warn(
+          { err: err instanceof Error ? err.message : String(err), type: event.type },
+          "Failed to persist agent activity",
+        );
+      });
     }
   }
 

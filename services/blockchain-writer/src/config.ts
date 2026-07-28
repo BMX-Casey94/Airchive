@@ -60,6 +60,27 @@ export interface Config {
   /** Minimum funding UTXO rows after startup split; more = less contention on concurrent refills. */
   fundingPoolSplitTarget: number;
   funding: FundingRecoveryConfig;
+  agentRefill: AgentRefillConfig;
+}
+
+/**
+ * Treasury top-ups for the marketplace agent wallets. The agents live in another
+ * service but spend from the same treasury, so the writer — which is the only
+ * component holding the funding key — keeps them solvent.
+ */
+export interface AgentRefillConfig {
+  enabled: boolean;
+  checkIntervalMs: number;
+  /** Top up once the agent's total on-chain balance drops below this. */
+  thresholdSats: number;
+  /** Total value delivered per top-up. */
+  amountSats: number;
+  /** Split across this many outputs so agents never chain unconfirmed spends. */
+  outputCount: number;
+  /** An output smaller than this cannot cover a fee and leave non-dust change. */
+  minOutputSats: number;
+  /** Top up when fewer than this many usable outputs remain, whatever the balance. */
+  minUsableOutputs: number;
 }
 
 /**
@@ -231,6 +252,15 @@ export function loadConfig(): Config {
       recoveryDrainBatchSize: Number(
         optionalEnv("FUNDING_RECOVERY_DRAIN_BATCH", "25"),
       ),
+    },
+    agentRefill: {
+      enabled: optionalEnv("AGENT_REFILL_ENABLED", "true").toLowerCase() !== "false",
+      checkIntervalMs: Number(optionalEnv("AGENT_REFILL_CHECK_INTERVAL_MS", "60000")),
+      thresholdSats: Number(optionalEnv("AGENT_REFILL_THRESHOLD_SATS", "20000")),
+      amountSats: Number(optionalEnv("AGENT_REFILL_AMOUNT_SATS", "60000")),
+      outputCount: Number(optionalEnv("AGENT_REFILL_OUTPUTS", "20")),
+      minOutputSats: Number(optionalEnv("AGENT_REFILL_MIN_OUTPUT_SATS", "1200")),
+      minUsableOutputs: Number(optionalEnv("AGENT_REFILL_MIN_USABLE_OUTPUTS", "6")),
     },
   };
 }

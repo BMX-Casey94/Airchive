@@ -120,6 +120,8 @@ export function AgentMarketplace() {
   const totalPayments = useAgentStore((s) => s.totalPayments);
   const totalEarnedSats = useAgentStore((s) => s.totalEarnedSats);
   const totalSpentSats = useAgentStore((s) => s.totalSpentSats);
+  const totalDiscoveries = useAgentStore((s) => s.totalDiscoveries);
+  const metricsSource = useAgentStore((s) => s.metricsSource);
 
   const agentEntries = Object.entries(agents).map(([id, info]) => ({
     id,
@@ -127,6 +129,9 @@ export function AgentMarketplace() {
   }));
 
   const recentEvents = events.slice(0, 50);
+  const fromGateway = metricsSource === "gateway";
+  const periodLabel = fromGateway ? "Today" : "This Session";
+  const periodSuffix = fromGateway ? "today" : "session";
 
   return (
     <section className="lg:col-span-12 space-y-3">
@@ -146,7 +151,7 @@ export function AgentMarketplace() {
               </span>
             </div>
             <span className="text-[9px] font-mono text-hud-muted/50 italic">
-              (this session)
+              ({periodLabel.toLowerCase()})
             </span>
           </div>
         }
@@ -159,26 +164,31 @@ export function AgentMarketplace() {
             ))}
           </div>
 
-          {/* Stats Row — session-scoped counters (reset on page reload) */}
+          {!fromGateway && (
+            <p className="text-[10px] font-mono text-neon-amber/80">
+              Gateway agent metrics unavailable — totals cover this session only.
+            </p>
+          )}
+
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
             <StatTile
-              label="Payments (session)"
+              label={`Payments (${periodSuffix})`}
               value={totalPayments.toLocaleString("en-GB")}
               colour="text-electric-cyan"
             />
             <StatTile
-              label="Earned (session)"
+              label={`Earned (${periodSuffix})`}
               value={fmtSats(totalEarnedSats)}
               colour="text-signal-green"
             />
             <StatTile
-              label="Spent (session)"
+              label={`Spent (${periodSuffix})`}
               value={fmtSats(totalSpentSats)}
               colour="text-neon-amber"
             />
             <StatTile
-              label="Discoveries (session)"
-              value={events.filter((e) => e.type === "discovery").length.toString()}
+              label={`Discoveries (${periodSuffix})`}
+              value={totalDiscoveries.toLocaleString("en-GB")}
               colour="text-signal-green"
             />
           </div>

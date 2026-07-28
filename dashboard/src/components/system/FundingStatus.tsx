@@ -1,6 +1,7 @@
 "use client";
 
 import { clsx } from "clsx";
+import { useCallback, useState } from "react";
 import useSWR from "swr";
 import { apiBaseUrl, fetcher } from "@/lib/api";
 
@@ -8,6 +9,7 @@ type FundingState = "HEALTHY" | "LOW" | "DRY" | "RECOVERING" | "UNKNOWN";
 
 interface FundingPayload {
   state: FundingState;
+  treasury_address?: string | null;
   balance_sats: number;
   utxo_count: number;
   burn_sats_per_hour?: number;
@@ -28,7 +30,7 @@ interface FundingResponse {
 const STATE_COPY: Record<FundingState, { label: string; detail: string }> = {
   HEALTHY: {
     label: "Treasury healthy",
-    detail: "Aircraft wallets are being topped up normally.",
+    detail: "Aircraft and agent wallets are being topped up normally.",
   },
   LOW: {
     label: "Treasury low",
@@ -55,6 +57,65 @@ function formatRunway(hours: number | null): string {
   if (hours >= 48) return `${Math.round(hours / 24)}d`;
   if (hours >= 1) return `${hours.toFixed(1)}h`;
   return `${Math.round(hours * 60)}m`;
+}
+
+/**
+ * The treasury pays for every write, so the one action that fixes a dry system
+ * is sending it coins. Showing the address — with a one-click copy — is what
+ * turns the status panel from a report into something an operator or a
+ * supporter can act on. Only ever a receive address; the WIF stays in the
+ * writer.
+ */
+function TreasuryAddress({ address }: { address: string }) {
+  const [copied, setCopied] = useState(false);
+
+  const copy = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(address);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2_000);
+    } catch {
+      setCopied(false);
+    }
+  }, [address]);
+
+  return (
+    <div className="rounded-lg border border-panel-border/50 bg-space-black/40 p-3 space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <p className="hud-label text-[9px]">Treasury Address</p>
+        <a
+          href={`https://whatsonchain.com/address/${address}`}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-[10px] text-hud-muted transition-colors hover:text-electric-cyan"
+        >
+          View on-chain ↗
+        </a>
+      </div>
+      <div className="flex items-center gap-2">
+        <code className="min-w-0 flex-1 break-all font-mono text-[11px] text-electric-cyan/90">
+          {address}
+        </code>
+        <button
+          type="button"
+          onClick={() => void copy()}
+          aria-label="Copy treasury address"
+          className={clsx(
+            "shrink-0 rounded border px-2 py-1 text-[10px] font-mono uppercase tracking-wider transition-colors",
+            copied
+              ? "border-signal-green/60 text-signal-green"
+              : "border-panel-border text-hud-muted hover:border-electric-cyan/60 hover:text-electric-cyan",
+          )}
+        >
+          {copied ? "Copied" : "Copy"}
+        </button>
+      </div>
+      <p className="text-[10px] leading-snug text-hud-muted">
+        BSV sent here funds aircraft and agent wallets automatically. Send nothing
+        you are not happy to spend on public infrastructure.
+      </p>
+    </div>
+  );
 }
 
 interface FundingStatusProps {
@@ -185,6 +246,8 @@ export default function FundingStatus({ variant = "panel" }: FundingStatusProps)
       <p className="text-[11px] leading-snug text-hud-muted">
         {funding.reason ?? copy.detail}
       </p>
+
+      {funding.treasury_address && <TreasuryAddress address={funding.treasury_address} />}
 
       {funding.stale && state !== "UNKNOWN" && (
         <p className="text-[10px] text-neon-amber/80">

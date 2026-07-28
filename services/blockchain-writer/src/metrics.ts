@@ -122,6 +122,20 @@ export const aircraftDryCount = new Gauge({
   registers: [registry],
 });
 
+export const agentWalletBalance = new Gauge({
+  name: "airchive_agent_wallet_balance_sats",
+  help: "On-chain balance of each marketplace agent wallet",
+  labelNames: ["agent"] as const,
+  registers: [registry],
+});
+
+export const agentRefillOutcomesTotal = new Counter({
+  name: "airchive_agent_refill_outcomes_total",
+  help: "Treasury top-up attempts for marketplace agent wallets",
+  labelNames: ["agent", "outcome"] as const,
+  registers: [registry],
+});
+
 export const arcadeSubmissionsTotal = new Counter({
   name: "airchive_arcade_submissions_total",
   help: "Transactions submitted to Arcade by outcome",

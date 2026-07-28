@@ -275,8 +275,8 @@ The system currently tracks **239 aircraft** in `aircraft_config`, each with its
 | Wallet | Count | Purpose |
 |--------|-------|---------|
 | Aircraft (HD-derived) | 239 | One per tracked ICAO — holds UTXOs for telemetry broadcasts |
-| Agent (ServerWallet) | 3 | Collector, Analyst, Monitor — micropayments and inscriptions |
-| Treasury / Funding | 1 | Top-level wallet that distributes satoshis to aircraft wallets via activity-aware auto-refill (`FUNDING_WALLET_WIF`) |
+| Agent (ServerWallet) | 3 | Collector, Analyst, Monitor — micropayments and inscriptions, topped up from the treasury |
+| Treasury / Funding | 1 | Top-level wallet that distributes satoshis to aircraft wallets via activity-aware auto-refill, and to the agent wallets on a fixed schedule (`FUNDING_WALLET_WIF`) |
 
 The treasury is a standard P2PKH wallet whose outputs are tracked in a dedicated `funding_utxo_pool` table, reconciled against WhatsonChain rather than re-fetched on every refill. Keeping the pool locally means a refill can select and lock several inputs atomically, which is what allows a fragmented treasury to fund a refill from multiple smaller outputs instead of failing while holding ample total value.
 
@@ -310,7 +310,9 @@ runway and held writes throughout.
 
 ### Agent wallets (`@bsv/simple` ServerWallet)
 
-The three marketplace agents each have their own `@bsv/simple` ServerWallet, separate from the HD aircraft wallets. These require independent funding. Set the `*_AGENT_KEY` env vars to persist stable keys across restarts; addresses are logged at startup.
+The three marketplace agents each have their own `@bsv/simple` ServerWallet, separate from the HD aircraft wallets. Set the `*_AGENT_KEY` env vars to persist stable keys across restarts; addresses are logged at startup.
+
+They are funded from the same treasury as the aircraft. The blockchain writer holds the funding key, so it also derives the three agent addresses from those keys and tops them up on the `AGENT_REFILL_*` schedule. Each top-up arrives as `AGENT_REFILL_OUTPUTS` small outputs rather than one large one, because an agent inscribing from a single output has to chain unconfirmed spends and the sequence ends up in the orphan mempool. Set `AGENT_REFILL_ENABLED=false` to fund the agents by hand instead.
 
 ## Environment variables
 

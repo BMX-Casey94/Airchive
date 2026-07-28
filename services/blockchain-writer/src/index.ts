@@ -40,6 +40,7 @@ import { ArcadeSseClient } from "./arcade-sse.js";
 import { StalePoolError, UtxoManager } from "./utxo-manager.js";
 import { FundingUtxoManager } from "./funding-utxo-manager.js";
 import { AutoRefillMonitor, treasuryOutputFloorSats } from "./auto-refill.js";
+import { AgentWalletRefiller, resolveAgentTargets } from "./agent-refill.js";
 import { WriteBuffer } from "./write-buffer.js";
 import { ConfirmationPoller } from "./confirmation-poller.js";
 import { FundingStateMachine } from "./funding-state.js";
@@ -1097,6 +1098,14 @@ async function main(): Promise<void> {
   autoRefill.start();
   writeBuffer.startRetryLoop();
 
+  const agentRefiller = new AgentWalletRefiller(
+    config,
+    broadcaster,
+    fundingUtxoManager,
+    resolveAgentTargets(),
+  );
+  agentRefiller.start();
+
   confirmationPoller = new ConfirmationPoller(
     db,
     config.wocApiUrl,
@@ -1111,6 +1120,9 @@ async function main(): Promise<void> {
   log.info("Running initial auto-refill check (activity-aware bootstrap)");
   void autoRefill.checkAll(false).catch((err) =>
     log.error({ err }, "Initial auto-refill failed"),
+  );
+  void agentRefiller.checkAll().catch((err) =>
+    log.error({ err }, "Initial agent wallet top-up failed"),
   );
 
   startMetricsServer();
@@ -1142,6 +1154,7 @@ async function main(): Promise<void> {
     arcadeSse?.stop();
     fundingState.stop();
     autoRefill.stop();
+    agentRefiller.stop();
     writeBuffer.stopRetryLoop();
     confirmationPoller?.stop();
 

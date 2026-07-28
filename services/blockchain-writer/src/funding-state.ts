@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { PrivateKey } from "@bsv/sdk";
 import type { Knex } from "knex";
 import type { Redis } from "ioredis";
 import { AlertSeverity } from "@airchive/types";
@@ -75,6 +76,12 @@ export class FundingStateMachine {
   private lastBalanceAt = 0;
   private burnEma = 0;
   private cached: FundingSnapshot | null = null;
+  /**
+   * Published so operators can top the treasury up without shelling into the
+   * host to read a log line. Derived from the WIF, which never leaves this
+   * service — the address is public information, the key is not.
+   */
+  private readonly treasuryAddress: string;
 
   constructor(
     private readonly db: Knex,
@@ -84,7 +91,9 @@ export class FundingStateMachine {
     private readonly writeBuffer: WriteBuffer,
     private readonly broadcaster: Broadcaster,
     private readonly publisher: Redis | null = null,
-  ) {}
+  ) {
+    this.treasuryAddress = PrivateKey.fromWif(config.fundingWalletWif).toAddress();
+  }
 
   /**
    * A single refill plus its worst-case fee. Refills combine inputs, so what
@@ -457,6 +466,7 @@ export class FundingStateMachine {
       details: {
         dryThresholdSats: this.dryThresholdSats,
         lowThresholdSats: this.lowThresholdSats,
+        treasuryAddress: this.treasuryAddress,
         ...details,
       },
     });

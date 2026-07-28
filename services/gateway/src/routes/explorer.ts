@@ -23,6 +23,21 @@ const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
 const RECORD_TYPE_FLIGHT_EVENT = 2;
 const MAX_EVENTS_PER_FLIGHT = 64;
+/**
+ * Hard ceiling on a single CSV export. Beyond this the operator should narrow
+ * the time range rather than shipping an unbounded download through the
+ * gateway's memory.
+ */
+const MAX_CSV_ROWS = 100_000;
+const CSV_BATCH_SIZE = 500;
+
+const RECORD_TYPE_LABEL: Record<number, string> = {
+  1: "Telemetry",
+  2: "Flight Event",
+  3: "Telemetry Delta",
+  4: "Agent Record",
+  5: "Agent Record",
+};
 
 /**
  * Recovering an envelope from a miner API costs a network round trip, so a
@@ -136,6 +151,17 @@ function parseEpochMs(raw: string | undefined): number | null | undefined {
 
 function isTruthyFlag(raw: string | undefined): boolean {
   return raw === "true" || raw === "1";
+}
+
+/** RFC 4180: quote every cell so commas and newlines in decoded JSON stay safe. */
+function csvCell(value: unknown): string {
+  const text = value == null ? "" : String(value);
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
+function recordTypeLabel(recordType: number): string {
+  return RECORD_TYPE_LABEL[recordType]
+    ?? `0x${recordType.toString(16).padStart(2, "0")}`;
 }
 
 function toIsoString(value: Date | string): string {
@@ -372,6 +398,246 @@ export async function explorerRoutes(app: FastifyInstance): Promise<void> {
     });
 
     return reply.send(decorated);
+  });
+
+  /**
+   * Lifetime write totals for one aircraft. The listing is paginated, so
+   * anything derived from a page describes the page rather than the aircraft;
+   * these aggregates are the only honest source for a headline figure.
+   */
+  app.get<{
+    Params: { icao: string };
+    Querystring: { from?: string; to?: string };
+  }>("/api/explorer/aircraft/:icao/summary", async (request, reply) => {
+    const icao = request.params.icao.trim().toUpperCase();
+    if (!ICAO_HEX.test(icao)) {
+      return reply.status(400).send({
+        success: false,
+        error: "ICAO must be six hexadecimal characters",
+      });
+    }
+
+    const from = parseEpochMs(request.query.from);
+    const to = parseEpochMs(request.query.to);
+    if (from === null || to === null) {
+      return reply.status(400).send({
+        success: false,
+        error: "from and to must be epoch milliseconds",
+      });
+    }
+
+    const db = getDb();
+    let query = db("tx_results").where({ aircraft_icao: icao });
+    if (from !== undefined) query = query.where("timestamp", ">=", from);
+    if (to !== undefined) query = query.where("timestamp", "<=", to);
+
+    const row = (await query
+      .select(
+        db.raw("count(*)::bigint as total"),
+        db.raw("coalesce(sum(fee_sats), 0)::bigint as fee_sats"),
+        db.raw("coalesce(sum(size_bytes), 0)::bigint as size_bytes"),
+        db.raw("min(timestamp)::bigint as first_seen"),
+        db.raw("max(timestamp)::bigint as last_seen"),
+        db.raw("count(*) filter (where status = 'MINED')::bigint as mined"),
+        db.raw(
+          "count(*) filter (where status = 'SEEN_ON_NETWORK')::bigint as pending",
+        ),
+        db.raw("count(*) filter (where status = 'FAILED')::bigint as failed"),
+        db.raw("count(*) filter (where spv_verified)::bigint as spv_verified"),
+      )
+      .first()) as Record<string, string | number | null> | undefined;
+
+    return reply.send({
+      success: true,
+      data: {
+        icao,
+        total: Number(row?.total ?? 0),
+        feeSats: Number(row?.fee_sats ?? 0),
+        sizeBytes: Number(row?.size_bytes ?? 0),
+        firstSeen: row?.first_seen != null ? Number(row.first_seen) : null,
+        lastSeen: row?.last_seen != null ? Number(row.last_seen) : null,
+        mined: Number(row?.mined ?? 0),
+        pending: Number(row?.pending ?? 0),
+        failed: Number(row?.failed ?? 0),
+        spvVerified: Number(row?.spv_verified ?? 0),
+      },
+    });
+  });
+
+  /**
+   * Full-history CSV for one aircraft. The paginated list only ever holds one
+   * page in the browser; this endpoint is what "Export CSV" actually means.
+   *
+   * Decoded fields are included as a JSON column (and the common telemetry
+   * columns are flattened for spreadsheets). Raw OP_RETURN hex is deliberately
+   * omitted — it is large, opaque, and never what an analyst opens Excel for.
+   * Envelopes are decoded from the stored column only; pre-schema rows without
+   * `op_return` leave `decodedFields` blank rather than hammering miner APIs
+   * for every line of a bulk export.
+   */
+  app.get<{
+    Params: { icao: string };
+    Querystring: { from?: string; to?: string; recordType?: string };
+  }>("/api/explorer/aircraft/:icao/export.csv", async (request, reply) => {
+    const icao = request.params.icao.trim().toUpperCase();
+    if (!ICAO_HEX.test(icao)) {
+      return reply.status(400).send({
+        success: false,
+        error: "ICAO must be six hexadecimal characters",
+      });
+    }
+
+    const from = parseEpochMs(request.query.from);
+    const to = parseEpochMs(request.query.to);
+    if (from === null || to === null) {
+      return reply.status(400).send({
+        success: false,
+        error: "from and to must be epoch milliseconds",
+      });
+    }
+    if (from !== undefined && to !== undefined && from > to) {
+      return reply.status(400).send({
+        success: false,
+        error: "from must not be later than to",
+      });
+    }
+
+    const recordTypeRaw = request.query.recordType;
+    const recordType =
+      recordTypeRaw === undefined || recordTypeRaw.trim() === ""
+        ? undefined
+        : Number(recordTypeRaw);
+    if (recordType !== undefined && ![1, 2, 3, 4, 5].includes(recordType)) {
+      return reply.status(400).send({
+        success: false,
+        error: "recordType must be between 1 and 5",
+      });
+    }
+
+    const db = getDb();
+    let countQuery = db("tx_results").where({ aircraft_icao: icao });
+    if (recordType !== undefined) {
+      countQuery = countQuery.where({ record_type: recordType });
+    }
+    if (from !== undefined) countQuery = countQuery.where("timestamp", ">=", from);
+    if (to !== undefined) countQuery = countQuery.where("timestamp", "<=", to);
+
+    const countRow = (await countQuery
+      .count<{ total: string | number }>("* as total")
+      .first()) as { total?: string | number } | undefined;
+    const total = Number(countRow?.total ?? 0);
+    if (total > MAX_CSV_ROWS) {
+      return reply.status(413).send({
+        success: false,
+        error:
+          `Export would contain ${total.toLocaleString("en-GB")} rows `
+          + `(limit ${MAX_CSV_ROWS.toLocaleString("en-GB")}). Narrow the time `
+          + "range or record-type filter and try again.",
+        total,
+        limit: MAX_CSV_ROWS,
+      });
+    }
+
+    const headers = [
+      "txid",
+      "aircraftIcao",
+      "recordType",
+      "status",
+      "spvVerified",
+      "blockHeight",
+      "timestamp",
+      "feeSats",
+      "sizeBytes",
+      "flightId",
+      "protocolId",
+      "protocolVersion",
+      "callsign",
+      "registration",
+      "aircraftType",
+      "latitude",
+      "longitude",
+      "altitudeFt",
+      "groundSpeedKts",
+      "headingDeg",
+      "verticalRateFpm",
+      "squawk",
+      "onGround",
+      "decodedFields",
+    ];
+
+    const chunks: string[] = [`${headers.map(csvCell).join(",")}\r\n`];
+    let offset = 0;
+
+    while (offset < total) {
+      let pageQuery = db("tx_results")
+        .select([...TX_COLUMNS, "op_return"])
+        .where({ aircraft_icao: icao });
+      if (recordType !== undefined) {
+        pageQuery = pageQuery.where({ record_type: recordType });
+      }
+      if (from !== undefined) pageQuery = pageQuery.where("timestamp", ">=", from);
+      if (to !== undefined) pageQuery = pageQuery.where("timestamp", "<=", to);
+
+      const rows = (await pageQuery
+        .orderBy("timestamp", "desc")
+        .orderBy("txid", "asc")
+        .limit(CSV_BATCH_SIZE)
+        .offset(offset)) as unknown as TxRow[];
+
+      if (rows.length === 0) break;
+
+      for (const row of rows) {
+        const stored = bufferFromColumn(row.op_return);
+        const envelope = stored === null ? null : tryDecodeEnvelope(stored);
+        const fields = envelope?.fields ?? {};
+        const telemetry = envelope ? telemetryFromFields(fields) : null;
+
+        chunks.push(
+          [
+            row.txid,
+            row.aircraft_icao,
+            recordTypeLabel(Number(row.record_type)),
+            row.status,
+            row.spv_verified === true ? "true" : "false",
+            row.block_height ?? "",
+            new Date(Number(row.timestamp)).toISOString(),
+            Number(row.fee_sats),
+            Number(row.size_bytes),
+            row.flight_id ?? "",
+            envelope?.protocolId ?? "",
+            envelope?.version ?? "",
+            telemetry?.callsign ?? "",
+            typeof fields.reg === "string" ? fields.reg : "",
+            typeof fields.aircraft_type === "string" ? fields.aircraft_type : "",
+            telemetry?.latitude ?? "",
+            telemetry?.longitude ?? "",
+            telemetry?.altitudeFt ?? "",
+            telemetry?.groundSpeedKts ?? "",
+            telemetry?.headingDeg ?? "",
+            telemetry?.verticalRateFpm ?? "",
+            telemetry?.squawk ?? "",
+            telemetry?.onGround == null ? "" : telemetry.onGround ? "true" : "false",
+            envelope ? JSON.stringify(fields) : "",
+          ]
+            .map(csvCell)
+            .join(",")
+            + "\r\n",
+        );
+      }
+
+      offset += rows.length;
+      if (rows.length < CSV_BATCH_SIZE) break;
+    }
+
+    const stamp = new Date().toISOString().slice(0, 10);
+    return reply
+      .header("Content-Type", "text/csv; charset=utf-8")
+      .header(
+        "Content-Disposition",
+        `attachment; filename="airchive-${icao}-${stamp}.csv"`,
+      )
+      .header("Cache-Control", "no-store")
+      .send(chunks.join(""));
   });
 
   app.get<{ Params: { txid: string } }>(

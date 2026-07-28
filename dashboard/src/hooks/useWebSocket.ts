@@ -147,7 +147,7 @@ export function useWebSocket() {
   const subscriptionsRef = useRef<Set<string>>(new Set());
   const globeBatchRef = useRef<Map<string, Partial<GlobeAircraftState>>>(new Map());
   const globeFlushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const fetchBusyRef = useRef({ metrics: false, fleet: false });
+  const fetchBusyRef = useRef({ metrics: false, fleet: false, agents: false });
 
   const [connected, setConnected] = useState(false);
 
@@ -161,6 +161,8 @@ export function useWebSocket() {
   const pushAlert = useAlertStore((s) => s.pushAlert);
   const bulkUpdateGlobe = useFleetStore((s) => s.bulkUpdate);
   const pushAgentEvent = useAgentStore((s) => s.pushEvent);
+  const applyAgentGatewayMetrics = useAgentStore((s) => s.applyGatewayMetrics);
+  const markAgentMetricsUnavailable = useAgentStore((s) => s.markMetricsUnavailable);
 
   const flushGlobeBatch = useCallback(() => {
     globeFlushTimer.current = null;
@@ -337,6 +339,37 @@ export function useWebSocket() {
 
     fetchMetrics();
 
+    function fetchAgentMetrics() {
+      if (fetchBusyRef.current.agents) return;
+      fetchBusyRef.current.agents = true;
+      fetch(`${API_URL}/api/agents/metrics`)
+        .then((r) => r.json())
+        .then((json: {
+          success: boolean;
+          data?: {
+            payments_today: number;
+            earned_sats_today: number;
+            spent_sats_today: number;
+            discoveries_today: number;
+          };
+        }) => {
+          if (json.success && json.data) {
+            applyAgentGatewayMetrics({
+              payments: json.data.payments_today,
+              earnedSats: json.data.earned_sats_today,
+              spentSats: json.data.spent_sats_today,
+              discoveries: json.data.discoveries_today,
+            });
+          } else {
+            markAgentMetricsUnavailable();
+          }
+        })
+        .catch(() => { markAgentMetricsUnavailable(); })
+        .finally(() => { fetchBusyRef.current.agents = false; });
+    }
+
+    fetchAgentMetrics();
+
     function fetchFleetSnapshot() {
       if (fetchBusyRef.current.fleet) return;
       fetchBusyRef.current.fleet = true;
@@ -363,6 +396,7 @@ export function useWebSocket() {
     fetchFleetSnapshot();
     const walletInterval = setInterval(fetchFleetSnapshot, 60_000);
     const metricsInterval = setInterval(fetchMetrics, 10_000);
+    const agentMetricsInterval = setInterval(fetchAgentMetrics, 15_000);
 
     const pruneInterval = setInterval(() => {
       useAircraftStore.getState().pruneStale(STALE_AGE_MS);
@@ -371,13 +405,22 @@ export function useWebSocket() {
 
     return () => {
       clearInterval(metricsInterval);
+      clearInterval(agentMetricsInterval);
       clearInterval(walletInterval);
       clearInterval(pruneInterval);
       if (globeFlushTimer.current) clearTimeout(globeFlushTimer.current);
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
       wsRef.current?.close();
     };
-  }, [connect, applyGatewayMetrics, markMetricsUnavailable, setWalletAddresses, updateFleet]);
+  }, [
+    connect,
+    applyGatewayMetrics,
+    markMetricsUnavailable,
+    applyAgentGatewayMetrics,
+    markAgentMetricsUnavailable,
+    setWalletAddresses,
+    updateFleet,
+  ]);
 
   /* ── Subscribe / Unsubscribe ──────────────────────────────── */
 

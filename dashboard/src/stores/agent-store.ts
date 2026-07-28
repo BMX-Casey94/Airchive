@@ -15,16 +15,32 @@ export interface AgentInfo {
   balance?: number;
 }
 
+/**
+ * Mirrors the Analytics store: `gateway` means the counters are the database's
+ * own day totals; `session` means we are accumulating from the live WebSocket
+ * feed only because the gateway could not be reached.
+ */
+export type AgentMetricsSource = "gateway" | "session";
+
 interface AgentStore {
   agents: Record<string, AgentInfo>;
   events: AgentEvent[];
   totalPayments: number;
   totalEarnedSats: number;
   totalSpentSats: number;
+  totalDiscoveries: number;
+  metricsSource: AgentMetricsSource;
 
   pushEvent: (event: AgentEvent) => void;
   updateAgentStatus: (agent: string, status: AgentInfo["status"], balance?: number) => void;
   setAgentIdentity: (agent: string, identityKey: string) => void;
+  applyGatewayMetrics: (metrics: {
+    payments: number;
+    earnedSats: number;
+    spentSats: number;
+    discoveries: number;
+  }) => void;
+  markMetricsUnavailable: () => void;
 }
 
 const MAX_EVENTS = 200;
@@ -56,11 +72,13 @@ export const useAgentStore = create<AgentStore>((set) => ({
   totalPayments: 0,
   totalEarnedSats: 0,
   totalSpentSats: 0,
+  totalDiscoveries: 0,
+  metricsSource: "session",
 
   pushEvent: (event) =>
     set((state) => {
       const events = [event, ...state.events].slice(0, MAX_EVENTS);
-      let { totalPayments, totalEarnedSats, totalSpentSats } = state;
+      let { totalPayments, totalEarnedSats, totalSpentSats, totalDiscoveries } = state;
       const agents = { ...state.agents };
 
       // Any event from a known agent proves it is alive — promote from offline
@@ -79,13 +97,16 @@ export const useAgentStore = create<AgentStore>((set) => ({
         }
       }
 
-      if (event.type === "discovery" && event.data.identityKey) {
-        const existing = agents[event.agent];
-        if (existing) {
-          agents[event.agent] = {
-            ...existing,
-            identityKey: event.data.identityKey as string,
-          };
+      if (event.type === "discovery") {
+        totalDiscoveries++;
+        if (event.data.identityKey) {
+          const existing = agents[event.agent];
+          if (existing) {
+            agents[event.agent] = {
+              ...existing,
+              identityKey: event.data.identityKey as string,
+            };
+          }
         }
       }
 
@@ -100,7 +121,14 @@ export const useAgentStore = create<AgentStore>((set) => ({
         }
       }
 
-      return { events, totalPayments, totalEarnedSats, totalSpentSats, agents };
+      return {
+        events,
+        totalPayments,
+        totalEarnedSats,
+        totalSpentSats,
+        totalDiscoveries,
+        agents,
+      };
     }),
 
   updateAgentStatus: (agent, status, balance) =>
@@ -126,4 +154,15 @@ export const useAgentStore = create<AgentStore>((set) => ({
         },
       };
     }),
+
+  applyGatewayMetrics: (metrics) =>
+    set({
+      totalPayments: metrics.payments,
+      totalEarnedSats: metrics.earnedSats,
+      totalSpentSats: metrics.spentSats,
+      totalDiscoveries: metrics.discoveries,
+      metricsSource: "gateway",
+    }),
+
+  markMetricsUnavailable: () => set({ metricsSource: "session" }),
 }));
