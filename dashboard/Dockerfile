@@ -5,6 +5,9 @@ WORKDIR /app
 FROM base AS deps
 COPY pnpm-lock.yaml pnpm-workspace.yaml package.json ./
 COPY dashboard/package.json dashboard/
+# postinstall runs copy-cesium-assets.mjs, so the scripts tree must exist
+# before pnpm install — package.json alone is not enough.
+COPY dashboard/scripts dashboard/scripts
 RUN pnpm install --frozen-lockfile --filter @airchive/dashboard...
 
 FROM base AS build
