@@ -27,10 +27,22 @@ async function main(): Promise<void> {
         + "Set it to a comma-separated list of the dashboard origins.",
     );
   }
-  await app.register(import("@fastify/cors"), { origin: config.corsOrigin });
+  await app.register(import("@fastify/cors"), {
+    origin: config.corsOrigin,
+    // Preflight must succeed for the dashboard's polling/SWR calls; without
+    // this, browsers report opaque CORS failures rather than the real cause.
+    methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  });
+  // The dashboard polls fleet/metrics/funding/transactions every few seconds
+  // from one browser. The old ceiling of 100/min is crossed within the first
+  // page load; @fastify/rate-limit then answers 429 without CORS headers, and
+  // Chrome surfaces that as a CORS block — which is exactly the "works for a
+  // couple of seconds, then Application error" symptom.
   await app.register(import("@fastify/rate-limit"), {
-    max: 100,
+    max: Number(process.env.GATEWAY_RATE_LIMIT_MAX ?? "2000"),
     timeWindow: "1 minute",
+    allowList: (req) => req.method === "OPTIONS",
   });
 
   await registerAuth(app, config);

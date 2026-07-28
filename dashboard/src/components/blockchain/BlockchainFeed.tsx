@@ -85,7 +85,7 @@ function FeedRow({ entry }: { entry: BlockchainEntry }) {
 
       {/* Aircraft ICAO badge */}
       <span className="flex-shrink-0 rounded bg-deep-navy px-1.5 py-0.5 font-mono text-[10px] text-electric-cyan tabular-nums border border-panel-border">
-        {entry.aircraft_icao.toUpperCase()}
+        {(entry.aircraft_icao ?? "—").toUpperCase()}
       </span>
 
       {/* TxID */}
