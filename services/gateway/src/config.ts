@@ -18,9 +18,13 @@ export interface GatewayConfig {
 function parseCorsOrigin(raw: string | undefined): string | string[] {
   const value = (raw ?? "http://localhost:3000").trim();
   if (value === "*") return "*";
+  // Browsers send Origin without a trailing slash. A value like
+  // https://www.airchive.uk/ would otherwise fail the exact match and the
+  // response would go out with Vary: Origin but no Allow-Origin header —
+  // which the browser reports as a CORS failure.
   const origins = value
     .split(",")
-    .map((entry) => entry.trim())
+    .map((entry) => entry.trim().replace(/\/+$/, ""))
     .filter(Boolean);
   if (origins.length === 0) return "http://localhost:3000";
   return origins.length === 1 ? origins[0]! : origins;
