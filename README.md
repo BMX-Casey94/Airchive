@@ -4,7 +4,7 @@
 
 Airchive ingests multi-source ADS-B telemetry, normalises it into a canonical record model, and drives phase detection, adaptive on-chain write rates, and operator-facing dashboards backed by Redis, PostgreSQL, and BSV infrastructure.
 
-The goal is an auditable, immutable trail of flight activity suitable for safety analytics, insurers, and fleet operations — without naive "one transaction per second per aircraft" economics.
+The goal is an auditable, append-only trail of flight activity suitable for safety analytics, insurers, and fleet operations. Airborne aircraft are archived at the full 1 Hz rate ADS-B broadcasts at — sampling faster would only duplicate records — while cadence drops on the ground and duplicate suppression removes samples carrying no new information. Every mined record is verified by SPV against a locally held, proof-of-work-checked block header rather than an explorer's say-so.
 
 ## Solo Dev
 
@@ -17,8 +17,8 @@ The goal is an auditable, immutable trail of flight activity suitable for safety
 ```
   ADS-B Sources                    BSV Blockchain (Chronicle)
   ┌──────────┐                     ┌──────────────┐
-  │ adsb.fi  │─┐                   │ TAAL ARC     │
-  │ OpenSky  │─┤                   │ Whatsonchain  │
+  │ adsb.fi  │─┐                   │ Arcade       │
+  │ OpenSky  │─┤                   │ (ARC fallbk) │
   │ RTL-SDR  │─┘                   └──────┬───────┘
        │                                  │
        ▼                                  ▲
@@ -47,7 +47,7 @@ The goal is an auditable, immutable trail of flight activity suitable for safety
 
 **Ingestion** polls adsb.fi, OpenSky, and optional RTL-SDR endpoints, merges and deduplicates into `TelemetryRecord` shapes, and publishes to Redis `telemetry:{ICAO}` channels. A **phase engine** subscribes to those channels, runs the flight-phase state machine and adaptive write-rate controller, emits `write:{ICAO}` for the blockchain writer, and broadcasts enriched payloads for real-time consumers. Write rates are configurable per phase via environment variables (`WRITE_RATE_*_MS`).
 
-**Gateway** exposes HTTP APIs and WebSockets for the **dashboard** (globe, fleet grid, alerts, blockchain feed, agent marketplace). **Blockchain writer** consumes `write:{ICAO}` events, builds OP_RETURN transactions with encoded telemetry, and broadcasts via TAAL ARC through a **bounded-concurrency broadcaster** with priority queuing, transient retry with exponential backoff, and a circuit breaker to prevent cascade failures. Each aircraft has its own independently funded wallet — **on-chain broadcasts only occur during active flight periods** (TAXI through LANDING phases). Parked aircraft write at most every 2 minutes, conserving both bandwidth and funds. An **activity-aware auto-refill** monitor tops up wallets only for actively flying aircraft, while the retry buffer coalesces superseded telemetry writes per aircraft and treats orphan-mempool responses optimistically (recording the spend and making the change output immediately available rather than waiting for full propagation).
+**Gateway** exposes HTTP APIs and WebSockets for the **dashboard** (globe, fleet grid, alerts, blockchain feed, agent marketplace). **Blockchain writer** consumes `write:{ICAO}` events, builds OP_RETURN transactions with encoded telemetry, and broadcasts through **Arcade** — a Teranode-native, Arc-compatible endpoint — with TAAL ARC as fallback. Submissions are coalesced into Extended Format batches and status arrives over Arcade's SSE stream rather than inbound callbacks, so no public ingress is required. A **bounded-concurrency broadcaster** applies priority queuing, transient retry with exponential backoff, and a circuit breaker to prevent cascade failures. Each aircraft has its own independently funded wallet, and an **activity-aware auto-refill** monitor tops up wallets only for actively flying aircraft. The retry buffer coalesces superseded telemetry writes per aircraft, and change is only spent once Arcade confirms the parent is genuinely on the network.
 
 **Overlay Node** runs a custom BSV overlay node (`services/overlay-node`) with an `AirchiveTopicManager` (`tm_airchive`) that indexes transactions by filtering for the `AIRCHIVE` protocol prefix in OP_RETURN outputs. It exposes a REST + WebSocket API for querying telemetry records by ICAO, transaction ID, time range, or flight session — providing a self-hosted, BSV-native lookup layer independent of third-party explorers.
 
@@ -57,7 +57,13 @@ The goal is an auditable, immutable trail of flight activity suitable for safety
 |-------|------|---------------|
 | **Collector** | Aggregates live telemetry from Redis and historical data from PostgreSQL; sells data products to other agents | Earns sats from data sales |
 | **Analyst** | Purchases fleet snapshots from Collector, runs anomaly detection and fleet statistics, inscribes analysis summaries on-chain | 5 sats/cycle (fleet_snapshot) + inscription fees |
-| **Monitor** | Round-robin queries live telemetry per aircraft from Collector; periodic monitoring inscriptions | 1 sat/query + inscription fees every 100 cycles |
+| **Monitor** | Round-robin queries live telemetry per aircraft from Collector; inscribes a coverage record once each full fleet sweep completes | 1 sat/query + inscription fees per sweep |
+
+Agent records carry an explicit `windowStart` and `windowEnd` rather than a
+single instant, because a sweep describes an interval and batched transactions
+are mined out of order — arrival time is not a safe proxy for when the data was
+observed. The Analyst inscribes full anomaly objects and stale-aircraft detail,
+not a bare count, so the on-chain record stands alone as evidence.
 
 ## Dashboard
 
@@ -74,9 +80,11 @@ The operator dashboard ([https://airchive.vercel.app](https://airchive.vercel.ap
 | **Emergency Overlay** | Full-screen overlay triggered by squawk 7700/7600/7500 — forces maximum 1s write rate |
 | **Agent Marketplace** | Live view of the three AI agents — messages, on-chain inscriptions, micropayment flows |
 | **Flight History** | Paginated completed flight log with origin/destination, duration, phase breakdown, and linked transactions |
-| **Aircraft Explorer** | Per-aircraft transaction history with decoded payload, block height, Merkle path, and flight session context |
+| **Aircraft Explorer** | Per-aircraft transaction history with decoded payload, block height, inclusion proof, and SPV verification state (verified / proof received / awaiting proof) |
+| **Historical Data** | Per-aircraft view that reads past transactions back off the chain and decodes them into a columnar telemetry table |
+| **Funding Status** | Treasury state (`HEALTHY`, `LOW`, `DRY`, `RECOVERING`), balance, estimated runway and held-write count, with a banner when funding is unhealthy |
 | **Wallet List** | All 239 configured aircraft wallets with BIP44 index and WhatsonChain links, generated automatically from the configured fleet |
-| **Pitch / Cost Calculator** (`/demo`) | Interactive chain-write economics calculator — compare naive 1 tx/s vs Airchive's adaptive rate, adjust fleet size and flight hours, view phase-by-phase write rate breakdown |
+| **Pitch / Cost Calculator** (`/demo`) | Interactive chain-write economics calculator — model the cost of full-fidelity archival per aircraft and per flight hour, adjust fleet size and flight hours, view the phase-by-phase write rate breakdown |
 
 ## BSV Chronicle Compatibility
 
@@ -107,8 +115,11 @@ Every OP_RETURN script is structured as `OP_FALSE OP_RETURN` followed by six ind
 | 2 | 1 | Version | `0x01` |
 | 3 | 3 | ICAO | Aircraft address (packed hex) |
 | 4 | 8 | Timestamp | Epoch milliseconds (LE uint64) |
-| 5 | 1 | Record type | `0x01` telemetry, `0x02` flight event, `0x03` telemetry delta |
+| 5 | 1 | Record type | `0x01` telemetry, `0x02` flight event, `0x03` telemetry delta, `0x04` agent analysis, `0x05` agent monitor |
 | 6 | variable | Payload | MessagePack-encoded telemetry data |
+
+Agent inscriptions share this envelope rather than using a separate format, so a
+single parser reads both telemetry and agent records off the chain.
 
 ## On-chain verifiability
 
@@ -121,14 +132,41 @@ Every aircraft wallet is deterministically derived and publicly verifiable:
 
 To verify any aircraft's on-chain activity, query the wallet list endpoint and follow the WhatsonChain links to inspect the raw transactions.
 
+### SPV verification
+
+A transaction is only marked `MINED` once its inclusion proof has been
+recomputed to a Merkle root matching a block header held locally — and every
+stored header has had its own proof of work checked before being trusted. No
+explorer's assertion that something is confirmed is taken at face value.
+
+- **Header chain:** headers are fetched, proof-of-work validated (the hash must
+  meet its own difficulty target) and stored in `block_headers`. A differing
+  hash at a known height is treated as a reorg, which deletes the header and
+  returns affected transactions for re-verification.
+- **Proofs:** BUMP proofs from Arcade and TSC proofs from WhatsOnChain are both
+  accepted, and both are verified the same way. These services transport proof
+  bytes; they are not trusted to vouch for them, because a forged proof cannot
+  produce a root matching a locally held header.
+- **Honest reporting:** proofs that fail verification are still stored, flagged
+  unverified, and retried. The explorer distinguishes *verified*, *proof
+  received but not yet verified*, and *awaiting proof* rather than collapsing
+  all three into a single confident badge.
+- **Metrics:** `airchive_spv_verifications_total` breaks outcomes down by
+  result, counting a missing header separately from a genuine root mismatch —
+  a lagging sync and an invalid proof are opposite diagnoses.
+
 ## Broadcast shaping and reliability
 
 The blockchain writer includes several production-grade mechanisms to maintain sustained throughput under real-world network conditions:
 
-- **Bounded-concurrency ARC broadcaster** — configurable parallel slots (`ARC_MAX_CONCURRENT_BROADCASTS`, default 48) with a priority queue that favours refills and flight events over routine telemetry
+- **Arcade batching** — submissions are coalesced into Extended Format batches over a short window (`ARCADE_BATCH_WINDOW_MS`, `ARCADE_MAX_BATCH_SIZE`), cutting per-transaction HTTP overhead at high fleet throughput
+- **Bounded-concurrency broadcaster** — configurable parallel slots (`ARC_MAX_CONCURRENT_BROADCASTS`, default 4) with a priority queue that favours refills and flight events over routine telemetry
 - **Transient retry with exponential backoff** — HTTP 500/502/503/504 errors are retried automatically (`ARC_TRANSIENT_RETRY_ATTEMPTS`, default 2) before deferring
-- **Circuit breaker** — opens after repeated transient failures within a time window, pausing broadcasts briefly to prevent cascade overload of ARC
-- **Optimistic orphan-mempool handling** — when ARC returns `SEEN_IN_ORPHAN_MEMPOOL`, the spend is recorded locally and the change output is made immediately available, avoiding UTXO stalls and eliminating double-spend errors from dependency chains
+- **Circuit breaker** — opens after repeated transient failures within a time window, pausing broadcasts briefly to prevent cascade overload
+- **Seen-on-network gate** — change is only spent once Arcade confirms the parent transaction is genuinely on the network. An earlier build optimistically treated `SEEN_IN_ORPHAN_MEMPOOL` as success and spent change the network had never seen, which produced conflicting spends that silently killed an aircraft's whole chain
+- **Rejection unwinding** — a terminally rejected transaction has its phantom outputs purged and the owning wallet reconciled against the chain, whether the rejection arrives over SSE or is found later by the confirmation poller. Skipping this is how one rejection becomes a permanently stuck chain
+- **Conservative UTXO settlement** — an input is only returned to the pool if the network was never offered it. Once broadcast, it stays locked and the wallet reconciles against chain truth, because unlocking risks a second transaction spending it
+- **Treasury reshaping** — the funding pool splits into spendable outputs sized above the refill floor, and consolidates automatically when fragmentation leaves it unable to fund a refill despite holding ample total value
 - **WoC reconciliation deduplication** — funding wallet reconciliation against WhatsonChain is globally deduplicated with rate-limit awareness (30s cooldown, 120s after a 429)
 - **Write coalescing** — the retry buffer keeps only the latest telemetry per aircraft, so stale queued writes are replaced rather than replayed
 
@@ -153,9 +191,13 @@ cp .env.example .env
 
 pnpm install
 pnpm run build
-docker compose up -d   # Postgres + Redis (or run them natively)
+docker compose up -d postgres redis   # or run them natively
 pnpm run db:migrate
 ```
+
+`docker compose up -d` with no arguments brings up the whole stack — Postgres,
+Redis, Arcade, all six services, the dashboard and nginx. For local development
+against `pnpm dev` processes, start only the dependencies as shown above.
 
 Start all services (separate terminals or use a process manager):
 
@@ -183,16 +225,19 @@ pnpm --filter @airchive/dashboard dev
 
 ### Deployment architecture
 
-The **dashboard** is deployed to Vercel (Next.js). All backend services (ingestion, gateway, blockchain-writer, agent-marketplace) run locally and are exposed to the Vercel frontend via a **Cloudflare Tunnel**, providing a secure HTTPS bridge without port forwarding or static IPs. The gateway WebSocket and REST endpoints are tunnelled so the Vercel-hosted dashboard can communicate with the local backend in real time.
+The **dashboard** is deployed to Vercel (Next.js). The backend services run as a Docker Compose stack — Postgres, Redis, Arcade and the six Node services on one internal network, with only the gateway exposed. `deploy/README.md` is the full VPS runbook, covering host preparation, TLS via nginx and certbot, file-backed secrets, verified backups and systemd units for boot.
+
+The gateway's REST and WebSocket endpoints need to be reachable from Vercel. Either terminate TLS at nginx on a domain pointed at the host, or front the gateway with a **named** Cloudflare Tunnel — the latter needs no open ports or certificates and, unlike a quick tunnel, keeps a stable hostname across restarts.
 
 ## Tech stack
 
 - **Runtime:** Node.js 22+, TypeScript, pnpm workspaces
 - **Data:** PostgreSQL 16, Redis 7
 - **Web:** Next.js 15, React 19, Tailwind CSS, Framer Motion, Cesium (globe)
-- **Chain:** BSV mainnet (TAAL ARC, Whatsonchain, `@bsv/sdk`, `@bsv/simple`)
+- **Chain:** BSV mainnet (Arcade primary, TAAL ARC fallback, Whatsonchain, `@bsv/sdk` v2, `@bsv/simple`)
+- **Verification:** SPV — local proof-of-work-checked header chain, BUMP and TSC proof validation
 - **Agent infra:** `@bsv/simple` ServerWallet, BRC-100 Identity Registry, MessageBox P2P
-- **Ops:** Docker Compose, Prometheus metrics, Cloudflare Tunnel (optional)
+- **Ops:** Docker Compose, nginx + certbot, Prometheus metrics, systemd
 
 ## Project structure
 
@@ -207,12 +252,13 @@ The **dashboard** is deployed to Vercel (Next.js). All backend services (ingesti
 | `packages/telemetry-codec` | Binary encoder/decoder for on-chain telemetry payloads |
 | `services/ingestion` | ADS-B ingest (adsb.fi, OpenSky, RTL-SDR), demo replay, phase engine |
 | `services/gateway` | HTTP REST API + WebSocket hub |
-| `services/blockchain-writer` | On-chain writes from Redis `write:*`, UTXO management, activity-aware auto-refill |
+| `services/blockchain-writer` | On-chain writes from Redis `write:*`, UTXO management, activity-aware auto-refill, SPV header store and proof verification, funding state machine |
 | `services/agent-marketplace` | Three autonomous AI agents (Collector, Analyst, Monitor) with BSV micropayments |
 | `services/overlay-node` | BSV overlay node — `tm_airchive` topic manager, `AirchiveLookupService`, REST + WebSocket API |
 | `services/alert-engine` | Configurable alerting (email/SMS via SendGrid/Twilio) |
 | `dashboard` | Next.js operator UI — globe, fleet grid, blockchain feed, agent marketplace panel |
-| `k8s`, `nginx` | Kubernetes manifests and reverse-proxy examples |
+| `deploy` | VPS runbook, systemd units, entrypoint and verified backup/restore scripts |
+| `k8s`, `nginx` | Kubernetes manifests and reverse-proxy configuration |
 
 ## Wallet architecture
 
@@ -226,18 +272,35 @@ The system currently tracks **239 aircraft** in `aircraft_config`, each with its
 | Agent (ServerWallet) | 3 | Collector, Analyst, Monitor — micropayments and inscriptions |
 | Treasury / Funding | 1 | Top-level wallet that distributes satoshis to aircraft wallets via activity-aware auto-refill (`FUNDING_WALLET_WIF`) |
 
-The treasury wallet is a standard P2PKH wallet whose UTXOs are fetched directly from WhatsonChain at refill time — it is not managed in the UTXO pool database.
+The treasury is a standard P2PKH wallet whose outputs are tracked in a dedicated `funding_utxo_pool` table, reconciled against WhatsonChain rather than re-fetched on every refill. Keeping the pool locally means a refill can select and lock several inputs atomically, which is what allows a fragmented treasury to fund a refill from multiple smaller outputs instead of failing while holding ample total value.
 
-**On-chain broadcasts only occur during active flight periods.** Parked aircraft write at most every 2 minutes. Once an aircraft is airborne (TAXI onwards), write rates increase to 10s for taxiing, 1s for takeoff/climb/descent/approach/landing, and 1.5s for cruise. All phase intervals are configurable via `WRITE_RATE_*_MS` environment variables. This means the blockchain is only written to when there is meaningful data to record.
+**Write cadence follows flight state.** A parked aircraft emits a liveness heartbeat every 60s. Taxi phases write every 2s, and every airborne phase writes at 1s — the rate ADS-B itself updates at, so sampling faster would only duplicate records. Writes are additionally triggered the moment a phase change, squawk change, or significant heading, altitude or vertical-rate change is observed, so a manoeuvre is never missed while waiting for the next interval tick. A duplicate-suppression filter, with tighter thresholds airborne than on the ground, drops samples carrying no new information. All intervals are configurable via `WRITE_RATE_*_MS`.
 
 ### Activity-aware auto-refill
 
-The auto-refill monitor runs every 5 minutes and checks each aircraft wallet balance against `REFILL_THRESHOLD_SATS`. It only refills wallets for **actively flying** aircraft — those that have had write channel activity within `REFILL_IDLE_WINDOW_MS` (default 30 minutes). Idle aircraft are skipped to conserve funding, refill broadcasts are serialised, and orphan-mempool dependency responses are backed off rather than treated as hard wallet failures.
+The auto-refill monitor runs every `REFILL_CHECK_INTERVAL_MS` (default 5 seconds) and checks each aircraft wallet balance against `REFILL_THRESHOLD_SATS`. It only refills wallets for **actively flying** aircraft — those with write-channel activity within `REFILL_IDLE_WINDOW_MS` (default 30 minutes). Idle aircraft are skipped to conserve funding.
 
 - **Startup behaviour**: The writer performs an activity-aware check rather than blindly refilling the whole fleet on boot.
-- **Subsequent cycles**: Only active aircraft are refilled; idle ones are skipped.
-- **On-demand refill**: If a UTXO pool is exhausted mid-flight, a refill is requested immediately rather than waiting for the next 5-minute cycle.
+- **On-demand refill**: If a UTXO pool is exhausted mid-flight, a refill is requested immediately rather than waiting for the next cycle.
+- **Multi-input refills**: A refill may draw on several treasury outputs at once, so fragmentation does not block funding while the treasury holds sufficient total value.
 - **Retry shaping**: Deferred telemetry writes are coalesced per aircraft so the queue keeps the latest state instead of every stale sample.
+
+### Funding recovery
+
+Funding state is persisted in Postgres, so it survives restarts of any length
+and no manual intervention is needed beyond sending funds.
+
+On entering `DRY` the writer stops retry churn, raises a `CRITICAL` alert and
+shows a dashboard banner. Held writes in `pending_writes` are preserved rather
+than aged out — the retry-exhaustion purge is skipped entirely while funding is
+unhealthy, so the backlog survives. The funding address is then polled on a
+backoff widening to `FUNDING_DRY_POLL_MAX_MS`, indefinitely.
+
+When funds arrive it reconciles the pool, splits to `FUNDING_POOL_SPLIT_TARGET`,
+refills active aircraft first, then drains the backlog
+`FUNDING_RECOVERY_DRAIN_BATCH` writes at a time so recovery does not stampede
+the broadcaster. `GET /api/system/funding` reports state, balance, estimated
+runway and held writes throughout.
 
 ### Agent wallets (`@bsv/simple` ServerWallet)
 
@@ -289,11 +352,17 @@ The current configured fleet database contains **239 aircraft** across five carr
 |-----------|-------|
 | Configured aircraft | **239** |
 | Realistic concurrent active aircraft | **80–120** (30–50% utilisation) |
-| Weighted-avg tx/s per active aircraft | 0.52 (phase-weighted across in-flight phases) |
-| Observed sustained TX/s (live monitoring) | **16–24 TX/s** (varies with fleet activity) |
-| Peak TX/s (burst — refills + active descents) | **24+ TX/s** |
-| Estimated daily volume (80 concurrent avg) | approx. **1.4–2.1 million transactions/day** |
-| Headroom vs 1.5M/day target | comfortably met at normal utilisation |
+| Weighted-avg tx/s per active aircraft | 0.97 ceiling (phase-weighted, before duplicate suppression) |
+| Measured sustained TX/s | **11 TX/s** mean across active minutes |
+| Measured 90th percentile | **23 TX/s** |
+| Measured peak | **30 TX/s** |
+| Extrapolated daily volume | approx. **0.95M/day** at the mean, **2.0M/day** at p90 |
+
+The measured figures come from a six-hour window of live operation and sit well
+below the phase-weighted ceiling, because duplicate suppression drops samples
+that carry no new information and not every tracked aircraft is airborne at
+once. The gap between ceiling and measurement is the design working, not
+capacity being lost.
 
 The adaptive write-rate controller adjusts per flight phase (defaults shown; all overridable via `WRITE_RATE_*_MS` env vars):
 
@@ -302,19 +371,20 @@ The adaptive write-rate controller adjusts per flight phase (defaults shown; all
 | TAKEOFF / LANDING | 1s | 1.00 | ~4% |
 | CLIMB | 1s | 1.00 | ~8% |
 | DESCENT / APPROACH | 1s | 1.00 | ~12% |
-| CRUISE | 1.5s | 0.67 | ~70% |
-| TAXI | 10s | 0.10 | ~4% |
-| TAXI_IN | 15s | 0.07 | ~2% |
+| CRUISE | 1s | 1.00 | ~70% |
+| TAXI | 2s | 0.50 | ~4% |
+| TAXI_IN | 2s | 0.50 | ~2% |
 | EMERGENCY | 1s | 1.00 | rare |
-| PARKED | 120s | 0.008 | n/a (not in-flight) |
+| PARKED | 60s | 0.017 | n/a (not in-flight) |
 
-With 80–120 aircraft concurrently active, Airchive comfortably sustains the **1.5M transactions/day** target. At full fleet scale with high utilisation (e.g. event periods, major hub rush hours), throughput scales linearly — adding more tracked aircraft directly increases daily volume with no architectural changes required.
+These are ceilings. Duplicate suppression removes samples that carry no new
+information, so realised throughput runs below the table.
 
-Each aircraft wallet is independently funded and manages its own UTXO chain, enabling fully parallel transaction construction with no contention.
+Throughput scales linearly with the tracked fleet — adding aircraft increases daily volume with no architectural change, since each aircraft wallet is independently funded and manages its own UTXO chain, enabling fully parallel transaction construction with no contention.
 
-**Cost estimate:** At the current fee rate of 110 sats/KB, a typical 738-byte aircraft telemetry transaction costs approximately 82 sats. At a sustained 80-aircraft active average this equates to roughly **1.2–1.8 BSV/day** (approx. £14–21 at £11.90/BSV) — well within the economics of commercial aviation data infrastructure. The activity-aware auto-refill system distributes funding automatically from the treasury wallet, topping up only actively flying aircraft.
+**Cost estimate:** At 110 sats/KB, the measured average transaction is 767 bytes and costs 85 sats. At the measured sustained rate that is roughly **0.8 BSV/day** (approx. £10 at £11.90/BSV), rising to about **1.7 BSV/day** (approx. £20) at p90. The activity-aware auto-refill system distributes funding automatically from the treasury, topping up only actively flying aircraft.
 
-In recent local monitoring sessions with the full 239-aircraft database loaded, live traffic sustains **16–24 TX/s** depending on how many aircraft are in active flight phases at that moment. Throughput peaks during descent/approach-heavy periods (e.g. European evening arrivals) and dips during quiet hours when most tracked aircraft are cruising or parked. The ARC broadcaster consistently operates well within capacity (typically 20–45 of 48 concurrent slots, empty queue), confirming the system is write-generation-limited rather than broadcast-limited.
+Throughput peaks during descent- and approach-heavy periods such as European evening arrivals, and dips when most tracked aircraft are cruising or parked. In practice the system is write-generation-limited rather than broadcast-limited: Arcade batching absorbs submission load comfortably, and the constraint is how much genuinely new telemetry the fleet produces.
 
 > The `/demo` route on the dashboard includes an interactive cost calculator where stakeholders can adjust fleet size and flight hours to model their own economics.
 
