@@ -2,7 +2,7 @@ import Fastify from "fastify";
 import { Redis } from "ioredis";
 import { createLogger } from "@airchive/logger";
 import { getDb, closeDb } from "@airchive/db";
-import { loadConfig } from "./config.js";
+import { createCorsOriginDelegate, loadConfig } from "./config.js";
 import { registerAuth } from "./plugins/auth.js";
 import { fleetRoutes, updateAircraftState } from "./routes/fleet.js";
 import { historyRoutes } from "./routes/history.js";
@@ -26,9 +26,14 @@ async function main(): Promise<void> {
       "CORS_ORIGIN is '*': any site can read this API from a visitor's browser. "
         + "Set it to a comma-separated list of the dashboard origins.",
     );
+  } else {
+    log.info(
+      { corsOrigin: config.corsOrigin },
+      "CORS allow-list loaded (trailing slashes stripped)",
+    );
   }
   await app.register(import("@fastify/cors"), {
-    origin: config.corsOrigin,
+    origin: createCorsOriginDelegate(config.corsOrigin),
     // Preflight must succeed for the dashboard's polling/SWR calls; without
     // this, browsers report opaque CORS failures rather than the real cause.
     methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],

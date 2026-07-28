@@ -54,7 +54,28 @@ export async function inscribeAgentRecord(params: {
   }
 
   const timestamp = Date.now();
-  const payload = encodeAgentPayload(record);
+  // Prefer a lean inscription over a broadcast that will fail for fee/UTXO
+  // size. Fleet analysis can grow quickly once anomaly + stale lists fill up.
+  const MAX_AGENT_PAYLOAD_BYTES = 8_192;
+  let working = record;
+  let payload = encodeAgentPayload(working);
+  if (payload.length > MAX_AGENT_PAYLOAD_BYTES) {
+    working = {
+      ...working,
+      anomalies: Array.isArray(working.anomalies)
+        ? (working.anomalies as unknown[]).slice(0, 5)
+        : working.anomalies,
+      stale: Array.isArray(working.stale)
+        ? (working.stale as unknown[]).slice(0, 5)
+        : working.stale,
+      truncated: true,
+    };
+    payload = encodeAgentPayload(working);
+    log.warn(
+      { agent: agentLabel, bytes: payload.length, limit: MAX_AGENT_PAYLOAD_BYTES },
+      "Agent record truncated to fit OP_RETURN budget",
+    );
+  }
   // The codec declares its own RecordType, so the byte is passed as a literal
   // in the same way the blockchain-writer does.
   const recordTypeByte = recordType as 0x04 | 0x05;

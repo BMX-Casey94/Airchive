@@ -57,10 +57,35 @@ function estimateFee(inputCount: number, outputCount: number): number {
   return Math.ceil((size / 1000) * SATS_PER_KB * FEE_BUFFER);
 }
 
+interface ArcBroadcastResult {
+  status?: string;
+  code?: string;
+  txid?: string;
+  description?: string;
+}
+
+/**
+ * ARC returns `status: "error"` for SEEN_IN_ORPHAN_MEMPOOL even when it stored
+ * the transaction under a txid. Treating that as a hard failure made agents
+ * retry immediately, burn the only UTXO, then report `best 0` forever.
+ */
+function acceptedBroadcast(result: ArcBroadcastResult): string | null {
+  if (!result.txid) return null;
+  const code = String(result.code ?? "").trim().toUpperCase();
+  if (code === "SEEN_IN_ORPHAN_MEMPOOL" || code === "SEEN_ON_NETWORK") {
+    return result.txid;
+  }
+  if (result.status === "error") return null;
+  return result.txid;
+}
+
 export class DirectPaymentSender {
   private readonly wocUrl: string;
   private readonly arc: ARC;
   private readonly keys = new Map<string, PrivateKey>();
+  /** Outpoints we have already spent locally — WoC lags behind mempool spends. */
+  private readonly recentlySpent = new Map<string, number>();
+  private static readonly SPENT_TTL_MS = 15 * 60_000;
 
   constructor(wocApiUrl: string, arcUrl: string, arcApiKey: string) {
     this.wocUrl = wocApiUrl;
@@ -81,6 +106,21 @@ export class DirectPaymentSender {
         },
       },
     });
+  }
+
+  private outpointKey(txHash: string, pos: number): string {
+    return `${txHash}:${pos}`;
+  }
+
+  private rememberSpend(txHash: string, pos: number): void {
+    this.recentlySpent.set(this.outpointKey(txHash, pos), Date.now());
+  }
+
+  private pruneSpent(): void {
+    const cutoff = Date.now() - DirectPaymentSender.SPENT_TTL_MS;
+    for (const [key, at] of this.recentlySpent) {
+      if (at < cutoff) this.recentlySpent.delete(key);
+    }
   }
 
   registerKey(label: string, hexKey: string): void {
@@ -110,11 +150,11 @@ export class DirectPaymentSender {
     if (!recipientKey) throw new Error(`Unknown recipient: ${toLabel}`);
 
     const senderAddress = senderKey.toAddress();
-    const utxos = await this.fetchUtxos(senderAddress);
+    const utxos = await this.fetchSpendableUtxos(senderAddress);
 
     const fee = estimateFee(1, 2);
     const needed = amountSats + fee + MIN_CHANGE_SATS;
-    const suitable = utxos.find((u) => u.value >= needed);
+    const suitable = pickUtxo(utxos, needed);
     if (!suitable) {
       const best = Math.max(0, ...utxos.map((u) => u.value));
       throw new Error(`No suitable UTXO for ${fromLabel}: need ${needed}, best ${best}`);
@@ -145,17 +185,22 @@ export class DirectPaymentSender {
 
     await tx.sign();
 
-    const result = await this.arc.broadcast(tx);
-    if (result.status === "error" || !result.txid) {
+    const result = (await this.arc.broadcast(tx)) as ArcBroadcastResult;
+    const txid = acceptedBroadcast(result);
+    if (!txid) {
       throw new Error(`Broadcast failed: ${JSON.stringify(result)}`);
     }
+    this.rememberSpend(suitable.tx_hash, suitable.tx_pos);
 
+    const orphan = String(result.code ?? "").toUpperCase() === "SEEN_IN_ORPHAN_MEMPOOL";
     log.info(
-      { from: fromLabel, to: toLabel, amount: amountSats, txid: result.txid, fee },
-      "Direct P2PKH payment sent",
+      { from: fromLabel, to: toLabel, amount: amountSats, txid, fee, orphan },
+      orphan
+        ? "Direct P2PKH payment accepted into orphan mempool (parent still propagating)"
+        : "Direct P2PKH payment sent",
     );
 
-    return { txid: result.txid, feeSats: fee };
+    return { txid, feeSats: fee };
   }
 
   async inscribe(
@@ -177,7 +222,7 @@ export class DirectPaymentSender {
     if (!senderKey) throw new Error(`Unknown sender: ${fromLabel}`);
 
     const senderAddress = senderKey.toAddress();
-    const utxos = await this.fetchUtxos(senderAddress);
+    const utxos = await this.fetchSpendableUtxos(senderAddress);
 
     const opReturnScript = Script.fromBinary(scriptBytes);
 
@@ -190,7 +235,7 @@ export class DirectPaymentSender {
     const fee = Math.ceil((txSize / 1000) * SATS_PER_KB * FEE_BUFFER);
     const needed = fee + MIN_CHANGE_SATS;
 
-    const suitable = utxos.find((u) => u.value >= needed);
+    const suitable = pickUtxo(utxos, needed);
     if (!suitable) {
       const best = Math.max(0, ...utxos.map((u) => u.value));
       throw new Error(`No suitable UTXO for ${fromLabel} inscription: need ${needed}, best ${best}`);
@@ -219,25 +264,43 @@ export class DirectPaymentSender {
 
     await tx.sign();
 
-    const result = await this.arc.broadcast(tx);
-    if (result.status === "error" || !result.txid) {
+    const result = (await this.arc.broadcast(tx)) as ArcBroadcastResult;
+    const txid = acceptedBroadcast(result);
+    if (!txid) {
       throw new Error(`Inscription broadcast failed: ${JSON.stringify(result)}`);
     }
+    this.rememberSpend(suitable.tx_hash, suitable.tx_pos);
 
+    const orphan = String(result.code ?? "").toUpperCase() === "SEEN_IN_ORPHAN_MEMPOOL";
     log.info(
-      { from: fromLabel, txid: result.txid, fee, scriptLen: scriptBytes.length },
-      "Direct OP_RETURN inscription sent",
+      { from: fromLabel, txid, fee, scriptLen: scriptBytes.length, orphan },
+      orphan
+        ? "Direct OP_RETURN inscription accepted into orphan mempool"
+        : "Direct OP_RETURN inscription sent",
     );
 
-    return { txid: result.txid, feeSats: fee, sizeBytes: tx.toBinary().length };
+    return { txid, feeSats: fee, sizeBytes: tx.toBinary().length };
   }
 
-  private async fetchUtxos(address: string): Promise<WocUtxo[]> {
+  private async fetchSpendableUtxos(address: string): Promise<WocUtxo[]> {
+    this.pruneSpent();
     const res = await fetch(`${this.wocUrl}/address/${address}/unspent`, {
       headers: { Accept: "application/json" },
       signal: AbortSignal.timeout(10_000),
     });
     if (!res.ok) return [];
-    return (await res.json()) as WocUtxo[];
+    const utxos = (await res.json()) as WocUtxo[];
+    return utxos.filter(
+      (u) => !this.recentlySpent.has(this.outpointKey(u.tx_hash, u.tx_pos)),
+    );
   }
+}
+
+/** Prefer confirmed UTXOs so agent chains do not keep landing in the orphan mempool. */
+function pickUtxo(utxos: WocUtxo[], needed: number): WocUtxo | undefined {
+  const funded = utxos.filter((u) => u.value >= needed);
+  if (funded.length === 0) return undefined;
+  const confirmed = funded.filter((u) => u.height > 0);
+  const pool = confirmed.length > 0 ? confirmed : funded;
+  return pool.sort((a, b) => a.value - b.value)[0];
 }

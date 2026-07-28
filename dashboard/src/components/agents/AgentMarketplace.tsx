@@ -76,9 +76,13 @@ function EventRow({ event }: { event: AgentEvent }) {
     detail = event.data.message as string;
   } else if (event.type === "analysis") {
     const txid = event.data.txid as string;
-    detail = txid !== "pending"
-      ? `Published: ${txid.slice(0, 12)}...`
-      : event.data.summary as string;
+    if (!txid || txid === "pending") {
+      detail = event.data.summary as string;
+    } else if (txid === "failed") {
+      detail = "Inscription failed (check agent wallet UTXOs)";
+    } else {
+      detail = `Published: ${txid.slice(0, 12)}...`;
+    }
   } else if (event.type === "message") {
     detail = `→ ${event.data.to}: ${event.data.messageType}`;
   } else {

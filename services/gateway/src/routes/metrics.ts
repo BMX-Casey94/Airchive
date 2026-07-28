@@ -17,7 +17,6 @@ export async function metricsRoutes(app: FastifyInstance): Promise<void> {
     const todayStartMs = new Date();
     todayStartMs.setUTCHours(0, 0, 0, 0);
     const todayEpoch = todayStartMs.getTime();
-    const recentWindowEpoch = Date.now() - 60_000;
 
     const [txToday, totalBytes, aircraftCount, pendingCount, totalSats, minedToday, failedToday, pendingToday, recentTxCount] = await Promise.all([
       db("tx_results")
@@ -54,8 +53,12 @@ export async function metricsRoutes(app: FastifyInstance): Promise<void> {
         .where("status", "SEEN_ON_NETWORK")
         .count("* as total")
         .first() as Promise<CountRow>,
+      // created_at is `timestamp without time zone` written by the database's
+      // own now(). Comparing it against a JS Date makes the answer depend on
+      // the gateway container's clock and timezone, which is how this reads
+      // zero on a busy system. Let Postgres evaluate the window instead.
       db("tx_results")
-        .where("created_at", ">=", new Date(recentWindowEpoch))
+        .whereRaw("created_at >= now() - interval '60 seconds'")
         .count("* as total")
         .first() as Promise<CountRow>,
     ]);

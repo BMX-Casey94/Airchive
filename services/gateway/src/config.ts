@@ -14,20 +14,50 @@ export interface GatewayConfig {
  * legitimately needs access — the custom domain and the hosting provider's own
  * URL, at least. A bare string cannot express that, which is how deployments
  * end up reaching for `*`.
+ *
+ * Browsers send Origin without a trailing slash. Values like
+ * `https://www.airchive.uk/` must be normalised or the exact match fails and
+ * the response goes out with `Vary: Origin` but no `Allow-Origin` header —
+ * which Chrome reports as a CORS failure (often on a 200).
  */
-function parseCorsOrigin(raw: string | undefined): string | string[] {
+export function parseCorsOrigin(raw: string | undefined): string | string[] {
   const value = (raw ?? "http://localhost:3000").trim();
   if (value === "*") return "*";
-  // Browsers send Origin without a trailing slash. A value like
-  // https://www.airchive.uk/ would otherwise fail the exact match and the
-  // response would go out with Vary: Origin but no Allow-Origin header —
-  // which the browser reports as a CORS failure.
   const origins = value
     .split(",")
     .map((entry) => entry.trim().replace(/\/+$/, ""))
     .filter(Boolean);
   if (origins.length === 0) return "http://localhost:3000";
   return origins.length === 1 ? origins[0]! : origins;
+}
+
+/** Normalise an Origin / allow-list entry for comparison. */
+export function normaliseOrigin(origin: string): string {
+  return origin.trim().replace(/\/+$/, "");
+}
+
+/**
+ * @fastify/cors `origin` option: reflect matching request origins, reject
+ * others. Re-normalises both sides so a trailing slash left in `.env` cannot
+ * break production again.
+ */
+export type CorsOriginCallback = (err: Error | null, allow: boolean | string) => void;
+export type CorsOriginDelegate = (origin: string | undefined, cb: CorsOriginCallback) => void;
+
+export function createCorsOriginDelegate(
+  allowed: string | string[],
+): boolean | CorsOriginDelegate {
+  if (allowed === "*") return true;
+  const list = (Array.isArray(allowed) ? allowed : [allowed]).map(normaliseOrigin);
+  return (origin, cb) => {
+    // Non-browser clients (curl, server-to-server) omit Origin.
+    if (!origin) {
+      cb(null, true);
+      return;
+    }
+    const normalised = normaliseOrigin(origin);
+    cb(null, list.includes(normalised) ? origin : false);
+  };
 }
 
 export function loadConfig(): GatewayConfig {

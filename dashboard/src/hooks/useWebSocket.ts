@@ -156,6 +156,8 @@ export function useWebSocket() {
   const setWalletAddresses = useAircraftStore((s) => s.setWalletAddresses);
   const pushEntry = useBlockchainStore((s) => s.pushEntry);
   const setDailySummary = useBlockchainStore((s) => s.setDailySummary);
+  const applyGatewayMetrics = useBlockchainStore((s) => s.applyGatewayMetrics);
+  const markMetricsUnavailable = useBlockchainStore((s) => s.markMetricsUnavailable);
   const pushAlert = useAlertStore((s) => s.pushAlert);
   const bulkUpdateGlobe = useFleetStore((s) => s.bulkUpdate);
   const pushAgentEvent = useAgentStore((s) => s.pushEvent);
@@ -315,7 +317,7 @@ export function useWebSocket() {
         .then((r) => r.json())
         .then((json: { success: boolean; data?: { transactions_today: number; bytes_on_chain_today: number; bsv_cost_today_sats: number; mined_today?: number; pending_today?: number; failed_today?: number; active_aircraft?: number; tx_per_second?: number } }) => {
           if (json.success && json.data) {
-            setDailySummary({
+            applyGatewayMetrics({
               txCount: json.data.transactions_today,
               totalBytes: json.data.bytes_on_chain_today,
               totalSats: json.data.bsv_cost_today_sats,
@@ -325,9 +327,11 @@ export function useWebSocket() {
               trackedAircraftCount: json.data.active_aircraft ?? 0,
               txPerSecond: json.data.tx_per_second ?? 0,
             });
+          } else {
+            markMetricsUnavailable();
           }
         })
-        .catch(() => {})
+        .catch(() => { markMetricsUnavailable(); })
         .finally(() => { fetchBusyRef.current.metrics = false; });
     }
 
@@ -373,7 +377,7 @@ export function useWebSocket() {
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
       wsRef.current?.close();
     };
-  }, [connect, setDailySummary, setWalletAddresses, updateFleet]);
+  }, [connect, applyGatewayMetrics, markMetricsUnavailable, setWalletAddresses, updateFleet]);
 
   /* ── Subscribe / Unsubscribe ──────────────────────────────── */
 

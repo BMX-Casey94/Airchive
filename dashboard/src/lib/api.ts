@@ -8,8 +8,9 @@ export { apiBaseUrl };
  * sessionStorage when available so authenticated endpoints work seamlessly.
  */
 export async function fetcher<T = unknown>(url: string): Promise<T> {
+  // Do not set Content-Type on GET — it forces a CORS preflight for no benefit
+  // and amplifies any Allow-Origin misconfiguration into opaque fetch failures.
   const headers: HeadersInit = {
-    "Content-Type": "application/json",
     Accept: "application/json",
   };
 

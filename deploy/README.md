@@ -71,7 +71,8 @@ Edit `.env` with the non-sensitive settings, including:
 PUBLIC_DOMAIN=airchive.example.com
 PUBLIC_ORIGIN=https://airchive.example.com
 PUBLIC_WS_ORIGIN=wss://airchive.example.com/ws
-CORS_ORIGIN=https://airchive.example.com
+# No trailing slash. Include www and apex if both serve the dashboard.
+CORS_ORIGIN=https://www.airchive.example.com,https://airchive.example.com
 POSTGRES_DB=airchive
 POSTGRES_USER=airchive
 BACKUP_PATH=/var/backups/airchive

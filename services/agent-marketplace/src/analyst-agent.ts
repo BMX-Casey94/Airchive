@@ -26,8 +26,9 @@ const log = createLogger({ service: "analyst-agent" });
  * has to fit an OP_RETURN comfortably. Highest severity first, so a truncated
  * list never drops a critical event in favour of an informational one.
  */
-const MAX_INSCRIBED_ANOMALIES = 25;
-const MAX_INSCRIBED_STALE = 50;
+const MAX_INSCRIBED_ANOMALIES = 15;
+/** Keep the OP_RETURN under a UTXO that agent wallets can actually fund. */
+const MAX_INSCRIBED_STALE = 20;
 /** Two missed inscriptions in a row means the agent is not actually working. */
 const UNHEALTHY_FAILURE_STREAK = 2;
 
