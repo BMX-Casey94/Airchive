@@ -8,8 +8,11 @@
 # a plaintext .env, in `docker inspect`, or in the process environment of a
 # child that only needs the value indirectly.
 #
-# A missing or unreadable file is fatal: starting with a silently absent seed
-# would derive the wrong wallets and write to addresses nobody controls.
+# Docker mounts secrets as root:root mode 0400. This script therefore starts as
+# root, loads the files, then drops to the `node` user before exec'ing the
+# service. A missing or unreadable file is fatal: starting with a silently
+# absent seed would derive the wrong wallets and write to addresses nobody
+# controls.
 set -eu
 
 for name in $(env | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)_FILE=.*/\1/p'); do
@@ -34,5 +37,9 @@ for name in $(env | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)_FILE=.*/\1/p'); do
 done
 
 unset secret_path secret_value file_var name 2>/dev/null || true
+
+if [ "$(id -u)" = "0" ]; then
+  exec su-exec node:node "$@"
+fi
 
 exec "$@"

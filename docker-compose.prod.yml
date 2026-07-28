@@ -9,7 +9,8 @@
 #     and resolved by deploy/docker-entrypoint.sh through the *_FILE convention,
 #     so the wallet seed, funding WIF, database password and API keys never
 #     appear in `docker inspect`, in the shell history, or in a world-readable
-#     file. Keep the remaining non-sensitive settings in `.env`.
+#     file. The entrypoint starts as root (secrets are root:root 0400), loads
+#     them, then drops to the `node` user. Keep non-sensitive settings in `.env`.
 #
 #  2. EXPOSURE. Only nginx publishes ports. Postgres, Redis, Arcade, the
 #     gateway, the overlay node and the dashboard become reachable only from

@@ -53,7 +53,9 @@ COPY --from=deps /app/packages/logger/node_modules packages/logger/node_modules
 COPY --from=deps /app/packages/telemetry-codec/node_modules packages/telemetry-codec/node_modules
 COPY --from=deps /app/services/agent-marketplace/node_modules services/agent-marketplace/node_modules
 COPY deploy/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
-USER node
+# Entrypoint starts as root so it can read Docker's 0400 secret mounts, then
+# drops to `node` via su-exec before the service process starts.
+RUN apk add --no-cache su-exec \
+  && chmod 0755 /usr/local/bin/docker-entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["node", "services/agent-marketplace/dist/index.js"]

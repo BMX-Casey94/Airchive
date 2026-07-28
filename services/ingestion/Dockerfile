@@ -62,7 +62,9 @@ COPY --from=deps /app/packages/flight-phase/node_modules packages/flight-phase/n
 COPY --from=deps /app/packages/db/node_modules packages/db/node_modules
 COPY --from=deps /app/services/ingestion/node_modules services/ingestion/node_modules
 COPY deploy/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
-USER node
+# Entrypoint starts as root so it can read Docker's 0400 secret mounts, then
+# drops to `node` via su-exec before the service process starts.
+RUN apk add --no-cache su-exec \
+  && chmod 0755 /usr/local/bin/docker-entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["node", "services/ingestion/dist/index.js"]
