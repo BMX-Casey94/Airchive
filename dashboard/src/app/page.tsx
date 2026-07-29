@@ -174,12 +174,6 @@ export default function DashboardPage() {
       <DashboardLogo />
 
       <div className="grid grid-cols-1 gap-3 lg:gap-4 lg:grid-cols-12 auto-rows-min">
-        {/* Renders only when the treasury is dry or the writer has gone
-            quiet; the full panel lives at the foot of the page. */}
-        <section className="lg:col-span-12 empty:hidden">
-          <FundingStatus variant="banner" />
-        </section>
-
         {/* ── Row 1: 3D Globe (full width, hero) ──────────── */}
         <section className="lg:col-span-12" style={{ minHeight: "50vh" }}>
           <Suspense fallback={<PanelSkeleton className="h-full min-h-[50vh]" />}>
