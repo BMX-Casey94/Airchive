@@ -75,13 +75,6 @@ const BLOCK_REQUEST_TIMEOUT_MS = 60_000;
 /** Floor between nudge-driven cycles, so a burst cannot outpace the timer. */
 const MIN_NUDGE_INTERVAL_MS = CATCHUP_INTERVAL_MS;
 /**
- * How many pending rows to test against cached trees each cycle. Membership is
- * an in-memory Map lookup, so this settles thousands of confirmations with
- * zero additional provider requests — which is how catch-up outruns ~25 TPS
- * without touching the rate limit.
- */
-const CACHE_SWEEP_CANDIDATES = 12_000;
-/**
  * Heights considered when draining the backlog. Rows already known to be in a
  * block carry the height, so the busiest heights can be found with one grouped
  * query and settled without asking any provider whether they are mined.
@@ -438,15 +431,21 @@ export class ConfirmationPoller {
       }
     }
 
-    const downloadCandidates = [...byHeight.entries()]
-      .filter(([height, rows]) => {
-        if (this.blockTrees.has(height)) return false;
-        // Skip heights whose rows were already settled via another path.
-        return rows.some((row) => !done.has(row.txid))
-          && rows.length >= MIN_ROWS_FOR_BLOCK_PROOF;
-      })
-      .sort((a, b) => b[1].length - a[1].length)
-      .slice(0, MAX_BLOCKS_PER_CYCLE);
+    // While catching up, every download belongs to the backlog drain, which
+    // clears a whole block rather than the handful of rows this batch happens
+    // to hold. Rows here have had their height recorded, so the drain reaches
+    // them next cycle regardless.
+    const downloadCandidates = this.mode === "catchup"
+      ? []
+      : [...byHeight.entries()]
+          .filter(([height, rows]) => {
+            if (this.blockTrees.has(height)) return false;
+            // Skip heights whose rows were already settled via another path.
+            return rows.some((row) => !done.has(row.txid))
+              && rows.length >= MIN_ROWS_FOR_BLOCK_PROOF;
+          })
+          .sort((a, b) => b[1].length - a[1].length)
+          .slice(0, MAX_BLOCKS_PER_CYCLE);
 
     for (const [height, rows] of downloadCandidates) {
       try {
@@ -565,7 +564,10 @@ export class ConfirmationPoller {
    */
   private async drainHeight(height: number, done: Set<string>): Promise<number> {
     const cached = await this.ensureBlockTree(height);
-    if (!cached) return 0;
+    if (!cached) {
+      log.warn({ height }, "Backlog height could not be verified — no block tree");
+      return 0;
+    }
 
     const blockTxids = [...cached.tree.indexOf.keys()];
     let confirmed = 0;
@@ -583,62 +585,19 @@ export class ConfirmationPoller {
       confirmed += await this.confirmRowsFromTree(height, rows, done);
     }
 
-    if (ours > 0) {
+    // The whole block has just been compared against the backlog, so anything
+    // still pending and still stamped with this height is provably not in it.
+    // Clearing the bad stamp is what stops such rows sitting at the top of the
+    // busiest-heights list and spending a block download every cycle for
+    // nothing, which is exactly what three of every four downloads were doing.
+    const cleared = await this.db("tx_results")
+      .where({ status: "SEEN_ON_NETWORK", block_height: height })
+      .update({ block_height: null, last_checked_at: this.db.fn.now() });
+
+    if (ours > 0 || cleared > 0) {
       log.info(
-        { height, blockTxCount: cached.blockTxCount, ours, confirmed },
+        { height, blockTxCount: cached.blockTxCount, ours, confirmed, staleStamps: cleared },
         "Matched a verified block against the pending backlog",
-      );
-    }
-
-    return confirmed;
-  }
-
-  /**
-   * Settles pending rows that sit inside a tree we already hold, without any
-   * further provider calls. Catches rows whose height was never recorded, so
-   * they are proved without ever being asked about individually.
-   */
-  private async sweepAgainstCachedTrees(
-    alreadyDone: Set<string>,
-  ): Promise<number> {
-    if (this.blockTrees.size === 0) return 0;
-
-    const candidates = (await this.db("tx_results")
-      .where("status", "SEEN_ON_NETWORK")
-      .where("timestamp", "<=", Date.now() - MIN_CONFIRMATION_AGE_MS)
-      .select(ConfirmationPoller.PENDING_COLUMNS)
-      .orderByRaw("last_checked_at ASC NULLS FIRST")
-      .limit(CACHE_SWEEP_CANDIDATES)) as PendingTxRow[];
-
-    if (candidates.length === 0) return 0;
-
-    const byHeight = new Map<number, PendingTxRow[]>();
-    for (const row of candidates) {
-      if (alreadyDone.has(row.txid)) continue;
-      const txid = row.txid.toLowerCase();
-      for (const [height, entry] of this.blockTrees) {
-        if (!entry.tree.indexOf.has(txid)) continue;
-        const group = byHeight.get(height);
-        if (group) group.push(row);
-        else byHeight.set(height, [row]);
-        break;
-      }
-    }
-
-    let confirmed = 0;
-    for (const [height, rows] of byHeight) {
-      confirmed += await this.confirmRowsFromTree(height, rows, alreadyDone);
-    }
-
-    if (confirmed > 0) {
-      log.info(
-        {
-          confirmed,
-          scanned: candidates.length,
-          cachedBlocks: this.blockTrees.size,
-          heights: [...byHeight.keys()],
-        },
-        "Swept pending transactions against cached block trees",
       );
     }
 
@@ -1051,10 +1010,6 @@ export class ConfirmationPoller {
       const settled = await this.verifyBlockBatches(pending, mined);
       confirmed += settled.confirmed;
       for (const txid of drainDone) settled.done.add(txid);
-
-      // Zero-RPS catch-up: every pending row that sits inside a tree we already
-      // hold can be proved without asking a provider again.
-      confirmed += await this.sweepAgainstCachedTrees(settled.done);
 
       const remaining = pending.filter((row) => !settled.done.has(row.txid));
       let perTxProofBudget = MAX_PER_TX_PROOFS_PER_CYCLE;

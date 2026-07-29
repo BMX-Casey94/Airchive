@@ -17,7 +17,7 @@ const STORE = "trails";
 /** Older than this and the path is history, not a flight in progress. */
 const MAX_TRAIL_AGE_MS = 6 * 60 * 60 * 1_000;
 /** Cap per aircraft on disk, mirroring the in-memory buffer. */
-const MAX_POINTS_PER_TRAIL = 600;
+const MAX_POINTS_PER_TRAIL = 1_500;
 
 interface StoredTrail {
   icao: string;
@@ -94,11 +94,27 @@ export async function loadPersistedTrails(): Promise<Map<string, PositionSnapsho
   return trails;
 }
 
+/**
+ * Point counts already written, so a fleet-wide save only touches the paths
+ * that actually grew. Rewriting every trail on each tick would mean cloning
+ * hundreds of thousands of points into the store for no reason, which is
+ * enough work to be visible as jank on the main thread.
+ */
+const persistedLengths = new Map<string, number>();
+
 export async function persistTrails(
   trails: Map<string, PositionSnapshot[]>,
 ): Promise<void> {
   const db = await openDb();
   if (!db) return;
+
+  const changed: Array<[string, PositionSnapshot[]]> = [];
+  for (const [icao, points] of trails) {
+    if (points.length === 0) continue;
+    if (persistedLengths.get(icao) === points.length) continue;
+    changed.push([icao, points]);
+  }
+  if (changed.length === 0) return;
 
   await new Promise<void>((resolve) => {
     try {
@@ -106,8 +122,7 @@ export async function persistTrails(
       const store = tx.objectStore(STORE);
       const updatedAt = Date.now();
 
-      for (const [icao, points] of trails) {
-        if (points.length === 0) continue;
+      for (const [icao, points] of changed) {
         const record: StoredTrail = {
           icao,
           points: points.slice(-MAX_POINTS_PER_TRAIL),
@@ -116,7 +131,12 @@ export async function persistTrails(
         store.put(record);
       }
 
-      tx.oncomplete = () => resolve();
+      tx.oncomplete = () => {
+        for (const [icao, points] of changed) {
+          persistedLengths.set(icao, points.length);
+        }
+        resolve();
+      };
       tx.onerror = () => resolve();
       tx.onabort = () => resolve();
     } catch {

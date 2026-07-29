@@ -1,8 +1,45 @@
 import { create } from "zustand";
 import type { AircraftState, PositionSnapshot } from "@/types/dashboard";
 
-const TRAIL_BUFFER_SIZE = 600;
-const MIN_TRAIL_DISTANCE_DEG = 0.0002; // ~22m — capture fine-grained movement
+/**
+ * Points held per aircraft. This is a ceiling on memory, not on how much of a
+ * flight is kept: once reached, the older part of the path is thinned rather
+ * than truncated, so the whole route from first contact survives at gradually
+ * coarser resolution while the recent stretch stays exact.
+ */
+const TRAIL_BUFFER_SIZE = 1_500;
+/** Newest points never thinned, so manoeuvring detail is not lost. */
+const TRAIL_RECENT_KEEP = 500;
+const MIN_TRAIL_DISTANCE_DEG = 0.0005; // ~55m — fine enough for taxi movement
+
+/**
+ * A trail kept only until the aircraft went quiet would restart from a single
+ * point every time it came back. Holding the path well past the aircraft's own
+ * staleness window is what lets a returning flight show where it came from.
+ */
+const TRAIL_RETENTION_MS = 6 * 60 * 60 * 1_000;
+
+/**
+ * Appends a point, halving the resolution of the older section when the buffer
+ * is full. Dropping every other old point costs detail in proportion to age
+ * and never loses the shape of the route, where slicing off the front would
+ * discard the departure entirely.
+ */
+function appendTrailPoint(
+  existing: PositionSnapshot[] | undefined,
+  snapshot: PositionSnapshot,
+): PositionSnapshot[] {
+  const next = existing ? [...existing, snapshot] : [snapshot];
+  if (next.length <= TRAIL_BUFFER_SIZE) return next;
+
+  const split = next.length - TRAIL_RECENT_KEEP;
+  const thinned = next.slice(0, split).filter((_, i) => i % 2 === 0);
+  return [...thinned, ...next.slice(split)];
+}
+
+function trailLastSeen(points: PositionSnapshot[]): number {
+  return points.length === 0 ? 0 : points[points.length - 1]!.ts;
+}
 
 interface FleetState {
   /** Live aircraft keyed by ICAO hex. */
@@ -83,14 +120,15 @@ export const useFleetStore = create<FleetState>()((set, get) => ({
           Math.abs(merged.lon - last.lon) > MIN_TRAIL_DISTANCE_DEG;
 
         if (moved) {
-          const snapshot: PositionSnapshot = {
-            lat: merged.lat,
-            lon: merged.lon,
-            alt: merged.altBaro,
-            ts: merged.lastSeen,
-          };
-          const updated = [...existing, snapshot].slice(-TRAIL_BUFFER_SIZE);
-          nextTrails.set(icao, updated);
+          nextTrails.set(
+            icao,
+            appendTrailPoint(existing, {
+              lat: merged.lat,
+              lon: merged.lon,
+              alt: merged.altBaro,
+              ts: merged.lastSeen,
+            }),
+          );
         }
       }
 
@@ -139,14 +177,15 @@ export const useFleetStore = create<FleetState>()((set, get) => ({
             Math.abs(merged.lon - last.lon) > MIN_TRAIL_DISTANCE_DEG;
 
           if (moved) {
-            const snapshot: PositionSnapshot = {
-              lat: merged.lat,
-              lon: merged.lon,
-              alt: merged.altBaro,
-              ts: merged.lastSeen,
-            };
-            const updated = [...existing, snapshot].slice(-TRAIL_BUFFER_SIZE);
-            nextTrails.set(icao, updated);
+            nextTrails.set(
+              icao,
+              appendTrailPoint(existing, {
+                lat: merged.lat,
+                lon: merged.lon,
+                alt: merged.altBaro,
+                ts: merged.lastSeen,
+              }),
+            );
           }
         }
       }
@@ -157,12 +196,12 @@ export const useFleetStore = create<FleetState>()((set, get) => ({
   removeAircraft: (icao) =>
     set((state) => {
       const nextAircraft = new Map(state.aircraft);
-      const nextTrails = new Map(state.trails);
       nextAircraft.delete(icao);
-      nextTrails.delete(icao);
+      // The trail deliberately stays. Nothing draws it while the aircraft is
+      // gone, and keeping it means a reappearance shows the full route flown
+      // rather than starting again from a single point.
       return {
         aircraft: nextAircraft,
-        trails: nextTrails,
         selectedIcao: state.selectedIcao === icao ? null : state.selectedIcao,
         selectedFlightId:
           state.selectedIcao === icao ? null : state.selectedFlightId,
@@ -203,19 +242,28 @@ export const useFleetStore = create<FleetState>()((set, get) => ({
     let pruned = 0;
     set((state) => {
       const nextAircraft = new Map<string, AircraftState>();
-      const nextTrails = new Map<string, PositionSnapshot[]>();
       for (const [icao, ac] of state.aircraft) {
         if (now - ac.lastSeen < maxAgeMs || icao === state.selectedIcao) {
           nextAircraft.set(icao, ac);
-          const t = state.trails.get(icao);
-          if (t) nextTrails.set(icao, t);
         } else {
           pruned++;
         }
       }
-      return pruned > 0
-        ? { aircraft: nextAircraft, trails: nextTrails }
-        : state;
+
+      // Trails outlive their aircraft, so they are aged out on their own much
+      // longer clock instead of vanishing the moment a feed goes quiet.
+      const nextTrails = new Map<string, PositionSnapshot[]>();
+      let expired = 0;
+      for (const [icao, points] of state.trails) {
+        if (now - trailLastSeen(points) < TRAIL_RETENTION_MS) {
+          nextTrails.set(icao, points);
+        } else {
+          expired++;
+        }
+      }
+
+      if (pruned === 0 && expired === 0) return state;
+      return { aircraft: nextAircraft, trails: nextTrails };
     });
     return pruned;
   },

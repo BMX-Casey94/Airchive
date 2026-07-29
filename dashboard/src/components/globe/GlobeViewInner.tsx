@@ -5,7 +5,7 @@ import { useFleetStore } from "@/stores/fleet";
 import { useAircraftStore } from "@/stores/aircraft-store";
 import { aircraftColourHex, aircraftSprite } from "./aircraft-style";
 import { loadPersistedTrails, persistTrails } from "@/lib/trail-persistence";
-import type { AircraftState } from "@/types/dashboard";
+import type { AircraftState, PositionSnapshot } from "@/types/dashboard";
 
 /** Inlined by Next from next.config `env` + dotenv loading workspace `.env`. */
 const CESIUM_TOKEN = process.env.NEXT_PUBLIC_CESIUM_ION_TOKEN ?? "";
@@ -32,9 +32,53 @@ const ICON_SCALE_FAR_M = 22_000_000;
 const ICON_SCALE_NEAR = 1.15;
 const ICON_SCALE_FAR = 0.5;
 
-/** Trail points drawn for aircraft that are not selected. */
-const TRAIL_TAIL_POINTS = 90;
+/**
+ * Vertices drawn per aircraft. The stored path can be far longer; it is
+ * sampled down to this, so the whole route is shown end to end at a cost that
+ * does not grow with flight duration. The selection gets a much larger budget
+ * because it is the one being examined closely.
+ */
+const TRAIL_POINTS_DEFAULT = 160;
+const TRAIL_POINTS_SELECTED = 1_200;
 const TRAIL_MIN_ALTITUDE_M = 100;
+
+/**
+ * A silence longer than this means the aircraft left coverage rather than flew
+ * a straight line. Drawing across the gap would invent a route it never took,
+ * so the path is broken into separate segments instead.
+ */
+const TRAIL_GAP_MS = 12 * 60_000;
+
+/** Breaks a path wherever the feed went quiet for longer than TRAIL_GAP_MS. */
+function splitOnGaps(points: PositionSnapshot[]): PositionSnapshot[][] {
+  const segments: PositionSnapshot[][] = [];
+  let current: PositionSnapshot[] = [];
+
+  for (let i = 0; i < points.length; i++) {
+    const point = points[i]!;
+    const previous = points[i - 1];
+    if (previous && point.ts - previous.ts > TRAIL_GAP_MS) {
+      if (current.length >= 2) segments.push(current);
+      current = [];
+    }
+    current.push(point);
+  }
+  if (current.length >= 2) segments.push(current);
+
+  return segments;
+}
+
+/** Evenly thins a segment to `max` vertices, always keeping both ends. */
+function sampleForDisplay(
+  points: PositionSnapshot[],
+  max: number,
+): PositionSnapshot[] {
+  if (points.length <= max) return points;
+  const step = (points.length - 1) / (max - 1);
+  const out: PositionSnapshot[] = [];
+  for (let i = 0; i < max; i++) out.push(points[Math.round(i * step)]!);
+  return out;
+}
 
 /** Trails are written back to storage on this cadence, not on every update. */
 const TRAIL_PERSIST_INTERVAL_MS = 15_000;
@@ -290,8 +334,8 @@ export default function GlobeViewInner() {
       ICON_SCALE_FAR_M,
       ICON_SCALE_FAR,
     );
-    /** Trail point counts already drawn, so unchanged paths are not rebuilt. */
-    const trailRevision = new Map<string, number>();
+    /** Paths already drawn, so untouched trails are not rebuilt every tick. */
+    const trailRevision = new Map<string, string>();
 
     /** Sync Cesium entities with the fleet store (runs outside React render). */
     function syncEntities() {
@@ -393,29 +437,37 @@ export default function GlobeViewInner() {
           });
         }
 
-        /* Flight path. Every aircraft gets one now — the whole point of a
-           trail is seeing where traffic came from, which a single selected
-           path could never show. Unselected aircraft draw a short tail so
-           hundreds of them stay cheap; the selection gets its full history
-           with a glow so it still stands out. */
-        const trailId = TRAIL_ENTITY_PREFIX + ac.icao;
-        const existingTrail = v.entities.getById(trailId);
+        /* Flight path. Every aircraft draws its whole stored route, not a
+           short tail, because seeing where traffic came from is the point of
+           having trails at all. Cost is held down by sampling vertices rather
+           than by discarding history. */
         const trail = trails.get(ac.icao);
-        const visible = trail
-          ? isSelected
-            ? trail
-            : trail.slice(-TRAIL_TAIL_POINTS)
-          : undefined;
+        const budget = isSelected ? TRAIL_POINTS_SELECTED : TRAIL_POINTS_DEFAULT;
+        const segments =
+          trail && trail.length >= 2
+            ? splitOnGaps(trail)
+                .map((segment) => sampleForDisplay(segment, budget))
+                .filter((segment) => segment.length >= 2)
+            : [];
 
-        if (visible && visible.length >= 2) {
-          seenIds.add(trailId);
-          // Rebuilding hundreds of polylines every second is what makes a
-          // full-fleet trail expensive, so untouched paths are left alone.
-          const changed =
-            !existingTrail || trailRevision.get(trailId) !== visible.length;
+        for (let s = 0; s < segments.length; s++) {
+          seenIds.add(`${TRAIL_ENTITY_PREFIX}${ac.icao}:${s}`);
+        }
 
-          if (changed || isSelected) {
-            const positions = visible.map((p) =>
+        // Keyed on the stored length rather than the drawn length: once a path
+        // exceeds its vertex budget the drawn count stops changing, and a
+        // signature built from it would freeze the trail in place.
+        const signature = `${isSelected ? "s" : "u"}:${trail?.length ?? 0}:${segments.length}`;
+
+        if (trailRevision.get(ac.icao) !== signature) {
+          trailRevision.set(ac.icao, signature);
+
+          for (let s = 0; s < segments.length; s++) {
+            const segment = segments[s]!;
+            const segmentId = `${TRAIL_ENTITY_PREFIX}${ac.icao}:${s}`;
+            // Altitude is carried through, so a climb-out visibly rises off
+            // the surface rather than lying flat against it.
+            const positions = segment.map((p) =>
               C.Cartesian3.fromDegrees(
                 p.lon,
                 p.lat,
@@ -423,36 +475,31 @@ export default function GlobeViewInner() {
               ),
             );
 
-            // Altitude is carried through, so a climb-out visibly rises off
-            // the surface rather than lying flat against it.
             const material = isSelected
               ? new C.PolylineGlowMaterialProperty({
                   color: colour.withAlpha(0.85),
                   glowPower: 0.22,
                   taperPower: 0.45,
                 })
-              : new C.ColorMaterialProperty(colour.withAlpha(0.32));
+              : new C.ColorMaterialProperty(colour.withAlpha(0.3));
 
-            if (existingTrail?.polyline) {
-              existingTrail.polyline.positions = constant(C, positions);
-              existingTrail.polyline.material = material;
-              existingTrail.polyline.width = constant(C, isSelected ? 3 : 1.4);
+            const existing = v.entities.getById(segmentId);
+            if (existing?.polyline) {
+              existing.polyline.positions = constant(C, positions);
+              existing.polyline.material = material;
+              existing.polyline.width = constant(C, isSelected ? 3 : 1.3);
             } else {
               v.entities.add({
-                id: trailId,
+                id: segmentId,
                 polyline: {
                   positions,
-                  width: isSelected ? 3 : 1.4,
+                  width: isSelected ? 3 : 1.3,
                   material,
                   arcType: C.ArcType.NONE,
                 },
               });
             }
-            trailRevision.set(trailId, visible.length);
           }
-        } else if (existingTrail) {
-          v.entities.remove(existingTrail);
-          trailRevision.delete(trailId);
         }
       }
 
