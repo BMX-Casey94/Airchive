@@ -326,17 +326,20 @@ export function buildChainLookup(options: {
 }): ChainLookup {
   const providers: ChainProviderConfig[] = [];
 
-  // BananaBlocks first for confirmations/proofs/headers so WhatsOnChain's
-  // scarce free-tier budget is kept for the UTXO work Bitails cannot cover
-  // once its daily quota is spent.
+  // BananaBlocks first for confirmations and proofs so WhatsOnChain's scarce
+  // free-tier budget is kept for the UTXO work Bitails cannot cover once its
+  // daily quota is spent.
   if (options.bananaBlocks.enabled && options.bananaBlocks.baseUrl.trim()) {
     providers.push({
       name: "bananablocks",
       baseUrl: options.bananaBlocks.baseUrl,
       maxRequestsPerSecond: options.bananaBlocks.maxRequestsPerSecond,
-      // Confirmed live: txs/status, proof/tsc, block/headers, tx/hash/{txid}.
-      // Address/UTXO endpoints currently 404, so they are intentionally omitted.
-      capabilities: ["txStatus", "tscProof", "headers", "tx"],
+      // Confirmed live: txs/status, proof/tsc, tx/hash/{txid}.
+      // Headers are deliberately excluded: its /block/headers payload omits
+      // `previousblockhash`, so the header cannot be reserialised into the
+      // canonical 80 bytes and fails proof-of-work verification. Address/UTXO
+      // endpoints currently 404, so they are omitted too.
+      capabilities: ["txStatus", "tscProof", "tx"],
       txPathStyle: "hash",
       wrapTscProof: true,
     });

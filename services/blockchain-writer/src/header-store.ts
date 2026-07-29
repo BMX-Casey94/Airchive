@@ -19,7 +19,7 @@ export interface BlockHeader {
   version: number;
 }
 
-interface WocHeader {
+export interface WocHeader {
   hash: string;
   height: number;
   version: number;
@@ -27,7 +27,8 @@ interface WocHeader {
   time: number;
   nonce: number;
   bits: string;
-  previousblockhash: string;
+  /** Absent on some providers; a header without it cannot be reserialised. */
+  previousblockhash?: string;
 }
 
 /**
@@ -95,8 +96,21 @@ export class HeaderStore {
       }
 
       // Ascending, so each header can be linked to the one before it.
-      const headers = payload
-        .map(toHeader)
+      const decoded = payload.map(toHeader);
+      const unusable = decoded.filter((header) => header === null).length;
+      if (unusable > 0) {
+        // Counted and logged rather than quietly dropped: a source that stops
+        // returning a required field takes the whole SPV pipeline down with it,
+        // and the only symptom otherwise is a verification rate of zero.
+        headerFetchTotal.inc({ outcome: "invalid" }, unusable);
+        log.error(
+          { unusable, received: payload.length },
+          "Block header source returned headers missing required fields — "
+            + "check the provider's response shape",
+        );
+      }
+
+      const headers = decoded
         .filter((header): header is BlockHeader => header !== null)
         .sort((a, b) => a.height - b.height);
 
@@ -203,7 +217,7 @@ function normaliseRow(row: BlockHeader): BlockHeader {
   };
 }
 
-function toHeader(raw: WocHeader): BlockHeader | null {
+export function toHeader(raw: WocHeader): BlockHeader | null {
   if (
     typeof raw?.hash !== "string"
     || typeof raw.merkleroot !== "string"
@@ -212,10 +226,19 @@ function toHeader(raw: WocHeader): BlockHeader | null {
   ) {
     return null;
   }
+
+  // Only the genesis block legitimately has no parent. Defaulting a missing
+  // field to the zero hash reserialises into a header that cannot hash to the
+  // hash it advertises, so every one is thrown out by the proof-of-work check
+  // further on — a provider omitting the field then looks exactly like a
+  // provider forging headers, and the store silently holds nothing.
+  if (raw.height !== 0 && typeof raw.previousblockhash !== "string") {
+    return null;
+  }
+
   return {
     height: raw.height,
     hash: raw.hash,
-    // The genesis block has no parent; represent it as the zero hash.
     prev_hash: raw.previousblockhash ?? "0".repeat(64),
     merkle_root: raw.merkleroot,
     time: raw.time,

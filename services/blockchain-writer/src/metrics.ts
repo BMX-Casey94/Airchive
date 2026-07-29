@@ -170,6 +170,18 @@ export const arcadeStatusEventsTotal = new Counter({
   registers: [registry],
 });
 
+export const statusEventsShedTotal = new Counter({
+  name: "airchive_status_events_shed_total",
+  help: "Status events dropped because the processing backlog was saturated",
+  registers: [registry],
+});
+
+export const statusQueueDepth = new Gauge({
+  name: "airchive_status_queue_depth",
+  help: "Status events waiting to be processed",
+  registers: [registry],
+});
+
 export const utxoLocksReclaimedTotal = new Counter({
   name: "airchive_utxo_locks_reclaimed_total",
   help: "UTXO locks reclaimed after exceeding the lock TTL",

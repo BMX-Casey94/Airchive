@@ -12,13 +12,25 @@ const log = createLogger({ service: "blockchain-writer:confirmation-poller" });
 
 const STEADY_INTERVAL_MS = 60_000;
 const CATCHUP_INTERVAL_MS = 10_000;
-const BATCH_SIZE = 200;
-const RECENT_BATCH_SIZE = 160;
-const BACKLOG_BATCH_SIZE = BATCH_SIZE - RECENT_BATCH_SIZE;
+const BATCH_SIZE = 400;
 const POLL_CONCURRENCY = 12;
 const BATCH_PAUSE_MS = 100;
 const REQUEST_TIMEOUT_MS = 10_000;
 const STALE_TX_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
+/**
+ * Blocks arrive roughly every ten minutes, so a transaction broadcast seconds
+ * ago is almost never in one. Checking it anyway spent most of every cycle's
+ * budget re-asking about the newest rows while the backlog behind them went
+ * untouched.
+ */
+const MIN_CONFIRMATION_AGE_MS = 120_000;
+/**
+ * The SSE stream reports rejections in real time, so polling Arcade for a
+ * verdict is a backstop for transactions it never reported on. Restricting it
+ * to older rows keeps one Arcade request per genuine question rather than one
+ * per pending row per cycle.
+ */
+const REJECTION_RECHECK_AGE_MS = 10 * 60_000;
 
 type PollMode = "catchup" | "steady";
 
@@ -210,8 +222,16 @@ export class ConfirmationPoller {
     wocBlockHeight: number | undefined,
   ): Promise<number> {
     const txid = row.txid;
+    const age = Date.now() - Number(row.timestamp);
     try {
-      const arcade = await this.fetchArcadeProof(txid);
+      // Arcade is asked only when it can answer something worth having: a BUMP
+      // for a transaction already known to be in a block, or a rejection
+      // verdict for one old enough that its absence from the chain is
+      // suspicious. Asking for every pending row was one request per row per
+      // cycle for an answer that was almost always "still pending".
+      const shouldAskArcade =
+        wocBlockHeight !== undefined || age > REJECTION_RECHECK_AGE_MS;
+      const arcade = shouldAskArcade ? await this.fetchArcadeProof(txid) : null;
       const arcadeStatus = (arcade?.txStatus ?? arcade?.status ?? "").toUpperCase();
 
       if (arcade?.merklePath) {
@@ -269,8 +289,7 @@ export class ConfirmationPoller {
       }
 
       // Nothing anywhere after a full day means it never propagated.
-      const age = Date.now() - Number(row.timestamp);
-      if (age > STALE_TX_MAX_AGE_MS && !arcade) {
+      if (age > STALE_TX_MAX_AGE_MS && shouldAskArcade && !arcade) {
         await updateTxStatus(this.db, txid, "FAILED");
         log.debug({ txid }, "Marked stale tx as FAILED (>24h with no proof from any source)");
       }
@@ -330,33 +349,24 @@ export class ConfirmationPoller {
     let confirmed = 0;
 
     try {
-      const baseQuery = () =>
-        this.db("tx_results")
-          .where("status", "SEEN_ON_NETWORK")
-          .select(
-            "txid",
-            "aircraft_icao",
-            "size_bytes",
-            "fee_sats",
-            "timestamp",
-            "record_type",
-            "chronicle_validated",
-          );
-
-      const [recentPending, backlogPending] = await Promise.all([
-        baseQuery()
-          .orderBy("timestamp", "desc")
-          .limit(RECENT_BATCH_SIZE) as Promise<PendingTxRow[]>,
-        baseQuery()
-          .orderBy("timestamp", "asc")
-          .limit(BACKLOG_BATCH_SIZE) as Promise<PendingTxRow[]>,
-      ]);
-
-      const pending = Array.from(
-        new Map(
-          [...recentPending, ...backlogPending].map((row) => [row.txid, row]),
-        ).values(),
-      );
+      // Least-recently-checked first, never-checked before that. Ordering by
+      // timestamp instead meant the oldest rows were re-read every cycle, so a
+      // transaction that could not be confirmed held the head of the queue
+      // permanently and nothing behind it was ever examined.
+      const pending = (await this.db("tx_results")
+        .where("status", "SEEN_ON_NETWORK")
+        .where("timestamp", "<=", Date.now() - MIN_CONFIRMATION_AGE_MS)
+        .select(
+          "txid",
+          "aircraft_icao",
+          "size_bytes",
+          "fee_sats",
+          "timestamp",
+          "record_type",
+          "chronicle_validated",
+        )
+        .orderByRaw("last_checked_at ASC NULLS FIRST")
+        .limit(BATCH_SIZE)) as PendingTxRow[];
 
       if (pending.length === 0) {
         this.switchToSteadyState();
@@ -386,13 +396,19 @@ export class ConfirmationPoller {
         }
       }
 
+      // Stamp the whole batch, confirmed or not. This is what rotates the
+      // queue: rows just examined go to the back, so the next cycle reaches
+      // rows it has not seen instead of re-reading these.
+      await this.db("tx_results")
+        .whereIn("txid", pending.map((row) => row.txid))
+        .update({ last_checked_at: this.db.fn.now() });
+
       if (confirmed > 0 || pending.length === BATCH_SIZE) {
         log.info(
           {
             confirmed,
             checked: pending.length,
-            recentChecked: recentPending.length,
-            backlogChecked: backlogPending.length,
+            inBlock: mined.size,
             mode: this.mode,
           },
           "Confirmation poll cycle completed",

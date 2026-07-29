@@ -20,7 +20,6 @@ import {
   insertTxResult,
   TREASURY_SCOPE,
   unlockAllAircraftUtxos,
-  updateTxStatus,
   upsertAircraftConfig,
 } from "@airchive/db";
 import { createLogger } from "@airchive/logger";
@@ -48,9 +47,12 @@ import { HeaderStore } from "./header-store.js";
 import { buildChainLookup } from "./chain-lookup.js";
 import { recordUnverifiedProof, recordVerifiedProof, verifyBump } from "./spv.js";
 import { buildFlightEventTx, buildTelemetryTx, computeTxid } from "./tx-builder.js";
+import { BoundedTaskQueue } from "./task-queue.js";
 import {
   recordTypeMetricLabel,
   registry,
+  statusEventsShedTotal,
+  statusQueueDepth,
   writerWriteIngressTotal,
   writerWriteOutcomesTotal,
 } from "./metrics.js";
@@ -62,6 +64,13 @@ const METRICS_PORT = Number(process.env.METRICS_PORT ?? "9091");
 const TRANSIENT_BROADCAST_COOLDOWN_MS = 3_000;
 const PENDING_WRITE_MAX_RETRIES = 10;
 const LOCK_RECLAIM_INTERVAL_MS = 60_000;
+/**
+ * Status events are cheap individually and ruinous in aggregate. The pool is
+ * sized around the database connection pool the work ends up queueing behind;
+ * raising it only moves the contention rather than relieving it.
+ */
+const STATUS_QUEUE_CONCURRENCY = 8;
+const STATUS_QUEUE_MAX_DEPTH = 5_000;
 /** Blocks arrive roughly every ten minutes, so this stays comfortably ahead. */
 const HEADER_SYNC_INTERVAL_MS = 120_000;
 /** Published by ingestion on every telemetry tick the dashboard renders. */
@@ -484,8 +493,15 @@ async function main(): Promise<void> {
     )
     .catch((err) => log.error({ err }, "Funding pool split failed"));
 
+  const statusUpdateQueue = new BoundedTaskQueue({
+    name: "status-update",
+    concurrency: STATUS_QUEUE_CONCURRENCY,
+    maxDepth: STATUS_QUEUE_MAX_DEPTH,
+    onOverflow: () => statusEventsShedTotal.inc(),
+  });
+
   broadcaster.on("status-update", (payload: ArcCallbackPayload) => {
-    void handleStatusUpdate(payload);
+    handleStatusUpdate(payload);
   });
 
   /**
@@ -529,7 +545,7 @@ async function main(): Promise<void> {
     }
   }
 
-  async function handleStatusUpdate(payload: ArcCallbackPayload): Promise<void> {
+  async function processStatusUpdate(payload: ArcCallbackPayload): Promise<void> {
     try {
       const upstreamStatus = payload.txStatus.trim().toUpperCase();
 
@@ -537,7 +553,14 @@ async function main(): Promise<void> {
       // FAILED stops the retry loop from resurrecting a transaction the network
       // has already refused, which for a double spend would be actively harmful.
       if (isTerminalArcadeFailure(upstreamStatus)) {
-        await updateTxStatus(db, payload.txid, "FAILED");
+        // A transaction already proved to be in a block cannot subsequently be
+        // rejected; such an event is stale ordering, not new information.
+        const marked = await db("tx_results")
+          .where({ txid: payload.txid })
+          .whereNot({ status: "MINED" })
+          .update({ status: "FAILED" });
+        if (marked === 0) return;
+
         log.error(
           {
             txid: payload.txid,
@@ -592,17 +615,46 @@ async function main(): Promise<void> {
         return;
       }
 
-      await updateTxStatus(db, payload.txid, "SEEN_ON_NETWORK", payload.blockHeight);
       if (upstreamStatus === "MINED") {
         // Mined without a proof: keep polling until one is available.
         confirmationPoller?.nudge();
       }
-      log.debug(
-        { txid: payload.txid, status: upstreamStatus },
-        "TX status updated from broadcaster status stream",
-      );
+
+      // Every remaining status (RECEIVED, SENT_TO_NETWORK, ACCEPTED_BY_NETWORK,
+      // SEEN_ON_NETWORK) tells us nothing the row does not already say — it is
+      // inserted as SEEN_ON_NETWORK at broadcast time. Writing the status back
+      // anyway cost an UPDATE per event on the hottest path in the writer, and
+      // worse, a late event could demote a transaction the poller had already
+      // proved and mined, leaving rows flagged spv_verified while sitting in
+      // SEEN_ON_NETWORK forever. Only a newly learned block height is recorded,
+      // and never over a MINED row.
+      if (payload.blockHeight !== undefined) {
+        await db("tx_results")
+          .where({ txid: payload.txid })
+          .whereNot({ status: "MINED" })
+          .whereNull("block_height")
+          .update({ block_height: payload.blockHeight });
+      }
     } catch (err) {
       log.error({ err, txid: payload.txid }, "Status update processing error");
+    }
+  }
+
+  /**
+   * Arcade streams every intermediate status for every transaction, so this is
+   * the hottest callback in the writer. Work is queued behind a fixed pool
+   * rather than spawned as a floating promise per event: a burst of rejections
+   * previously put thousands of concurrent database operations in flight and
+   * exhausted the heap.
+   */
+  function handleStatusUpdate(payload: ArcCallbackPayload): void {
+    const accepted = statusUpdateQueue.push(() => processStatusUpdate(payload));
+    statusQueueDepth.set(statusUpdateQueue.depth);
+    if (!accepted) {
+      log.warn(
+        { txid: payload.txid, status: payload.txStatus, maxDepth: STATUS_QUEUE_MAX_DEPTH },
+        "Status event shed — backlog saturated; the confirmation poller remains the backstop",
+      );
     }
   }
 
@@ -616,7 +668,7 @@ async function main(): Promise<void> {
     );
     arcadeSse.on("status-update", (payload: ArcCallbackPayload) => {
       arcadeBroadcaster?.noteStatus(payload.txid, payload.txStatus);
-      void handleStatusUpdate(payload);
+      handleStatusUpdate(payload);
     });
     arcadeSse.start();
   }

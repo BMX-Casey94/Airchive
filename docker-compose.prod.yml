@@ -98,6 +98,13 @@ services:
       WALLET_MASTER_SEED_FILE: /run/secrets/wallet_master_seed
       FUNDING_WALLET_WIF_FILE: /run/secrets/funding_wallet_wif
       TAAL_ARC_API_KEY_FILE: /run/secrets/taal_arc_api_key
+      # Steady state is well under 200 MB. Left unbounded, Node sizes its heap
+      # from host RAM and a runaway will happily take 4 GB from whatever else
+      # the box is running before it dies. The cap turns that into a contained,
+      # fast failure, and the snapshot means the next occurrence arrives with
+      # evidence instead of only a stack-less FATAL ERROR.
+      NODE_OPTIONS: --max-old-space-size=1536 --heapsnapshot-near-heap-limit=1
+    mem_limit: 2g
     secrets:
       - postgres_password
       - wallet_master_seed

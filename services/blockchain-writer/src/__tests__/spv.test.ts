@@ -3,8 +3,10 @@ import { describe, expect, it } from "vitest";
 import {
   serialiseHeader,
   targetFromBits,
+  toHeader,
   verifyProofOfWork,
   type BlockHeader,
+  type WocHeader,
 } from "../header-store.js";
 import { computeTscRoot } from "../confirmation-poller.js";
 
@@ -81,6 +83,40 @@ describe("block header verification", () => {
       0x0000_0000_ffffn * 2n ** BigInt(8 * (0x1d - 3)),
     );
     expect(targetFromBits(0x0100_0002)).toBe(0x02n >> 16n);
+  });
+});
+
+describe("header decoding", () => {
+  // Exactly the shape WhatsOnChain returns for this block.
+  const RAW_BLOCK_800000: WocHeader = {
+    hash: BLOCK_800000.hash,
+    height: BLOCK_800000.height,
+    version: BLOCK_800000.version,
+    merkleroot: BLOCK_800000.merkle_root,
+    time: BLOCK_800000.time,
+    nonce: BLOCK_800000.nonce,
+    bits: "180d589d",
+    previousblockhash: BLOCK_800000.prev_hash,
+  };
+
+  it("decodes a complete header into one that verifies", () => {
+    const decoded = toHeader(RAW_BLOCK_800000);
+    expect(decoded).not.toBeNull();
+    expect(verifyProofOfWork(decoded!)).toBe(true);
+  });
+
+  it("rejects a header missing its parent hash rather than zero-filling it", () => {
+    // BananaBlocks omits `previousblockhash`. Substituting the zero hash
+    // produced a header that reserialised wrongly and was then thrown out by
+    // the proof-of-work check, so every header from that provider was
+    // discarded and the store held nothing to verify proofs against.
+    const { previousblockhash: _omitted, ...withoutParent } = RAW_BLOCK_800000;
+    expect(toHeader(withoutParent)).toBeNull();
+  });
+
+  it("still accepts the genesis block, which genuinely has no parent", () => {
+    const genesis = { ...RAW_BLOCK_800000, height: 0, previousblockhash: undefined };
+    expect(toHeader(genesis)?.prev_hash).toBe("0".repeat(64));
   });
 });
 
