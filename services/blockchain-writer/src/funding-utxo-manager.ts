@@ -70,7 +70,7 @@ export interface FundingSelection {
 }
 
 export class FundingUtxoManager {
-  private reconcileInFlight: Promise<void> | null = null;
+  private reconcileInFlight: Promise<boolean> | null = null;
   private reconcileEarliestRetryAt = 0;
   private readonly fundingCooldownUntil = new Map<string, number>();
 
@@ -624,10 +624,11 @@ export class FundingUtxoManager {
   /**
    * Reconcile local state against on-chain reality.
    * De-duplicated: if a reconciliation is in-flight, callers join it;
-   * if one completed recently (or WoC rate-limited us), callers skip.
+   * if one completed recently (or the chain API rate-limited us), callers
+   * skip and receive `false` so they do not treat a stale local pool as truth.
    */
-  async reconcile(fundingWif: string): Promise<void> {
-    if (Date.now() < this.reconcileEarliestRetryAt) return;
+  async reconcile(fundingWif: string): Promise<boolean> {
+    if (Date.now() < this.reconcileEarliestRetryAt) return false;
     if (this.reconcileInFlight) return this.reconcileInFlight;
 
     this.reconcileInFlight = this.doReconcile(fundingWif).finally(() => {
@@ -637,7 +638,7 @@ export class FundingUtxoManager {
     return this.reconcileInFlight;
   }
 
-  private async doReconcile(fundingWif: string): Promise<void> {
+  private async doReconcile(fundingWif: string): Promise<boolean> {
     const fundingKey = PrivateKey.fromWif(fundingWif);
     const address = fundingKey.toAddress();
     const pkh = derivePubKeyHash(fundingKey);
@@ -652,8 +653,8 @@ export class FundingUtxoManager {
         ? RATE_LIMITED_COOLDOWN_MS
         : MIN_RECONCILE_INTERVAL_MS;
       this.reconcileEarliestRetryAt = Date.now() + cooldown;
-      log.warn({ err, retryInMs: cooldown }, "Funding reconciliation skipped — WoC unreachable");
-      return;
+      log.warn({ err, retryInMs: cooldown }, "Funding reconciliation skipped — chain unreachable");
+      return false;
     }
 
     this.reconcileEarliestRetryAt = Date.now() + MIN_RECONCILE_INTERVAL_MS;
@@ -693,6 +694,7 @@ export class FundingUtxoManager {
     }
 
     await this.refreshMetrics();
+    return true;
   }
 
   private async fetchFromChain(address: string): Promise<WocUtxo[]> {

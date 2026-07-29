@@ -168,21 +168,64 @@ export class FundingStateMachine {
     const previous = await getFundingState(this.db, TREASURY_SCOPE);
     const previousState = (previous?.state ?? "HEALTHY") as FundingStateName;
 
-    // While dry the pool is only refreshed on the backoff schedule; polling WoC
-    // every 15 seconds for an address nobody has funded yet is pure noise.
+    // While dry, chain polls follow the backoff schedule so an empty wallet is
+    // not hammered every tick. Two important exceptions:
+    //   1) Never advance next_poll_at on a skipped tick — doing so pushed the
+    //      deadline further out every 15s and made reconcile unreachable.
+    //   2) If the local pool already looks funded, verify against the chain
+    //      immediately. Otherwise the UI can show a large balance while the
+    //      badge stays DRY forever (and phantom UTXOs never get purged).
     if (previousState === "DRY" && !this.dryPollDue(previous)) {
-      await this.persist(previousState, previous, { skippedPoll: true });
-      return;
+      const local = await this.fundingUtxoManager.getBalance();
+      const looksFunded =
+        local.count > 0 && local.balance >= this.dryThresholdSats;
+
+      if (!looksFunded) {
+        await this.persist(previousState, previous, { skippedPoll: true }, false, {
+          nextPollAt: previous?.next_poll_at
+            ? new Date(previous.next_poll_at)
+            : null,
+          consecutiveDryPolls: previous?.consecutive_dry_polls ?? 0,
+        });
+        return;
+      }
+
+      log.info(
+        {
+          balance: local.balance,
+          utxoCount: local.count,
+          dryThresholdSats: this.dryThresholdSats,
+        },
+        "Local treasury pool looks funded while state is DRY — "
+          + "forcing chain reconciliation ahead of the dry-poll schedule",
+      );
     }
 
+    let dryReconciled = previousState !== "DRY";
     if (previousState === "DRY") {
-      await this.fundingUtxoManager
+      dryReconciled = await this.fundingUtxoManager
         .reconcile(this.config.fundingWalletWif)
-        .catch((err) => log.warn({ err }, "Dry-state funding reconciliation failed"));
+        .catch((err) => {
+          log.warn({ err }, "Dry-state funding reconciliation failed");
+          return false;
+        });
     }
 
     const { balance, count } = await this.fundingUtxoManager.getBalance();
     this.updateBurnEstimate(balance);
+
+    // Leaving DRY requires a successful chain reconcile. A stale local pool can
+    // look flush (phantom UTXOs) while the address is empty, or the reverse —
+    // never promote on unverified local figures alone.
+    if (previousState === "DRY" && !dryReconciled) {
+      await this.persist("DRY", previous, { reconcileFailed: true }, false, {
+        nextPollAt: previous?.next_poll_at
+          ? new Date(previous.next_poll_at)
+          : new Date(Date.now() + this.config.funding.dryPollBaseMs),
+        consecutiveDryPolls: previous?.consecutive_dry_polls ?? 0,
+      });
+      return;
+    }
 
     const nextState = this.classify(balance, count, previousState);
 
