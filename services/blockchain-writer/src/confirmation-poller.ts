@@ -87,10 +87,12 @@ const CACHE_SWEEP_CANDIDATES = 12_000;
  * query and settled without asking any provider whether they are mined.
  */
 const BACKLOG_HEIGHT_SAMPLE = 12;
-/** Rows pulled per drain page. Bounded so one height cannot own a whole cycle. */
-const DRAIN_PAGE_SIZE = 2_000;
-/** Pages per height per cycle, capping work at DRAIN_PAGE_SIZE * this. */
-const DRAIN_PAGES_PER_HEIGHT = 10;
+/**
+ * Block transaction ids matched against the backlog per query. `txid` is the
+ * primary key, so each chunk is an index lookup; the chunking exists only to
+ * keep a large block well inside the bind-parameter limit.
+ */
+const DRAIN_MATCH_CHUNK = 5_000;
 /** Verified trees kept warm. A 70k-tx block is tens of MB; four is a safe cap. */
 const BLOCK_TREE_CACHE_MAX = 4;
 /**
@@ -487,28 +489,45 @@ export class ConfirmationPoller {
    * nothing could be confirmed, however large the backlog behind it.
    */
   private async drainKnownMinedBacklog(done: Set<string>): Promise<number> {
-    const hot = (await this.db("tx_results")
-      .where("status", "SEEN_ON_NETWORK")
-      .whereNotNull("block_height")
-      .select("block_height")
-      .count("* as rows")
-      .groupBy("block_height")
-      .orderBy("rows", "desc")
-      .limit(BACKLOG_HEIGHT_SAMPLE)) as Array<{
-      block_height: number | string;
-      rows: number | string;
-    }>;
+    const [hot, oldest] = await Promise.all([
+      this.db("tx_results")
+        .where("status", "SEEN_ON_NETWORK")
+        .whereNotNull("block_height")
+        .select("block_height")
+        .count("* as rows")
+        .groupBy("block_height")
+        .orderBy("rows", "desc")
+        .limit(BACKLOG_HEIGHT_SAMPLE) as unknown as Promise<
+        Array<{ block_height: number | string; rows: number | string }>
+      >,
+      this.db("tx_results")
+        .where("status", "SEEN_ON_NETWORK")
+        .whereNotNull("block_height")
+        .min("block_height as height")
+        .first() as Promise<{ height: number | string | null } | undefined>,
+    ]);
 
-    if (hot.length === 0) return 0;
+    // Ordering purely by row count would leave the sparse tail of old blocks
+    // permanently behind busier ones, so the oldest is always taken as well.
+    const heights: number[] = [];
+    const seenHeight = new Set<number>();
+    const push = (value: number | string | null | undefined) => {
+      const height = Number(value);
+      if (!Number.isFinite(height) || height <= 0 || seenHeight.has(height)) return;
+      seenHeight.add(height);
+      heights.push(height);
+    };
+
+    push(oldest?.height);
+    for (const entry of hot) push(entry.block_height);
+
+    if (heights.length === 0) return 0;
 
     let confirmed = 0;
     let downloads = 0;
     const drained: Array<{ height: number; confirmed: number }> = [];
 
-    for (const entry of hot) {
-      const height = Number(entry.block_height);
-      if (!Number.isFinite(height) || height <= 0) continue;
-
+    for (const height of heights) {
       // Cached heights are free; fresh downloads stay rationed.
       if (!this.blockTrees.has(height)) {
         if (downloads >= MAX_BLOCKS_PER_CYCLE) continue;
@@ -531,32 +550,47 @@ export class ConfirmationPoller {
   }
 
   /**
-   * Pages through every pending row recorded at one height.
+   * Proves every transaction of ours that the block contains.
    *
-   * Confirmed rows leave SEEN_ON_NETWORK, so each page naturally returns the
-   * next set without an offset. The loop stops as soon as a page makes no
-   * progress, which is what prevents rows that cannot be proved from being
-   * fetched round and round.
+   * The question is asked from the block's side rather than the backlog's: the
+   * verified tree already lists every transaction id in the block, so matching
+   * that list against pending rows finds all of them at once. Selecting rows by
+   * `block_height` instead only ever found the few that some earlier pass had
+   * happened to stamp — a small fraction of the roughly seventeen thousand
+   * writes a block carries at the current rate — and left the rest to be
+   * discovered one at a time through the very lookups the rate limit caps.
+   *
+   * The download is the expensive part and it has already been paid for, so
+   * this extracts everything it is worth.
    */
   private async drainHeight(height: number, done: Set<string>): Promise<number> {
-    let total = 0;
+    const cached = await this.ensureBlockTree(height);
+    if (!cached) return 0;
 
-    for (let page = 0; page < DRAIN_PAGES_PER_HEIGHT; page++) {
+    const blockTxids = [...cached.tree.indexOf.keys()];
+    let confirmed = 0;
+    let ours = 0;
+
+    for (let i = 0; i < blockTxids.length; i += DRAIN_MATCH_CHUNK) {
+      const chunk = blockTxids.slice(i, i + DRAIN_MATCH_CHUNK);
       const rows = (await this.db("tx_results")
-        .where({ status: "SEEN_ON_NETWORK", block_height: height })
-        .select(ConfirmationPoller.PENDING_COLUMNS)
-        .limit(DRAIN_PAGE_SIZE)) as PendingTxRow[];
+        .where("status", "SEEN_ON_NETWORK")
+        .whereIn("txid", chunk)
+        .select(ConfirmationPoller.PENDING_COLUMNS)) as PendingTxRow[];
 
-      if (rows.length === 0) break;
-
-      const settled = await this.verifyOneBlock(height, rows, done);
-      if (settled === 0) break;
-
-      total += settled;
-      if (rows.length < DRAIN_PAGE_SIZE) break;
+      if (rows.length === 0) continue;
+      ours += rows.length;
+      confirmed += await this.confirmRowsFromTree(height, rows, done);
     }
 
-    return total;
+    if (ours > 0) {
+      log.info(
+        { height, blockTxCount: cached.blockTxCount, ours, confirmed },
+        "Matched a verified block against the pending backlog",
+      );
+    }
+
+    return confirmed;
   }
 
   /**
@@ -611,6 +645,62 @@ export class ConfirmationPoller {
     return confirmed;
   }
 
+  /**
+   * Returns a merkle tree for the height whose root has been checked against a
+   * header we verified the proof of work on, downloading the block if it is not
+   * already cached.
+   */
+  private async ensureBlockTree(height: number): Promise<CachedBlockTree | null> {
+    const header = await this.headers.getHeader(height);
+    if (!header) {
+      spvVerificationsTotal.inc({ outcome: "header_unavailable" });
+      return null;
+    }
+    const expectedRoot = header.merkle_root.toLowerCase();
+
+    const cached = this.getCachedBlockTree(height);
+    if (cached) {
+      if (cached.merkleRoot === expectedRoot) return cached;
+      // Header changed under us (reorg). Drop the stale tree and retry next cycle.
+      this.blockTrees.delete(height);
+      spvVerificationsTotal.inc({ outcome: "block_root_mismatch" });
+      log.warn({ height }, "Cached block tree no longer matches header — discarded");
+      return null;
+    }
+
+    const txids = await this.fetchBlockTxids(height);
+    if (!txids) return null;
+
+    const tree = buildBlockMerkleTree(txids);
+    if (!tree) {
+      spvVerificationsTotal.inc({ outcome: "block_list_malformed" });
+      return null;
+    }
+
+    // The whole basis of trusting this list. It came from an unauthenticated
+    // API, but only the real transaction set in the real order hashes to the
+    // root of a header we have already checked the proof of work on. Anything
+    // altered fails here and the block is discarded entirely.
+    if (tree.root !== expectedRoot) {
+      spvVerificationsTotal.inc({ outcome: "block_root_mismatch" });
+      log.warn(
+        { height, computed: tree.root, expected: header.merkle_root },
+        "Block transaction list did not hash to the verified header root — discarded",
+      );
+      return null;
+    }
+
+    this.rememberBlockTree(height, tree, txids.length, expectedRoot);
+    const stored = this.getCachedBlockTree(height);
+    if (stored) {
+      log.info(
+        { height, blockTxCount: txids.length, cacheSize: this.blockTrees.size },
+        "Cached verified block merkle tree",
+      );
+    }
+    return stored;
+  }
+
   private async verifyOneBlock(
     height: number,
     rows: PendingTxRow[],
@@ -618,52 +708,9 @@ export class ConfirmationPoller {
   ): Promise<number> {
     if (rows.length === 0) return 0;
 
-    const header = await this.headers.getHeader(height);
-    if (!header) {
-      spvVerificationsTotal.inc({ outcome: "header_unavailable" });
-      return 0;
-    }
-
-    let cached = this.getCachedBlockTree(height);
-    let cacheHit = cached !== null;
-    if (!cached) {
-      const txids = await this.fetchBlockTxids(height);
-      if (!txids) return 0;
-
-      const tree = buildBlockMerkleTree(txids);
-      if (!tree) {
-        spvVerificationsTotal.inc({ outcome: "block_list_malformed" });
-        return 0;
-      }
-
-      // The whole basis of trusting this list. It came from an unauthenticated
-      // API, but only the real transaction set in the real order hashes to the
-      // root of a header we have already checked the proof of work on. Anything
-      // altered fails here and the block is discarded entirely.
-      if (tree.root !== header.merkle_root.toLowerCase()) {
-        spvVerificationsTotal.inc({ outcome: "block_root_mismatch" });
-        log.warn(
-          { height, computed: tree.root, expected: header.merkle_root },
-          "Block transaction list did not hash to the verified header root — discarded",
-        );
-        return 0;
-      }
-
-      this.rememberBlockTree(height, tree, txids.length, header.merkle_root.toLowerCase());
-      cached = this.getCachedBlockTree(height);
-      if (!cached) return 0;
-
-      log.info(
-        { height, blockTxCount: txids.length, cacheSize: this.blockTrees.size },
-        "Cached verified block merkle tree",
-      );
-    } else if (cached.merkleRoot !== header.merkle_root.toLowerCase()) {
-      // Header changed under us (reorg). Drop the stale tree and retry next cycle.
-      this.blockTrees.delete(height);
-      spvVerificationsTotal.inc({ outcome: "block_root_mismatch" });
-      log.warn({ height }, "Cached block tree no longer matches header — discarded");
-      return 0;
-    }
+    const cacheHit = this.blockTrees.has(height);
+    const cached = await this.ensureBlockTree(height);
+    if (!cached) return 0;
 
     const confirmed = await this.confirmRowsFromTree(height, rows, done);
     log.info(
