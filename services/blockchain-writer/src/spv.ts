@@ -88,6 +88,49 @@ export async function recordVerifiedProof(
 }
 
 /**
+ * Persists many verified proofs in a few statements.
+ *
+ * Catch-up settles thousands of rows against one cached block; one UPDATE per
+ * row would spend the whole cycle on round-trips and leave the backlog growing.
+ */
+export async function recordVerifiedProofsBatch(
+  db: Knex,
+  proofs: Array<{ txid: string; bumpHex: string; blockHeight: number }>,
+): Promise<number> {
+  if (proofs.length === 0) return 0;
+
+  const CHUNK = 200;
+  let updated = 0;
+
+  for (let i = 0; i < proofs.length; i += CHUNK) {
+    const chunk = proofs.slice(i, i + CHUNK);
+    const bindings: Array<string | number> = [];
+    const valuesSql = chunk
+      .map((proof) => {
+        bindings.push(proof.txid, proof.blockHeight, proof.bumpHex);
+        return "(?::text, ?::int, ?::text)";
+      })
+      .join(", ");
+
+    const result = await db.raw(
+      `UPDATE tx_results AS t SET
+         status = 'MINED',
+         block_height = v.block_height,
+         bump = v.bump,
+         merkle_path = v.bump,
+         spv_verified = true
+       FROM (VALUES ${valuesSql}) AS v(txid, block_height, bump)
+       WHERE t.txid = v.txid
+         AND t.status = 'SEEN_ON_NETWORK'`,
+      bindings,
+    );
+    updated += Number(result.rowCount ?? chunk.length);
+  }
+
+  return updated;
+}
+
+/**
  * Keeps an unverified proof for later re-checking without claiming it is sound.
  * A proof can legitimately arrive before its header does.
  */

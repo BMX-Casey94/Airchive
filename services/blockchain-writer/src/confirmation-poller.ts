@@ -4,8 +4,17 @@ import { updateTxStatus } from "@airchive/db";
 import { createLogger } from "@airchive/logger";
 import { spvVerificationsTotal } from "./metrics.js";
 import type { HeaderStore } from "./header-store.js";
-import { recordUnverifiedProof, recordVerifiedProof, verifyBump } from "./spv.js";
-import { branchToBumpHex, buildBlockMerkleTree } from "./block-merkle.js";
+import {
+  recordUnverifiedProof,
+  recordVerifiedProof,
+  recordVerifiedProofsBatch,
+  verifyBump,
+} from "./spv.js";
+import {
+  branchToBumpHex,
+  buildBlockMerkleTree,
+  type BlockMerkleTree,
+} from "./block-merkle.js";
 import type { ChainLookup } from "./chain-lookup.js";
 import { isWocUnavailable } from "./woc-client.js";
 
@@ -13,6 +22,11 @@ const log = createLogger({ service: "blockchain-writer:confirmation-poller" });
 
 const STEADY_INTERVAL_MS = 60_000;
 const CATCHUP_INTERVAL_MS = 10_000;
+/**
+ * Kept modest on purpose: WhatsOnChain's bulk status endpoint accepts 20 ids
+ * per request, so this is 20 metered calls. Throughput comes from sweeping a
+ * cached block afterwards, not from enlarging this status batch.
+ */
 const BATCH_SIZE = 400;
 const POLL_CONCURRENCY = 12;
 const BATCH_PAUSE_MS = 100;
@@ -35,18 +49,34 @@ const REJECTION_RECHECK_AGE_MS = 10 * 60_000;
 
 /**
  * A block costs one summary request plus one per 50,000 transactions, so it
- * pays for itself once a handful of the batch share it. Below that the
- * per-transaction proof is cheaper and avoids parsing a large block.
+ * pays for itself once a handful of the batch share it. Cached trees skip the
+ * gate entirely — proving against a tree we already hold costs no RPS.
  */
-const MIN_ROWS_FOR_BLOCK_PROOF = 4;
-/** Blocks are hashed one at a time; a couple per cycle bounds the CPU spike. */
-const MAX_BLOCKS_PER_CYCLE = 2;
+const MIN_ROWS_FOR_BLOCK_PROOF = 3;
+/** New block downloads per cycle. Cache hits do not count against this. */
+const MAX_BLOCKS_PER_CYCLE = 4;
 /** Above this the tree costs more heap than a confirmation is worth. */
 const MAX_BLOCK_TX_FOR_LOCAL_PROOFS = 150_000;
 /** Block bodies are megabytes, so they need longer than an API call. */
 const BLOCK_REQUEST_TIMEOUT_MS = 60_000;
 /** Floor between nudge-driven cycles, so a burst cannot outpace the timer. */
 const MIN_NUDGE_INTERVAL_MS = CATCHUP_INTERVAL_MS;
+/**
+ * How many pending rows to test against cached trees each cycle. Membership is
+ * an in-memory Map lookup, so this settles thousands of confirmations with
+ * zero additional provider requests — which is how catch-up outruns ~25 TPS
+ * without touching the rate limit.
+ */
+const CACHE_SWEEP_CANDIDATES = 12_000;
+/** Verified trees kept warm. A 70k-tx block is tens of MB; four is a safe cap. */
+const BLOCK_TREE_CACHE_MAX = 4;
+/**
+ * Hard ceiling on per-transaction TSC fetches per cycle. The block path is the
+ * real confirmer; this is only a narrow escape hatch so a lonely mined row is
+ * not stranded when it never shares a batch with enough siblings to justify a
+ * download.
+ */
+const MAX_PER_TX_PROOFS_PER_CYCLE = 8;
 
 type PollMode = "catchup" | "steady";
 
@@ -135,6 +165,14 @@ function toWireOrder(hex: string): string {
  * of work has been checked locally. A transaction only reaches MINED once that
  * succeeds; anything weaker is recorded as an unverified proof and retried.
  */
+interface CachedBlockTree {
+  tree: BlockMerkleTree;
+  blockTxCount: number;
+  /** Header merkle root the tree was checked against. */
+  merkleRoot: string;
+  lastUsedAt: number;
+}
+
 export class ConfirmationPoller {
   private intervalId: ReturnType<typeof setInterval> | null = null;
   private running = false;
@@ -142,6 +180,8 @@ export class ConfirmationPoller {
   private lastNudgePollAt = 0;
   private redisPublisher: { publish(channel: string, message: string): Promise<number> } | null = null;
   private onTerminalRejection: ((txid: string) => Promise<void>) | null = null;
+  /** Height → verified merkle tree. Avoids re-downloading the same hot block. */
+  private readonly blockTrees = new Map<number, CachedBlockTree>();
 
   constructor(
     private readonly db: Knex,
@@ -305,12 +345,47 @@ export class ConfirmationPoller {
     return { blockHeight };
   }
 
+  private rememberBlockTree(
+    height: number,
+    tree: BlockMerkleTree,
+    blockTxCount: number,
+    merkleRoot: string,
+  ): void {
+    this.blockTrees.set(height, {
+      tree,
+      blockTxCount,
+      merkleRoot,
+      lastUsedAt: Date.now(),
+    });
+
+    while (this.blockTrees.size > BLOCK_TREE_CACHE_MAX) {
+      let oldestHeight: number | null = null;
+      let oldestAt = Number.POSITIVE_INFINITY;
+      for (const [candidateHeight, entry] of this.blockTrees) {
+        if (entry.lastUsedAt < oldestAt) {
+          oldestAt = entry.lastUsedAt;
+          oldestHeight = candidateHeight;
+        }
+      }
+      if (oldestHeight === null) break;
+      this.blockTrees.delete(oldestHeight);
+    }
+  }
+
+  private getCachedBlockTree(height: number): CachedBlockTree | null {
+    const entry = this.blockTrees.get(height);
+    if (!entry) return null;
+    entry.lastUsedAt = Date.now();
+    return entry;
+  }
+
   /**
-   * Downloads whole blocks and proves every one of our transactions in them.
+   * Downloads whole blocks (or reuses cached trees) and proves every one of
+   * our transactions in them.
    *
-   * Only blocks carrying enough of the batch to beat the per-transaction cost
-   * are taken, and only a couple per cycle, because a block's transaction list
-   * is tens of megabytes to parse and hash.
+   * Cached heights are always used, even for a single row — the download was
+   * already paid for. Fresh downloads are reserved for heights that carry
+   * enough of the batch to beat the per-transaction cost.
    */
   private async verifyBlockBatches(
     pending: PendingTxRow[],
@@ -328,16 +403,36 @@ export class ConfirmationPoller {
       else byHeight.set(height, [row]);
     }
 
-    const candidates = [...byHeight.entries()]
-      .filter(([, rows]) => rows.length >= MIN_ROWS_FOR_BLOCK_PROOF)
-      .sort((a, b) => b[1].length - a[1].length)
-      .slice(0, MAX_BLOCKS_PER_CYCLE);
-
-    for (const [height, rows] of candidates) {
+    // Cache hits first: no RPS, no MIN_ROWS gate.
+    for (const [height, rows] of byHeight) {
+      if (!this.blockTrees.has(height)) continue;
       try {
         confirmed += await this.verifyOneBlock(height, rows, done);
       } catch (err) {
-        // Leaves the rows untouched so the per-transaction path can still try.
+        log.warn({ err, height, rows: rows.length }, "Cached block proofs failed");
+      }
+    }
+
+    const downloadCandidates = [...byHeight.entries()]
+      .filter(([height, rows]) => {
+        if (this.blockTrees.has(height)) return false;
+        // Skip heights whose rows were already settled via another path.
+        return rows.some((row) => !done.has(row.txid))
+          && rows.length >= MIN_ROWS_FOR_BLOCK_PROOF;
+      })
+      .sort((a, b) => b[1].length - a[1].length)
+      .slice(0, MAX_BLOCKS_PER_CYCLE);
+
+    for (const [height, rows] of downloadCandidates) {
+      try {
+        confirmed += await this.verifyOneBlock(
+          height,
+          rows.filter((row) => !done.has(row.txid)),
+          done,
+        );
+      } catch (err) {
+        // Leaves the rows untouched so the narrow per-transaction escape hatch
+        // can still try a few of them.
         log.warn({ err, height, rows: rows.length }, "Block-derived proofs failed for a block");
       }
     }
@@ -345,42 +440,149 @@ export class ConfirmationPoller {
     return { confirmed, done };
   }
 
+  /**
+   * Settles pending rows that sit inside a tree we already hold, without any
+   * further provider calls. This is the catch-up multiplier: one downloaded
+   * block can clear thousands of our SEEN_ON_NETWORK rows across many cycles.
+   */
+  private async sweepAgainstCachedTrees(
+    alreadyDone: Set<string>,
+  ): Promise<number> {
+    if (this.blockTrees.size === 0) return 0;
+
+    const candidates = (await this.db("tx_results")
+      .where("status", "SEEN_ON_NETWORK")
+      .where("timestamp", "<=", Date.now() - MIN_CONFIRMATION_AGE_MS)
+      .select(
+        "txid",
+        "aircraft_icao",
+        "size_bytes",
+        "fee_sats",
+        "timestamp",
+        "record_type",
+        "chronicle_validated",
+      )
+      .orderByRaw("last_checked_at ASC NULLS FIRST")
+      .limit(CACHE_SWEEP_CANDIDATES)) as PendingTxRow[];
+
+    if (candidates.length === 0) return 0;
+
+    const byHeight = new Map<number, PendingTxRow[]>();
+    for (const row of candidates) {
+      if (alreadyDone.has(row.txid)) continue;
+      const txid = row.txid.toLowerCase();
+      for (const [height, entry] of this.blockTrees) {
+        if (!entry.tree.indexOf.has(txid)) continue;
+        const group = byHeight.get(height);
+        if (group) group.push(row);
+        else byHeight.set(height, [row]);
+        break;
+      }
+    }
+
+    let confirmed = 0;
+    for (const [height, rows] of byHeight) {
+      confirmed += await this.confirmRowsFromTree(height, rows, alreadyDone);
+    }
+
+    if (confirmed > 0) {
+      log.info(
+        {
+          confirmed,
+          scanned: candidates.length,
+          cachedBlocks: this.blockTrees.size,
+          heights: [...byHeight.keys()],
+        },
+        "Swept pending transactions against cached block trees",
+      );
+    }
+
+    return confirmed;
+  }
+
   private async verifyOneBlock(
     height: number,
     rows: PendingTxRow[],
     done: Set<string>,
   ): Promise<number> {
+    if (rows.length === 0) return 0;
+
     const header = await this.headers.getHeader(height);
     if (!header) {
       spvVerificationsTotal.inc({ outcome: "header_unavailable" });
       return 0;
     }
 
-    const txids = await this.fetchBlockTxids(height);
-    if (!txids) return 0;
+    let cached = this.getCachedBlockTree(height);
+    let cacheHit = cached !== null;
+    if (!cached) {
+      const txids = await this.fetchBlockTxids(height);
+      if (!txids) return 0;
 
-    const tree = buildBlockMerkleTree(txids);
-    if (!tree) {
-      spvVerificationsTotal.inc({ outcome: "block_list_malformed" });
-      return 0;
-    }
+      const tree = buildBlockMerkleTree(txids);
+      if (!tree) {
+        spvVerificationsTotal.inc({ outcome: "block_list_malformed" });
+        return 0;
+      }
 
-    // The whole basis of trusting this list. It came from an unauthenticated
-    // API, but only the real transaction set in the real order hashes to the
-    // root of a header we have already checked the proof of work on. Anything
-    // altered fails here and the block is discarded entirely.
-    if (tree.root !== header.merkle_root.toLowerCase()) {
-      spvVerificationsTotal.inc({ outcome: "block_root_mismatch" });
-      log.warn(
-        { height, computed: tree.root, expected: header.merkle_root },
-        "Block transaction list did not hash to the verified header root — discarded",
+      // The whole basis of trusting this list. It came from an unauthenticated
+      // API, but only the real transaction set in the real order hashes to the
+      // root of a header we have already checked the proof of work on. Anything
+      // altered fails here and the block is discarded entirely.
+      if (tree.root !== header.merkle_root.toLowerCase()) {
+        spvVerificationsTotal.inc({ outcome: "block_root_mismatch" });
+        log.warn(
+          { height, computed: tree.root, expected: header.merkle_root },
+          "Block transaction list did not hash to the verified header root — discarded",
+        );
+        return 0;
+      }
+
+      this.rememberBlockTree(height, tree, txids.length, header.merkle_root.toLowerCase());
+      cached = this.getCachedBlockTree(height);
+      if (!cached) return 0;
+
+      log.info(
+        { height, blockTxCount: txids.length, cacheSize: this.blockTrees.size },
+        "Cached verified block merkle tree",
       );
+    } else if (cached.merkleRoot !== header.merkle_root.toLowerCase()) {
+      // Header changed under us (reorg). Drop the stale tree and retry next cycle.
+      this.blockTrees.delete(height);
+      spvVerificationsTotal.inc({ outcome: "block_root_mismatch" });
+      log.warn({ height }, "Cached block tree no longer matches header — discarded");
       return 0;
     }
 
-    let confirmed = 0;
+    const confirmed = await this.confirmRowsFromTree(height, rows, done);
+    log.info(
+      {
+        height,
+        blockTxCount: cached.blockTxCount,
+        ours: rows.length,
+        confirmed,
+        cacheHit,
+      },
+      "Derived merkle proofs locally from a block",
+    );
+    return confirmed;
+  }
+
+  private async confirmRowsFromTree(
+    height: number,
+    rows: PendingTxRow[],
+    done: Set<string>,
+  ): Promise<number> {
+    const cached = this.getCachedBlockTree(height);
+    if (!cached) return 0;
+
+    const { tree } = cached;
+    const proofs: Array<{ txid: string; bumpHex: string; blockHeight: number }> = [];
+    const minedWithoutBump: string[] = [];
+    const publishRows: PendingTxRow[] = [];
 
     for (const row of rows) {
+      if (done.has(row.txid)) continue;
       const txid = row.txid.toLowerCase();
       const index = tree.indexOf.get(txid);
       if (index === undefined) {
@@ -391,32 +593,38 @@ export class ConfirmationPoller {
       }
 
       const bump = branchToBumpHex(height, txid, index, tree.branchFor(index), tree.root);
-
       if (bump) {
-        await recordVerifiedProof(this.db, row.txid, bump, height);
+        proofs.push({ txid: row.txid, bumpHex: bump, blockHeight: height });
       } else {
         // Inclusion is already proven by the root match above, so the row is
         // still confirmed; only the portable proof could not be assembled.
         spvVerificationsTotal.inc({ outcome: "bump_encode_failed" });
-        await this.db("tx_results").where({ txid: row.txid }).update({
-          status: "MINED",
-          block_height: height,
-          spv_verified: true,
-        });
+        minedWithoutBump.push(row.txid);
       }
-
-      spvVerificationsTotal.inc({ outcome: "verified_block" });
-      await this.publishMined(row, height);
+      publishRows.push(row);
       done.add(row.txid);
-      confirmed++;
     }
 
-    log.info(
-      { height, blockTxCount: txids.length, ours: rows.length, confirmed },
-      "Derived merkle proofs locally from a block",
-    );
+    if (proofs.length > 0) {
+      await recordVerifiedProofsBatch(this.db, proofs);
+      spvVerificationsTotal.inc({ outcome: "verified_block" }, proofs.length);
+    }
 
-    return confirmed;
+    if (minedWithoutBump.length > 0) {
+      await this.db("tx_results").whereIn("txid", minedWithoutBump).update({
+        status: "MINED",
+        block_height: height,
+        spv_verified: true,
+      });
+      spvVerificationsTotal.inc({ outcome: "verified_block" }, minedWithoutBump.length);
+    }
+
+    // Live subscribers; catch-up must not serialise thousands of awaits.
+    for (const row of publishRows) {
+      void this.publishMined(row, height);
+    }
+
+    return publishRows.length;
   }
 
   /**
@@ -469,6 +677,7 @@ export class ConfirmationPoller {
   private async processPendingRow(
     row: PendingTxRow,
     wocBlockHeight: number | undefined,
+    allowPerTxProof: boolean,
   ): Promise<number> {
     const txid = row.txid;
     const age = Date.now() - Number(row.timestamp);
@@ -479,7 +688,8 @@ export class ConfirmationPoller {
       // suspicious. Asking for every pending row was one request per row per
       // cycle for an answer that was almost always "still pending".
       const shouldAskArcade =
-        wocBlockHeight !== undefined || age > REJECTION_RECHECK_AGE_MS;
+        (allowPerTxProof && wocBlockHeight !== undefined)
+        || age > REJECTION_RECHECK_AGE_MS;
       const arcade = shouldAskArcade ? await this.fetchArcadeProof(txid) : null;
       const arcadeStatus = (arcade?.txStatus ?? arcade?.status ?? "").toUpperCase();
 
@@ -499,10 +709,7 @@ export class ConfirmationPoller {
         );
         // Deliberately fall through rather than returning. One source offering
         // a proof that does not recompute says nothing about whether the
-        // transaction is in a block — only that this proof cannot show it. The
-        // TSC path below is checked against the same local header, so trying it
-        // costs no trust, and returning here would strand a genuinely mined
-        // transaction purely because the first proof it was handed was bad.
+        // transaction is in a block — only that this proof cannot show it.
       }
 
       if (arcadeStatus === "REJECTED" || arcadeStatus === "DOUBLE_SPEND_ATTEMPTED") {
@@ -517,20 +724,23 @@ export class ConfirmationPoller {
       }
 
       if (wocBlockHeight !== undefined) {
-        const woc = await this.verifyViaWoc(txid, wocBlockHeight);
-        if (woc) {
-          await this.db("tx_results").where({ txid }).update({
-            status: "MINED",
-            block_height: woc.blockHeight,
-            spv_verified: true,
-          });
-          await this.publishMined(row, woc.blockHeight);
-          return 1;
+        if (allowPerTxProof) {
+          const woc = await this.verifyViaWoc(txid, wocBlockHeight);
+          if (woc) {
+            await this.db("tx_results").where({ txid }).update({
+              status: "MINED",
+              block_height: woc.blockHeight,
+              spv_verified: true,
+            });
+            await this.publishMined(row, woc.blockHeight);
+            return 1;
+          }
         }
 
-        // In a block but not yet provable — usually the header for that height
-        // has not synced. Record the height so the row is not mistaken for one
-        // the network never saw, and let the next cycle finish the proof.
+        // In a block but not proved this cycle — record the height so the row
+        // is not mistaken for one the network never saw. The block/sweep path
+        // will finish it once that height is cached; buying a TSC proof here
+        // for every leftover is what used to burn the rate budget.
         await this.db("tx_results")
           .where({ txid })
           .update({ block_height: wocBlockHeight });
@@ -631,19 +841,37 @@ export class ConfirmationPoller {
       // backlog never drained, and the poller stayed in catch-up forever.
       const mined = await this.fetchWocBlockHeights(pending.map((row) => row.txid));
 
-      // Where many rows share a block, download that block once and prove them
-      // all locally. Buying a proof each would cost one metered request per
-      // row; the block costs two or three however many rows it settles.
+      // Where many rows share a block, download that block once (or reuse a
+      // cached tree) and prove them locally. Buying a proof each would cost
+      // one metered request per row; the block costs two or three however many
+      // rows it settles, and a cache hit costs none.
       const settled = await this.verifyBlockBatches(pending, mined);
       confirmed += settled.confirmed;
 
+      // Zero-RPS catch-up: every pending row that sits inside a tree we already
+      // hold can be proved without asking a provider again.
+      confirmed += await this.sweepAgainstCachedTrees(settled.done);
+
       const remaining = pending.filter((row) => !settled.done.has(row.txid));
+      let perTxProofBudget = MAX_PER_TX_PROOFS_PER_CYCLE;
 
       for (let i = 0; i < remaining.length; i += POLL_CONCURRENCY) {
         const slice = remaining.slice(i, i + POLL_CONCURRENCY);
+        // Budget is assigned before the concurrent work so a parallel slice
+        // cannot overshoot MAX_PER_TX_PROOFS_PER_CYCLE.
+        const allowPerTx = slice.map((row) => {
+          const height = mined.get(row.txid.toLowerCase());
+          if (height === undefined || perTxProofBudget <= 0) return false;
+          perTxProofBudget -= 1;
+          return true;
+        });
         const results = await Promise.all(
-          slice.map((row) =>
-            this.processPendingRow(row, mined.get(row.txid.toLowerCase())),
+          slice.map((row, index) =>
+            this.processPendingRow(
+              row,
+              mined.get(row.txid.toLowerCase()),
+              allowPerTx[index]!,
+            ),
           ),
         );
         confirmed += results.reduce((sum, value) => sum + value, 0);
@@ -666,6 +894,7 @@ export class ConfirmationPoller {
             confirmed,
             checked: pending.length,
             inBlock: mined.size,
+            cachedBlocks: this.blockTrees.size,
             mode: this.mode,
           },
           "Confirmation poll cycle completed",
