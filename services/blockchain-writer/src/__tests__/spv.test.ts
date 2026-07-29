@@ -8,7 +8,7 @@ import {
   type BlockHeader,
   type WocHeader,
 } from "../header-store.js";
-import { computeTscRoot } from "../confirmation-poller.js";
+import { computeTscRoot, targetMatchesHeader } from "../confirmation-poller.js";
 
 // Mainnet block 800000, as returned by a header API. Real chain values are used
 // deliberately: the point of these checks is that the maths agrees with the
@@ -144,5 +144,52 @@ describe("TSC merkle branch", () => {
   it("rejects a malformed branch", () => {
     expect(computeTscRoot(COINBASE_TXID, 0, ["abcd"])).toBeNull();
     expect(computeTscRoot(COINBASE_TXID, -1, COINBASE_BRANCH)).toBeNull();
+  });
+});
+
+describe("TSC proof target", () => {
+  it("accepts a block hash, which is the default when no type is given", () => {
+    expect(targetMatchesHeader({ target: BLOCK_800000.hash }, BLOCK_800000)).toBe(true);
+    expect(
+      targetMatchesHeader({ target: BLOCK_800000.hash.toUpperCase() }, BLOCK_800000),
+    ).toBe(true);
+  });
+
+  it("accepts a merkle root when the proof says that is what it sent", () => {
+    // BananaBlocks answers this way. Comparing it against the block hash
+    // regardless discarded every proof it served as pointing at another block.
+    expect(
+      targetMatchesHeader(
+        { target: BLOCK_800000.merkle_root, targetType: "merkleRoot" },
+        BLOCK_800000,
+      ),
+    ).toBe(true);
+  });
+
+  it("does not accept a merkle root offered as a block hash", () => {
+    expect(targetMatchesHeader({ target: BLOCK_800000.merkle_root }, BLOCK_800000)).toBe(
+      false,
+    );
+    expect(
+      targetMatchesHeader(
+        { target: BLOCK_800000.hash, targetType: "merkleRoot" },
+        BLOCK_800000,
+      ),
+    ).toBe(false);
+  });
+
+  it("accepts a serialised header and reads the root out of it", () => {
+    const serialised = Buffer.from(serialiseHeader(BLOCK_800000)).toString("hex");
+    expect(
+      targetMatchesHeader({ target: serialised, targetType: "header" }, BLOCK_800000),
+    ).toBe(true);
+  });
+
+  it("rejects a target for a different block", () => {
+    expect(targetMatchesHeader({ target: "a".repeat(64) }, BLOCK_800000)).toBe(false);
+    expect(targetMatchesHeader({ target: "" }, BLOCK_800000)).toBe(false);
+    expect(
+      targetMatchesHeader({ target: "deadbeef", targetType: "header" }, BLOCK_800000),
+    ).toBe(false);
   });
 });

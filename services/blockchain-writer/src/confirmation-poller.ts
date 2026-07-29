@@ -5,6 +5,7 @@ import { createLogger } from "@airchive/logger";
 import { spvVerificationsTotal } from "./metrics.js";
 import type { HeaderStore } from "./header-store.js";
 import { recordUnverifiedProof, recordVerifiedProof, verifyBump } from "./spv.js";
+import { branchToBumpHex, buildBlockMerkleTree } from "./block-merkle.js";
 import type { ChainLookup } from "./chain-lookup.js";
 import { isWocUnavailable } from "./woc-client.js";
 
@@ -32,6 +33,21 @@ const MIN_CONFIRMATION_AGE_MS = 120_000;
  */
 const REJECTION_RECHECK_AGE_MS = 10 * 60_000;
 
+/**
+ * A block costs one summary request plus one per 50,000 transactions, so it
+ * pays for itself once a handful of the batch share it. Below that the
+ * per-transaction proof is cheaper and avoids parsing a large block.
+ */
+const MIN_ROWS_FOR_BLOCK_PROOF = 4;
+/** Blocks are hashed one at a time; a couple per cycle bounds the CPU spike. */
+const MAX_BLOCKS_PER_CYCLE = 2;
+/** Above this the tree costs more heap than a confirmation is worth. */
+const MAX_BLOCK_TX_FOR_LOCAL_PROOFS = 150_000;
+/** Block bodies are megabytes, so they need longer than an API call. */
+const BLOCK_REQUEST_TIMEOUT_MS = 60_000;
+/** Floor between nudge-driven cycles, so a burst cannot outpace the timer. */
+const MIN_NUDGE_INTERVAL_MS = CATCHUP_INTERVAL_MS;
+
 type PollMode = "catchup" | "steady";
 
 interface PendingTxRow {
@@ -42,6 +58,15 @@ interface PendingTxRow {
   timestamp: number | string;
   record_type: number | string;
   chronicle_validated?: boolean | null;
+}
+
+interface BlockSummary {
+  hash?: string;
+  txcount?: number;
+  num_tx?: number;
+  /** Present in full only for blocks small enough to avoid pagination. */
+  tx?: string[];
+  pages?: { uri?: string[]; size?: number };
 }
 
 interface ArcadeTxStatus {
@@ -55,11 +80,51 @@ interface TscProof {
   index: number;
   txOrId: string;
   target: string;
+  /**
+   * What `target` holds. The TSC default is the block hash, which is what
+   * WhatsOnChain returns; BananaBlocks returns the merkle root and says so
+   * here. Ignoring the field meant every BananaBlocks proof was discarded as
+   * pointing at the wrong block.
+   */
+  targetType?: string;
   nodes: string[];
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Checks the proof is about the block we hold, under either TSC encoding.
+ *
+ * `targetType` is optional and defaults to the block hash. BananaBlocks sets
+ * it to "merkleRoot" and returns the root instead, so a comparison hard-coded
+ * to the hash rejected every proof it served.
+ */
+export function targetMatchesHeader(
+  proof: Pick<TscProof, "target" | "targetType">,
+  header: { hash: string; merkle_root: string },
+): boolean {
+  const target = proof.target?.toLowerCase();
+  if (!target) return false;
+
+  switch ((proof.targetType ?? "hash").toLowerCase()) {
+    case "merkleroot":
+      return target === header.merkle_root.toLowerCase();
+    case "header": {
+      // The 80-byte serialised header. Bytes 36..67 are the merkle root in
+      // wire order, whereas the stored root is in display order.
+      if (target.length !== 160) return false;
+      return target.slice(72, 136) === toWireOrder(header.merkle_root.toLowerCase());
+    }
+    default:
+      return target === header.hash.toLowerCase();
+  }
+}
+
+/** Display-order hash hex to wire order, which is the same bytes reversed. */
+function toWireOrder(hex: string): string {
+  return (hex.match(/../g) ?? []).reverse().join("");
 }
 
 /**
@@ -74,6 +139,7 @@ export class ConfirmationPoller {
   private intervalId: ReturnType<typeof setInterval> | null = null;
   private running = false;
   private mode: PollMode = "catchup";
+  private lastNudgePollAt = 0;
   private redisPublisher: { publish(channel: string, message: string): Promise<number> } | null = null;
   private onTerminalRejection: ((txid: string) => Promise<void>) | null = null;
 
@@ -106,12 +172,23 @@ export class ConfirmationPoller {
     void this.poll();
   }
 
+  /**
+   * Asks for an out-of-band cycle when something suggests there is work.
+   *
+   * Rate limited on purpose. Every mined-without-proof report used to trigger
+   * one, and a block landing produces thousands at once, so cycles ran
+   * back-to-back and drove the providers straight into rate limiting — the
+   * poller then spent its budget on 429s rather than confirmations.
+   */
   nudge(): void {
     if (!this.intervalId) return;
     this.switchToCatchupState();
-    if (!this.running) {
-      void this.poll();
-    }
+
+    const now = Date.now();
+    if (this.running || now - this.lastNudgePollAt < MIN_NUDGE_INTERVAL_MS) return;
+
+    this.lastNudgePollAt = now;
+    void this.poll();
   }
 
   stop(): void {
@@ -196,13 +273,24 @@ export class ConfirmationPoller {
     });
 
     const proof = proofs?.[0];
-    if (!proof || !Array.isArray(proof.nodes)) return null;
+    if (!proof || !Array.isArray(proof.nodes)) {
+      // Counted because it is otherwise invisible: a request was spent and no
+      // verification was attempted, and at scale that consumes most of the
+      // provider budget without producing a single confirmation.
+      spvVerificationsTotal.inc({ outcome: "no_proof_available" });
+      return null;
+    }
 
     const header = await this.headers.getHeader(blockHeight);
-    if (!header) return null;
+    if (!header) {
+      spvVerificationsTotal.inc({ outcome: "header_unavailable" });
+      return null;
+    }
 
-    // The proof targets a block hash; it must be the block we verified.
-    if (proof.target.toLowerCase() !== header.hash.toLowerCase()) {
+    // `target` identifies which block the proof claims; the recomputation
+    // below is the part that actually proves inclusion, so accepting either
+    // encoding weakens nothing.
+    if (!targetMatchesHeader(proof, header)) {
       spvVerificationsTotal.inc({ outcome: "target_mismatch" });
       return null;
     }
@@ -215,6 +303,167 @@ export class ConfirmationPoller {
 
     spvVerificationsTotal.inc({ outcome: "verified_tsc" });
     return { blockHeight };
+  }
+
+  /**
+   * Downloads whole blocks and proves every one of our transactions in them.
+   *
+   * Only blocks carrying enough of the batch to beat the per-transaction cost
+   * are taken, and only a couple per cycle, because a block's transaction list
+   * is tens of megabytes to parse and hash.
+   */
+  private async verifyBlockBatches(
+    pending: PendingTxRow[],
+    mined: Map<string, number>,
+  ): Promise<{ confirmed: number; done: Set<string> }> {
+    const done = new Set<string>();
+    let confirmed = 0;
+
+    const byHeight = new Map<number, PendingTxRow[]>();
+    for (const row of pending) {
+      const height = mined.get(row.txid.toLowerCase());
+      if (height === undefined) continue;
+      const group = byHeight.get(height);
+      if (group) group.push(row);
+      else byHeight.set(height, [row]);
+    }
+
+    const candidates = [...byHeight.entries()]
+      .filter(([, rows]) => rows.length >= MIN_ROWS_FOR_BLOCK_PROOF)
+      .sort((a, b) => b[1].length - a[1].length)
+      .slice(0, MAX_BLOCKS_PER_CYCLE);
+
+    for (const [height, rows] of candidates) {
+      try {
+        confirmed += await this.verifyOneBlock(height, rows, done);
+      } catch (err) {
+        // Leaves the rows untouched so the per-transaction path can still try.
+        log.warn({ err, height, rows: rows.length }, "Block-derived proofs failed for a block");
+      }
+    }
+
+    return { confirmed, done };
+  }
+
+  private async verifyOneBlock(
+    height: number,
+    rows: PendingTxRow[],
+    done: Set<string>,
+  ): Promise<number> {
+    const header = await this.headers.getHeader(height);
+    if (!header) {
+      spvVerificationsTotal.inc({ outcome: "header_unavailable" });
+      return 0;
+    }
+
+    const txids = await this.fetchBlockTxids(height);
+    if (!txids) return 0;
+
+    const tree = buildBlockMerkleTree(txids);
+    if (!tree) {
+      spvVerificationsTotal.inc({ outcome: "block_list_malformed" });
+      return 0;
+    }
+
+    // The whole basis of trusting this list. It came from an unauthenticated
+    // API, but only the real transaction set in the real order hashes to the
+    // root of a header we have already checked the proof of work on. Anything
+    // altered fails here and the block is discarded entirely.
+    if (tree.root !== header.merkle_root.toLowerCase()) {
+      spvVerificationsTotal.inc({ outcome: "block_root_mismatch" });
+      log.warn(
+        { height, computed: tree.root, expected: header.merkle_root },
+        "Block transaction list did not hash to the verified header root — discarded",
+      );
+      return 0;
+    }
+
+    let confirmed = 0;
+
+    for (const row of rows) {
+      const txid = row.txid.toLowerCase();
+      const index = tree.indexOf.get(txid);
+      if (index === undefined) {
+        // The status lookup placed it in this block but the block does not
+        // contain it. Left alone for the per-transaction path to resolve.
+        spvVerificationsTotal.inc({ outcome: "absent_from_block" });
+        continue;
+      }
+
+      const bump = branchToBumpHex(height, txid, index, tree.branchFor(index), tree.root);
+
+      if (bump) {
+        await recordVerifiedProof(this.db, row.txid, bump, height);
+      } else {
+        // Inclusion is already proven by the root match above, so the row is
+        // still confirmed; only the portable proof could not be assembled.
+        spvVerificationsTotal.inc({ outcome: "bump_encode_failed" });
+        await this.db("tx_results").where({ txid: row.txid }).update({
+          status: "MINED",
+          block_height: height,
+          spv_verified: true,
+        });
+      }
+
+      spvVerificationsTotal.inc({ outcome: "verified_block" });
+      await this.publishMined(row, height);
+      done.add(row.txid);
+      confirmed++;
+    }
+
+    log.info(
+      { height, blockTxCount: txids.length, ours: rows.length, confirmed },
+      "Derived merkle proofs locally from a block",
+    );
+
+    return confirmed;
+  }
+
+  /**
+   * The block's full transaction id list, in order.
+   *
+   * Large blocks are paginated at 50,000 ids, so even a busy block is two or
+   * three requests. Returns null unless the complete list arrives — a partial
+   * list would hash to the wrong root anyway, and bailing early saves the work.
+   */
+  private async fetchBlockTxids(height: number): Promise<string[] | null> {
+    const summary = await this.woc.getJson<BlockSummary>(`/block/height/${height}`, {
+      label: "block_summary",
+      timeoutMs: BLOCK_REQUEST_TIMEOUT_MS,
+      allowNotFound: true,
+    });
+    if (!summary?.hash) return null;
+
+    const total = Number(summary.txcount ?? summary.num_tx ?? 0);
+    if (!Number.isFinite(total) || total <= 0) return null;
+
+    // Guards the heap: the tree for a block this size is already tens of
+    // megabytes, and the per-transaction path remains available above it.
+    if (total > MAX_BLOCK_TX_FOR_LOCAL_PROOFS) {
+      log.debug({ height, total }, "Block too large for local proof derivation");
+      return null;
+    }
+
+    const pageSize = Number(summary.pages?.size ?? 0);
+    if (!summary.pages?.uri?.length || pageSize <= 0) {
+      // Small blocks are returned inline with no pagination.
+      return Array.isArray(summary.tx) && summary.tx.length === total ? summary.tx : null;
+    }
+
+    const txids: string[] = [];
+    const pageCount = Math.ceil(total / pageSize);
+
+    for (let page = 1; page <= pageCount; page++) {
+      const rows = await this.woc.getJson<string[]>(
+        `/block/hash/${summary.hash}/page/${page}`,
+        { label: "block_page", timeoutMs: BLOCK_REQUEST_TIMEOUT_MS, allowNotFound: true },
+      );
+      if (!Array.isArray(rows) || rows.length === 0) return null;
+      // Appended one at a time; spreading 50,000 arguments overflows the stack.
+      for (const txid of rows) txids.push(txid);
+    }
+
+    return txids.length === total ? txids : null;
   }
 
   private async processPendingRow(
@@ -382,8 +631,16 @@ export class ConfirmationPoller {
       // backlog never drained, and the poller stayed in catch-up forever.
       const mined = await this.fetchWocBlockHeights(pending.map((row) => row.txid));
 
-      for (let i = 0; i < pending.length; i += POLL_CONCURRENCY) {
-        const slice = pending.slice(i, i + POLL_CONCURRENCY);
+      // Where many rows share a block, download that block once and prove them
+      // all locally. Buying a proof each would cost one metered request per
+      // row; the block costs two or three however many rows it settles.
+      const settled = await this.verifyBlockBatches(pending, mined);
+      confirmed += settled.confirmed;
+
+      const remaining = pending.filter((row) => !settled.done.has(row.txid));
+
+      for (let i = 0; i < remaining.length; i += POLL_CONCURRENCY) {
+        const slice = remaining.slice(i, i + POLL_CONCURRENCY);
         const results = await Promise.all(
           slice.map((row) =>
             this.processPendingRow(row, mined.get(row.txid.toLowerCase())),
@@ -391,7 +648,7 @@ export class ConfirmationPoller {
         );
         confirmed += results.reduce((sum, value) => sum + value, 0);
 
-        if (i + POLL_CONCURRENCY < pending.length) {
+        if (i + POLL_CONCURRENCY < remaining.length) {
           await sleep(BATCH_PAUSE_MS);
         }
       }

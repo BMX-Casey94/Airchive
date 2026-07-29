@@ -23,6 +23,8 @@ export type ChainCapability =
   | "txStatus"
   | "tscProof"
   | "headers"
+  /** A block's transaction id list, used to derive proofs locally. */
+  | "blockTx"
   | "tx";
 
 export interface ChainProviderConfig extends WocClientOptions {
@@ -71,13 +73,17 @@ export interface BitailsProviderConfig {
 const ADDRESS_UNSPENT = /^\/address\/([^/]+)\/unspent$/;
 const TX_PATH = /^\/tx\/([0-9a-fA-F]{64})(?:\/|$)/;
 const TSC_PROOF = /^\/tx\/[0-9a-fA-F]{64}\/proof\/tsc$/;
-const HEADERS = /^\/block\//;
+// Block headers and block bodies are separate capabilities because a provider
+// can serve one correctly and not the other.
+const BLOCK_HEADER = /^\/block\/(?:headers|\d+\/header)$/;
+const BLOCK_TX = /^\/block\/(?:height\/\d+|hash\/[0-9a-fA-F]{64}(?:\/page\/\d+)?)$/;
 
 function capabilityFor(path: string, method: "GET" | "POST"): ChainCapability | null {
   if (ADDRESS_UNSPENT.test(path)) return "utxo";
   if (path === "/txs/status" && method === "POST") return "txStatus";
   if (TSC_PROOF.test(path)) return "tscProof";
-  if (HEADERS.test(path) || path === "/block/headers") return "headers";
+  if (BLOCK_HEADER.test(path)) return "headers";
+  if (BLOCK_TX.test(path)) return "blockTx";
   if (TX_PATH.test(path)) return "tx";
   return null;
 }
@@ -334,12 +340,15 @@ export function buildChainLookup(options: {
       name: "bananablocks",
       baseUrl: options.bananaBlocks.baseUrl,
       maxRequestsPerSecond: options.bananaBlocks.maxRequestsPerSecond,
-      // Confirmed live: txs/status, proof/tsc, tx/hash/{txid}.
+      // Confirmed live: txs/status, proof/tsc, tx/hash/{txid}, and block
+      // bodies with the same pagination as WhatsOnChain.
       // Headers are deliberately excluded: its /block/headers payload omits
       // `previousblockhash`, so the header cannot be reserialised into the
-      // canonical 80 bytes and fails proof-of-work verification. Address/UTXO
-      // endpoints currently 404, so they are omitted too.
-      capabilities: ["txStatus", "tscProof", "tx"],
+      // canonical 80 bytes and fails proof-of-work verification. That defect is
+      // specific to the header endpoint, so block bodies are still used — and
+      // a tampered body cannot pass, since its tree has to reproduce a root we
+      // already verified. Address/UTXO endpoints currently 404.
+      capabilities: ["txStatus", "tscProof", "tx", "blockTx"],
       txPathStyle: "hash",
       wrapTscProof: true,
     });
@@ -350,7 +359,7 @@ export function buildChainLookup(options: {
     baseUrl: options.woc.baseUrl,
     apiKey: options.woc.apiKey,
     maxRequestsPerSecond: options.woc.maxRequestsPerSecond,
-    capabilities: ["utxo", "txStatus", "tscProof", "headers", "tx"],
+    capabilities: ["utxo", "txStatus", "tscProof", "headers", "blockTx", "tx"],
   });
 
   return new ChainLookup(providers, options.bitails);
