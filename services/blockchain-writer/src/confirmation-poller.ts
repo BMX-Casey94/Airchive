@@ -38,7 +38,20 @@ const STALE_TX_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
  * budget re-asking about the newest rows while the backlog behind them went
  * untouched.
  */
-const MIN_CONFIRMATION_AGE_MS = 120_000;
+const MIN_CONFIRMATION_AGE_MS = 300_000;
+/**
+ * A row checked once and never revisited is a row abandoned. Blocks arrive
+ * about every ten minutes, so the first look at a young transaction usually
+ * finds nothing; without a re-check it would stay pending forever behind the
+ * endless supply of never-checked rows arriving at the current write rate.
+ */
+const RECHECK_AFTER_MS = 15 * 60_000;
+/**
+ * Share of each discovery batch spent on rows that have never been looked at.
+ * The rest goes to the least recently checked, so new arrivals cannot starve
+ * the backlog the way a pure NULLS-FIRST ordering did.
+ */
+const DISCOVERY_NEW_SHARE = 0.5;
 /**
  * The SSE stream reports rejections in real time, so polling Arcade for a
  * verdict is a backstop for transactions it never reported on. Restricting it
@@ -68,6 +81,16 @@ const MIN_NUDGE_INTERVAL_MS = CATCHUP_INTERVAL_MS;
  * without touching the rate limit.
  */
 const CACHE_SWEEP_CANDIDATES = 12_000;
+/**
+ * Heights considered when draining the backlog. Rows already known to be in a
+ * block carry the height, so the busiest heights can be found with one grouped
+ * query and settled without asking any provider whether they are mined.
+ */
+const BACKLOG_HEIGHT_SAMPLE = 12;
+/** Rows pulled per drain page. Bounded so one height cannot own a whole cycle. */
+const DRAIN_PAGE_SIZE = 2_000;
+/** Pages per height per cycle, capping work at DRAIN_PAGE_SIZE * this. */
+const DRAIN_PAGES_PER_HEIGHT = 10;
 /** Verified trees kept warm. A 70k-tx block is tens of MB; four is a safe cap. */
 const BLOCK_TREE_CACHE_MAX = 4;
 /**
@@ -440,10 +463,106 @@ export class ConfirmationPoller {
     return { confirmed, done };
   }
 
+  private static readonly PENDING_COLUMNS = [
+    "txid",
+    "aircraft_icao",
+    "size_bytes",
+    "fee_sats",
+    "timestamp",
+    "record_type",
+    "chronicle_validated",
+  ];
+
+  /**
+   * Clears every pending row that already knows which block it is in.
+   *
+   * This is the catch-up engine, and it is deliberately independent of the
+   * status lookup. A row reaches this state once any earlier pass recorded its
+   * height, so proving it needs nothing from a provider beyond the block
+   * itself — and one block download settles every row that shares that height.
+   *
+   * Driving from the backlog's own height distribution is what makes catch-up
+   * possible. Selecting blocks from the small status batch instead meant that
+   * when the batch happened to contain nothing mined, no block was cached and
+   * nothing could be confirmed, however large the backlog behind it.
+   */
+  private async drainKnownMinedBacklog(done: Set<string>): Promise<number> {
+    const hot = (await this.db("tx_results")
+      .where("status", "SEEN_ON_NETWORK")
+      .whereNotNull("block_height")
+      .select("block_height")
+      .count("* as rows")
+      .groupBy("block_height")
+      .orderBy("rows", "desc")
+      .limit(BACKLOG_HEIGHT_SAMPLE)) as Array<{
+      block_height: number | string;
+      rows: number | string;
+    }>;
+
+    if (hot.length === 0) return 0;
+
+    let confirmed = 0;
+    let downloads = 0;
+    const drained: Array<{ height: number; confirmed: number }> = [];
+
+    for (const entry of hot) {
+      const height = Number(entry.block_height);
+      if (!Number.isFinite(height) || height <= 0) continue;
+
+      // Cached heights are free; fresh downloads stay rationed.
+      if (!this.blockTrees.has(height)) {
+        if (downloads >= MAX_BLOCKS_PER_CYCLE) continue;
+        downloads++;
+      }
+
+      const settled = await this.drainHeight(height, done);
+      if (settled > 0) drained.push({ height, confirmed: settled });
+      confirmed += settled;
+    }
+
+    if (confirmed > 0) {
+      log.info(
+        { confirmed, blocks: drained, downloads, cachedBlocks: this.blockTrees.size },
+        "Drained known-mined backlog from block trees",
+      );
+    }
+
+    return confirmed;
+  }
+
+  /**
+   * Pages through every pending row recorded at one height.
+   *
+   * Confirmed rows leave SEEN_ON_NETWORK, so each page naturally returns the
+   * next set without an offset. The loop stops as soon as a page makes no
+   * progress, which is what prevents rows that cannot be proved from being
+   * fetched round and round.
+   */
+  private async drainHeight(height: number, done: Set<string>): Promise<number> {
+    let total = 0;
+
+    for (let page = 0; page < DRAIN_PAGES_PER_HEIGHT; page++) {
+      const rows = (await this.db("tx_results")
+        .where({ status: "SEEN_ON_NETWORK", block_height: height })
+        .select(ConfirmationPoller.PENDING_COLUMNS)
+        .limit(DRAIN_PAGE_SIZE)) as PendingTxRow[];
+
+      if (rows.length === 0) break;
+
+      const settled = await this.verifyOneBlock(height, rows, done);
+      if (settled === 0) break;
+
+      total += settled;
+      if (rows.length < DRAIN_PAGE_SIZE) break;
+    }
+
+    return total;
+  }
+
   /**
    * Settles pending rows that sit inside a tree we already hold, without any
-   * further provider calls. This is the catch-up multiplier: one downloaded
-   * block can clear thousands of our SEEN_ON_NETWORK rows across many cycles.
+   * further provider calls. Catches rows whose height was never recorded, so
+   * they are proved without ever being asked about individually.
    */
   private async sweepAgainstCachedTrees(
     alreadyDone: Set<string>,
@@ -453,15 +572,7 @@ export class ConfirmationPoller {
     const candidates = (await this.db("tx_results")
       .where("status", "SEEN_ON_NETWORK")
       .where("timestamp", "<=", Date.now() - MIN_CONFIRMATION_AGE_MS)
-      .select(
-        "txid",
-        "aircraft_icao",
-        "size_bytes",
-        "fee_sats",
-        "timestamp",
-        "record_type",
-        "chronicle_validated",
-      )
+      .select(ConfirmationPoller.PENDING_COLUMNS)
       .orderByRaw("last_checked_at ASC NULLS FIRST")
       .limit(CACHE_SWEEP_CANDIDATES)) as PendingTxRow[];
 
@@ -580,15 +691,17 @@ export class ConfirmationPoller {
     const proofs: Array<{ txid: string; bumpHex: string; blockHeight: number }> = [];
     const minedWithoutBump: string[] = [];
     const publishRows: PendingTxRow[] = [];
+    const absent: string[] = [];
 
     for (const row of rows) {
       if (done.has(row.txid)) continue;
       const txid = row.txid.toLowerCase();
       const index = tree.indexOf.get(txid);
       if (index === undefined) {
-        // The status lookup placed it in this block but the block does not
-        // contain it. Left alone for the per-transaction path to resolve.
+        // Something recorded this height, but a proof-of-work-verified tree for
+        // it does not contain the transaction, so the height is simply wrong.
         spvVerificationsTotal.inc({ outcome: "absent_from_block" });
+        absent.push(row.txid);
         continue;
       }
 
@@ -617,6 +730,19 @@ export class ConfirmationPoller {
         spv_verified: true,
       });
       spvVerificationsTotal.inc({ outcome: "verified_block" }, minedWithoutBump.length);
+    }
+
+    if (absent.length > 0) {
+      // Clearing the stale height is what stops the drain fetching these same
+      // rows every cycle, and lets the status pass rediscover the real block.
+      await this.db("tx_results")
+        .whereIn("txid", absent)
+        .where("status", "SEEN_ON_NETWORK")
+        .update({ block_height: null, last_checked_at: this.db.fn.now() });
+      log.warn(
+        { height, absent: absent.length },
+        "Rows recorded at a height the verified block does not contain — height cleared",
+      );
     }
 
     // Live subscribers; catch-up must not serialise thousands of awaits.
@@ -802,34 +928,64 @@ export class ConfirmationPoller {
     await this.redisPublisher.publish("txresult", message).catch(() => {});
   }
 
+  /**
+   * Rows for the discovery pass, whose only job is to learn which block a
+   * transaction is in so the drain can prove it later.
+   *
+   * The batch is split deliberately. A pure never-checked-first ordering meant
+   * the constant stream of new writes filled every cycle, so each transaction
+   * got exactly one look — at an age when a block almost certainly had not
+   * arrived yet — and was then never revisited. Half the budget now goes to
+   * rows due a re-check, which is what lets the backlog make progress.
+   */
+  private async selectDiscoveryBatch(): Promise<PendingTxRow[]> {
+    const eligibleBefore = Date.now() - MIN_CONFIRMATION_AGE_MS;
+    const newShare = Math.floor(BATCH_SIZE * DISCOVERY_NEW_SHARE);
+
+    const [fresh, stale] = await Promise.all([
+      this.db("tx_results")
+        .where("status", "SEEN_ON_NETWORK")
+        .where("timestamp", "<=", eligibleBefore)
+        .whereNull("last_checked_at")
+        .select(ConfirmationPoller.PENDING_COLUMNS)
+        .limit(newShare) as Promise<PendingTxRow[]>,
+      this.db("tx_results")
+        .where("status", "SEEN_ON_NETWORK")
+        .where("timestamp", "<=", eligibleBefore)
+        .whereNotNull("last_checked_at")
+        .where("last_checked_at", "<=", new Date(Date.now() - RECHECK_AFTER_MS))
+        .orderBy("last_checked_at", "asc")
+        .select(ConfirmationPoller.PENDING_COLUMNS)
+        .limit(BATCH_SIZE - newShare) as Promise<PendingTxRow[]>,
+    ]);
+
+    const seen = new Set<string>();
+    const batch: PendingTxRow[] = [];
+    for (const row of [...fresh, ...stale]) {
+      if (seen.has(row.txid)) continue;
+      seen.add(row.txid);
+      batch.push(row);
+    }
+    return batch;
+  }
+
   async poll(): Promise<number> {
     if (this.running) return 0;
     this.running = true;
     let confirmed = 0;
 
     try {
-      // Least-recently-checked first, never-checked before that. Ordering by
-      // timestamp instead meant the oldest rows were re-read every cycle, so a
-      // transaction that could not be confirmed held the head of the queue
-      // permanently and nothing behind it was ever examined.
-      const pending = (await this.db("tx_results")
-        .where("status", "SEEN_ON_NETWORK")
-        .where("timestamp", "<=", Date.now() - MIN_CONFIRMATION_AGE_MS)
-        .select(
-          "txid",
-          "aircraft_icao",
-          "size_bytes",
-          "fee_sats",
-          "timestamp",
-          "record_type",
-          "chronicle_validated",
-        )
-        .orderByRaw("last_checked_at ASC NULLS FIRST")
-        .limit(BATCH_SIZE)) as PendingTxRow[];
+      // Backlog first, and without spending a single status request. Rows that
+      // already carry a height only need the block, so this runs whether or not
+      // the discovery pass below finds anything.
+      const drainDone = new Set<string>();
+      confirmed += await this.drainKnownMinedBacklog(drainDone);
+
+      const pending = await this.selectDiscoveryBatch();
 
       if (pending.length === 0) {
-        this.switchToSteadyState();
-        return 0;
+        if (confirmed === 0) this.switchToSteadyState();
+        return confirmed;
       }
 
       this.switchToCatchupState();
@@ -847,6 +1003,7 @@ export class ConfirmationPoller {
       // rows it settles, and a cache hit costs none.
       const settled = await this.verifyBlockBatches(pending, mined);
       confirmed += settled.confirmed;
+      for (const txid of drainDone) settled.done.add(txid);
 
       // Zero-RPS catch-up: every pending row that sits inside a tree we already
       // hold can be proved without asking a provider again.
@@ -894,6 +1051,7 @@ export class ConfirmationPoller {
             confirmed,
             checked: pending.length,
             inBlock: mined.size,
+            drained: drainDone.size,
             cachedBlocks: this.blockTrees.size,
             mode: this.mode,
           },

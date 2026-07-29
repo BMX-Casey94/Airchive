@@ -3,6 +3,8 @@
 import { useEffect, useRef, useState } from "react";
 import { useFleetStore } from "@/stores/fleet";
 import { useAircraftStore } from "@/stores/aircraft-store";
+import { aircraftColourHex, aircraftSprite } from "./aircraft-style";
+import { loadPersistedTrails, persistTrails } from "@/lib/trail-persistence";
 import type { AircraftState } from "@/types/dashboard";
 
 /** Inlined by Next from next.config `env` + dotenv loading workspace `.env`. */
@@ -10,35 +12,53 @@ const CESIUM_TOKEN = process.env.NEXT_PUBLIC_CESIUM_ION_TOKEN ?? "";
 
 const ALT_EXAGGERATION = 6;
 const AUTO_ROTATE_SPEED = 0.025;
-const AIRCRAFT_ICON_URL = "/250px-White_plane_icon.svg.png";
-const AIRCRAFT_ICON_SIZE = 22;
-const AIRCRAFT_ICON_SIZE_SELECTED = 28;
-const AIRCRAFT_LABEL_OFFSET_Y = -20;
+const AIRCRAFT_ICON_SIZE = 26;
+const AIRCRAFT_ICON_SIZE_SELECTED = 34;
+const AIRCRAFT_LABEL_OFFSET_Y = -22;
 const FLY_TO_ALTITUDE = 800_000;
 const GLOBE_OCCLUSION_DEPTH_TEST_DISTANCE = 0;
 
-type CesiumNs = typeof import("cesium");
+/**
+ * Callsigns only render inside this camera range. Every aircraft carried a
+ * permanent label, so a few hundred over Europe merged into an unreadable
+ * block that hid the globe behind it. Labels now appear as the view closes in
+ * on a region, where there is room for them.
+ */
+const LABEL_VISIBLE_DISTANCE_M = 3_000_000;
 
-function aircraftColour(
-  Cesium: CesiumNs,
-  ac: AircraftState,
-): import("cesium").Color {
-  if (ac.emergency !== "none") {
-    return Cesium.Color.fromCssColorString("#FF3B5C");
-  }
-  if (ac.onGround) return Cesium.Color.fromCssColorString("#FFB800");
-  return Cesium.Color.fromCssColorString("#00F5FF");
-}
+/** Markers shrink with distance so a crowded continent stays legible. */
+const ICON_SCALE_NEAR_M = 150_000;
+const ICON_SCALE_FAR_M = 22_000_000;
+const ICON_SCALE_NEAR = 1.15;
+const ICON_SCALE_FAR = 0.5;
+
+/** Trail points drawn for aircraft that are not selected. */
+const TRAIL_TAIL_POINTS = 90;
+const TRAIL_MIN_ALTITUDE_M = 100;
+
+/** Trails are written back to storage on this cadence, not on every update. */
+const TRAIL_PERSIST_INTERVAL_MS = 15_000;
+
+type CesiumNs = typeof import("cesium");
 
 function aircraftIconSize(isSelected: boolean): number {
   return isSelected ? AIRCRAFT_ICON_SIZE_SELECTED : AIRCRAFT_ICON_SIZE;
 }
 
-const IMAGE_HEADING_OFFSET_RAD = Math.PI / 2;
-
-/** Convert aviation track (0°=N, CW) to Cesium billboard rotation (CCW, radians). */
+/** The generated sprite points north, so only the track rotation applies. */
 function trackToRotation(trackDeg: number): number {
-  return -(trackDeg * Math.PI) / 180 + IMAGE_HEADING_OFFSET_RAD;
+  return -(trackDeg * Math.PI) / 180;
+}
+
+function labelVisible(Cesium: CesiumNs, always: boolean): import("cesium").DistanceDisplayCondition {
+  return new Cesium.DistanceDisplayCondition(
+    0,
+    always ? Number.MAX_VALUE : LABEL_VISIBLE_DISTANCE_M,
+  );
+}
+
+function constant<T>(Cesium: CesiumNs, value: T): import("cesium").Property {
+  return new Cesium.ConstantProperty(value) as unknown as import("cesium").Property;
 }
 
 function GlobeFallback({ reason }: { reason: string }) {
@@ -75,6 +95,35 @@ export default function GlobeViewInner() {
 
   const selectGlobeAircraft = useFleetStore((s) => s.selectAircraft);
   const selectPanelAircraft = useAircraftStore((s) => s.selectAircraft);
+
+  /* ── Trails survive a reload ─────────────────────────────────────────── */
+  useEffect(() => {
+    let cancelled = false;
+
+    void loadPersistedTrails().then((restored) => {
+      if (!cancelled && restored.size > 0) {
+        useFleetStore.getState().hydrateTrails(restored);
+      }
+    });
+
+    const flush = () => {
+      void persistTrails(useFleetStore.getState().trails);
+    };
+    const timer = setInterval(flush, TRAIL_PERSIST_INTERVAL_MS);
+    // A tab closed or backgrounded between ticks would otherwise lose
+    // everything gathered since the last one.
+    const onHidden = () => {
+      if (document.visibilityState === "hidden") flush();
+    };
+    document.addEventListener("visibilitychange", onHidden);
+
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", onHidden);
+      flush();
+    };
+  }, []);
 
   /* ── One-time Cesium Viewer (loaded from /cesium/Cesium.js static asset) ─ */
   useEffect(() => {
@@ -234,7 +283,15 @@ export default function GlobeViewInner() {
     viewer.clock.onTick.addEventListener(rotateTick);
     tickRef.current = rotateTick;
 
-    const trailColour = Cesium.Color.fromCssColorString("#00F5FF").withAlpha(0.5);
+    const pixelRatio = window.devicePixelRatio ?? 1;
+    const scaleByDistance = new Cesium.NearFarScalar(
+      ICON_SCALE_NEAR_M,
+      ICON_SCALE_NEAR,
+      ICON_SCALE_FAR_M,
+      ICON_SCALE_FAR,
+    );
+    /** Trail point counts already drawn, so unchanged paths are not rebuilt. */
+    const trailRevision = new Map<string, number>();
 
     /** Sync Cesium entities with the fleet store (runs outside React render). */
     function syncEntities() {
@@ -250,8 +307,11 @@ export default function GlobeViewInner() {
         if (ac.lat === 0 && ac.lon === 0) continue;
         seenIds.add(ac.icao);
 
-        const colour = aircraftColour(C, ac);
+        const colourHex = aircraftColourHex(ac);
+        const colour = C.Color.fromCssColorString(colourHex);
         const isSelected = selectedIcao === ac.icao;
+        const isUrgent = ac.emergency !== "none";
+        const sprite = aircraftSprite(colourHex, pixelRatio);
         const iconSize = aircraftIconSize(isSelected);
         const rotation = trackToRotation(ac.track);
         const position = C.Cartesian3.fromDegrees(
@@ -259,58 +319,65 @@ export default function GlobeViewInner() {
           ac.lat,
           ac.altBaro * ALT_EXAGGERATION,
         );
+        // Shading is baked into the sprite, so the billboard must not tint it.
+        const labelText = ac.callsign || ac.icao;
+        const labelCondition = labelVisible(C, isSelected || isUrgent);
 
         let entity = v.entities.getById(ac.icao);
         if (entity) {
           (entity.position as import("cesium").ConstantPositionProperty).setValue(position);
           if (!entity.billboard) {
             entity.billboard = new C.BillboardGraphics({
-              image: AIRCRAFT_ICON_URL,
+              image: sprite,
               width: iconSize,
               height: iconSize,
-              color: colour,
               rotation,
               alignedAxis: C.Cartesian3.UNIT_Z,
               horizontalOrigin: C.HorizontalOrigin.CENTER,
               verticalOrigin: C.VerticalOrigin.CENTER,
+              scaleByDistance,
               disableDepthTestDistance: GLOBE_OCCLUSION_DEPTH_TEST_DISTANCE,
             });
             entity.point = undefined;
           } else {
-            entity.billboard.width = new C.ConstantProperty(iconSize) as unknown as import("cesium").Property;
-            entity.billboard.height = new C.ConstantProperty(iconSize) as unknown as import("cesium").Property;
-            entity.billboard.color = new C.ConstantProperty(colour) as unknown as import("cesium").Property;
-            entity.billboard.rotation = new C.ConstantProperty(rotation) as unknown as import("cesium").Property;
-            entity.billboard.disableDepthTestDistance =
-              new C.ConstantProperty(
-                GLOBE_OCCLUSION_DEPTH_TEST_DISTANCE,
-              ) as unknown as import("cesium").Property;
+            entity.billboard.image = constant(C, sprite);
+            entity.billboard.width = constant(C, iconSize);
+            entity.billboard.height = constant(C, iconSize);
+            entity.billboard.rotation = constant(C, rotation);
+            entity.billboard.scaleByDistance = constant(C, scaleByDistance);
+            entity.billboard.disableDepthTestDistance = constant(
+              C,
+              GLOBE_OCCLUSION_DEPTH_TEST_DISTANCE,
+            );
           }
-          entity.label!.text = new C.ConstantProperty(ac.callsign || ac.icao) as unknown as import("cesium").Property;
-          entity.label!.fillColor = new C.ConstantProperty(colour) as unknown as import("cesium").Property;
-          entity.label!.pixelOffset = new C.ConstantProperty(
+          entity.label!.text = constant(C, labelText);
+          entity.label!.fillColor = constant(C, colour);
+          entity.label!.pixelOffset = constant(
+            C,
             new C.Cartesian2(0, AIRCRAFT_LABEL_OFFSET_Y),
-          ) as unknown as import("cesium").Property;
-          entity.label!.disableDepthTestDistance = new C.ConstantProperty(
+          );
+          entity.label!.distanceDisplayCondition = constant(C, labelCondition);
+          entity.label!.disableDepthTestDistance = constant(
+            C,
             GLOBE_OCCLUSION_DEPTH_TEST_DISTANCE,
-          ) as unknown as import("cesium").Property;
+          );
         } else {
           v.entities.add({
             id: ac.icao,
             position,
             billboard: {
-              image: AIRCRAFT_ICON_URL,
+              image: sprite,
               width: iconSize,
               height: iconSize,
-              color: colour,
               rotation,
               alignedAxis: C.Cartesian3.UNIT_Z,
               horizontalOrigin: C.HorizontalOrigin.CENTER,
               verticalOrigin: C.VerticalOrigin.CENTER,
+              scaleByDistance,
               disableDepthTestDistance: GLOBE_OCCLUSION_DEPTH_TEST_DISTANCE,
             },
             label: {
-              text: ac.callsign || ac.icao,
+              text: labelText,
               font: "12px JetBrains Mono, monospace",
               fillColor: colour,
               outlineColor: C.Color.BLACK,
@@ -319,42 +386,73 @@ export default function GlobeViewInner() {
               verticalOrigin: C.VerticalOrigin.BOTTOM,
               pixelOffset: new C.Cartesian2(0, AIRCRAFT_LABEL_OFFSET_Y),
               showBackground: true,
-              backgroundColor: C.Color.BLACK.withAlpha(0.6),
+              backgroundColor: C.Color.BLACK.withAlpha(0.55),
+              distanceDisplayCondition: labelCondition,
               disableDepthTestDistance: GLOBE_OCCLUSION_DEPTH_TEST_DISTANCE,
             },
           });
         }
 
-        /* Trail for selected aircraft */
+        /* Flight path. Every aircraft gets one now — the whole point of a
+           trail is seeing where traffic came from, which a single selected
+           path could never show. Unselected aircraft draw a short tail so
+           hundreds of them stay cheap; the selection gets its full history
+           with a glow so it still stands out. */
         const trailId = TRAIL_ENTITY_PREFIX + ac.icao;
         const existingTrail = v.entities.getById(trailId);
-        if (isSelected) {
-          const trail = trails.get(ac.icao);
-          if (trail && trail.length >= 2) {
-            const positions = trail.map((p) =>
+        const trail = trails.get(ac.icao);
+        const visible = trail
+          ? isSelected
+            ? trail
+            : trail.slice(-TRAIL_TAIL_POINTS)
+          : undefined;
+
+        if (visible && visible.length >= 2) {
+          seenIds.add(trailId);
+          // Rebuilding hundreds of polylines every second is what makes a
+          // full-fleet trail expensive, so untouched paths are left alone.
+          const changed =
+            !existingTrail || trailRevision.get(trailId) !== visible.length;
+
+          if (changed || isSelected) {
+            const positions = visible.map((p) =>
               C.Cartesian3.fromDegrees(
                 p.lon,
                 p.lat,
-                Math.max(p.alt, 100) * ALT_EXAGGERATION,
+                Math.max(p.alt, TRAIL_MIN_ALTITUDE_M) * ALT_EXAGGERATION,
               ),
             );
-            if (existingTrail) {
-              existingTrail.polyline!.positions = new C.ConstantProperty(positions) as unknown as import("cesium").Property;
+
+            // Altitude is carried through, so a climb-out visibly rises off
+            // the surface rather than lying flat against it.
+            const material = isSelected
+              ? new C.PolylineGlowMaterialProperty({
+                  color: colour.withAlpha(0.85),
+                  glowPower: 0.22,
+                  taperPower: 0.45,
+                })
+              : new C.ColorMaterialProperty(colour.withAlpha(0.32));
+
+            if (existingTrail?.polyline) {
+              existingTrail.polyline.positions = constant(C, positions);
+              existingTrail.polyline.material = material;
+              existingTrail.polyline.width = constant(C, isSelected ? 3 : 1.4);
             } else {
               v.entities.add({
                 id: trailId,
                 polyline: {
                   positions,
-                  width: 2,
-                  material: new C.ColorMaterialProperty(trailColour),
+                  width: isSelected ? 3 : 1.4,
+                  material,
                   arcType: C.ArcType.NONE,
                 },
               });
             }
+            trailRevision.set(trailId, visible.length);
           }
-          seenIds.add(trailId);
         } else if (existingTrail) {
           v.entities.remove(existingTrail);
+          trailRevision.delete(trailId);
         }
       }
 

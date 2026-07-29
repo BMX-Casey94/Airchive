@@ -24,6 +24,8 @@ interface FleetState {
   removeAircraft: (icao: string) => void;
   clearFleet: () => void;
   pruneStale: (maxAgeMs?: number) => number;
+  /** Seeds trails restored from storage without disturbing live ones. */
+  hydrateTrails: (restored: Map<string, PositionSnapshot[]>) => void;
 }
 
 export const useFleetStore = create<FleetState>()((set, get) => ({
@@ -173,6 +175,27 @@ export const useFleetStore = create<FleetState>()((set, get) => ({
       trails: new Map(),
       selectedIcao: null,
       selectedFlightId: null,
+    }),
+
+  hydrateTrails: (restored) =>
+    set((state) => {
+      if (restored.size === 0) return state;
+      const nextTrails = new Map(state.trails);
+
+      for (const [icao, points] of restored) {
+        const live = nextTrails.get(icao);
+        if (!live || live.length === 0) {
+          nextTrails.set(icao, points.slice(-TRAIL_BUFFER_SIZE));
+          continue;
+        }
+        // Points gathered since the page opened win; the restored history is
+        // stitched on in front of them, dropping any overlap by timestamp.
+        const earliestLive = live[0]!.ts;
+        const history = points.filter((p) => p.ts < earliestLive);
+        nextTrails.set(icao, [...history, ...live].slice(-TRAIL_BUFFER_SIZE));
+      }
+
+      return { trails: nextTrails };
     }),
 
   pruneStale: (maxAgeMs = 300_000) => {
