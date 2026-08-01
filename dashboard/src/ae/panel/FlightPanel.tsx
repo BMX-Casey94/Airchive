@@ -85,7 +85,11 @@ function Chevron({ direction }: { direction: "up" | "down" }) {
       aria-hidden="true"
     >
       <path
-        d={direction === "up" ? "M2.5 7.5 6 4l3.5 3.5" : "M2.5 4.5 6 8l3.5 3.5"}
+        d={
+          direction === "up"
+            ? "M2.5 7.5 L6 4 L9.5 7.5"
+            : "M2.5 4.5 L6 8 L9.5 4.5"
+        }
         strokeLinecap="round"
         strokeLinejoin="round"
       />
