@@ -264,6 +264,12 @@ export class AeEngine {
     this.disc.setDimmed(dimmed);
   }
 
+  /** Halve toroidal-field opacity so trails and aircraft stand out. */
+  setTorusDimmed(dimmed: boolean): void {
+    if (this.disposed) return;
+    this.torus.setDimmed(dimmed);
+  }
+
   /** Feed the scene from the fleet store; call on every store change. */
   syncData(
     aircraft: Map<string, AircraftState>,
@@ -353,7 +359,7 @@ export class AeEngine {
       }
 
       this.disc.update(dt);
-      this.torus.update(elapsed);
+      this.torus.update(elapsed, dt);
       this.trails.updateFrame(this.camera, elapsed);
       this.labels.update(this.camera, dt);
 

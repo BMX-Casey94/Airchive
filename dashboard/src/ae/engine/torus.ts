@@ -59,6 +59,7 @@ const LINE_VERTEX = /* glsl */ `
 const LINE_FRAGMENT = /* glsl */ `
   precision highp float;
   uniform float uTime;
+  uniform float uDim;
   varying float vT;
   varying float vSeed;
   varying vec3 vColor;
@@ -76,7 +77,7 @@ const LINE_FRAGMENT = /* glsl */ `
 
     float base = 0.03;
     vec3 color = vColor * (base + comet * 2.4);
-    float alpha = (base + comet * 1.05) * taper;
+    float alpha = (base + comet * 1.05) * taper * (1.0 - 0.5 * uDim);
     gl_FragColor = vec4(color, alpha);
   }
 `;
@@ -141,7 +142,7 @@ function buildCage(cMax: number): {
     transparent: true,
     blending: THREE.AdditiveBlending,
     depthWrite: false,
-    uniforms: { uTime: { value: 0 } },
+    uniforms: { uTime: { value: 0 }, uDim: { value: 0 } },
   });
 
   return { geometry, material };
@@ -191,12 +192,13 @@ const PARTICLE_VERTEX = /* glsl */ `
 
 const PARTICLE_FRAGMENT = /* glsl */ `
   precision highp float;
+  uniform float uDim;
   varying vec3 vColor;
   varying float vFade;
 
   void main() {
     float d = length(gl_PointCoord - vec2(0.5));
-    float alpha = smoothstep(0.5, 0.08, d) * 0.3 * vFade;
+    float alpha = smoothstep(0.5, 0.08, d) * 0.3 * vFade * (1.0 - 0.5 * uDim);
     if (alpha < 0.004) discard;
     gl_FragColor = vec4(vColor * (0.7 + 0.9 * vFade), alpha);
   }
@@ -265,7 +267,7 @@ function buildParticles(cMax: number): {
     transparent: true,
     blending: THREE.AdditiveBlending,
     depthWrite: false,
-    uniforms: { uTime: { value: 0 } },
+    uniforms: { uTime: { value: 0 }, uDim: { value: 0 } },
   });
 
   return { geometry, material };
@@ -286,6 +288,7 @@ const BEAM_FRAGMENT = /* glsl */ `
   uniform float uTime;
   uniform vec3 uColor;
   uniform float uAlpha;
+  uniform float uDim;
   varying float vV;
 
   void main() {
@@ -294,7 +297,7 @@ const BEAM_FRAGMENT = /* glsl */ `
     // Gain capped so the core stays below the bloom threshold's runaway
     // range — the beam should read as a polar axis, not a searchlight.
     vec3 color = uColor * (0.5 + 1.05 * falloff);
-    gl_FragColor = vec4(color, falloff * uAlpha * flicker);
+    gl_FragColor = vec4(color, falloff * uAlpha * flicker * (1.0 - 0.5 * uDim));
   }
 `;
 
@@ -316,6 +319,7 @@ function buildBeam(
       uTime: { value: 0 },
       uColor: { value: new THREE.Color(color) },
       uAlpha: { value: alpha },
+      uDim: { value: 0 },
     },
   });
   return { mesh: new THREE.Mesh(geometry, material), material };
@@ -325,7 +329,9 @@ function buildBeam(
 
 export interface TorusHandle {
   object: THREE.Object3D;
-  update: (elapsedSeconds: number) => void;
+  /** Halve field opacity so trails and aircraft stand out. */
+  setDimmed: (dimmed: boolean) => void;
+  update: (elapsedSeconds: number, dt: number) => void;
   dispose: () => void;
 }
 
@@ -354,11 +360,24 @@ export function createToroidalField(): TorusHandle {
   group.add(beamHalo.mesh);
 
   const materials = [cage.material, particles.material, beamCore.material, beamHalo.material];
+  let dimTarget = 0;
 
   return {
     object: group,
-    update(elapsedSeconds) {
-      for (const m of materials) m.uniforms.uTime.value = elapsedSeconds;
+    setDimmed(dimmed) {
+      dimTarget = dimmed ? 1 : 0;
+    },
+    update(elapsedSeconds, dt) {
+      for (const m of materials) {
+        m.uniforms.uTime.value = elapsedSeconds;
+        const dim = m.uniforms.uDim;
+        const delta = dimTarget - (dim.value as number);
+        if (Math.abs(delta) > 1e-4) {
+          dim.value =
+            (dim.value as number)
+            + Math.sign(delta) * Math.min(Math.abs(delta), dt * 3);
+        }
+      }
     },
     dispose() {
       cage.geometry.dispose();

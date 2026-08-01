@@ -18,18 +18,31 @@ import FlightPanel from "./panel/FlightPanel";
  */
 
 const PERSIST_INTERVAL_MS = 10_000;
-const MAP_DIM_STORAGE_KEY = "ae-map-dim";
+/** v2: absent keys default to dimmed; the old `ae-map-dim` key wrote "0" on first visit. */
+const MAP_DIM_STORAGE_KEY = "ae-map-dim-v2";
+const TORUS_DIM_STORAGE_KEY = "ae-torus-dim";
 
 function selectBoth(icao: string | null): void {
   useFleetStore.getState().selectAircraft(icao);
   useAircraftStore.getState().selectAircraft(icao);
 }
 
-function readPersistedDim(): boolean {
+/** Absent keys default to dimmed (50%) so overlays stay readable first visit. */
+function readPersistedDim(key: string): boolean {
   try {
-    return window.localStorage.getItem(MAP_DIM_STORAGE_KEY) === "1";
+    const v = window.localStorage.getItem(key);
+    if (v === null) return true;
+    return v === "1";
   } catch {
-    return false;
+    return true;
+  }
+}
+
+function persistDim(key: string, dimmed: boolean): void {
+  try {
+    window.localStorage.setItem(key, dimmed ? "1" : "0");
+  } catch {
+    // Storage unavailable (private mode); the toggle still works in-session.
   }
 }
 
@@ -39,7 +52,12 @@ export default function AeView() {
   const deepLinkApplied = useRef(false);
   const [contextLost, setContextLost] = useState(false);
   const [utc, setUtc] = useState("--:--:--");
-  const [mapDimmed, setMapDimmed] = useState(readPersistedDim);
+  const [mapDimmed, setMapDimmed] = useState(() =>
+    readPersistedDim(MAP_DIM_STORAGE_KEY),
+  );
+  const [torusDimmed, setTorusDimmed] = useState(() =>
+    readPersistedDim(TORUS_DIM_STORAGE_KEY),
+  );
 
   const { connected } = useWebSocket();
   const sessions = useActiveSessions();
@@ -77,15 +95,16 @@ export default function AeView() {
     };
   }, []);
 
-  /* ── Map dim toggle ───────────────────────────────────────── */
+  /* ── Map / torus dim toggles ──────────────────────────────── */
   useEffect(() => {
     engineRef.current?.setMapDimmed(mapDimmed);
-    try {
-      window.localStorage.setItem(MAP_DIM_STORAGE_KEY, mapDimmed ? "1" : "0");
-    } catch {
-      // Storage unavailable (private mode); the toggle still works in-session.
-    }
+    persistDim(MAP_DIM_STORAGE_KEY, mapDimmed);
   }, [mapDimmed]);
+
+  useEffect(() => {
+    engineRef.current?.setTorusDimmed(torusDimmed);
+    persistDim(TORUS_DIM_STORAGE_KEY, torusDimmed);
+  }, [torusDimmed]);
 
   /* ── Trail persistence across reloads ─────────────────────── */
   useEffect(() => {
@@ -161,21 +180,36 @@ export default function AeView() {
         </div>
       </div>
 
-      {/* ── Bottom-left: map dim toggle + legend ─────────────── */}
+      {/* ── Bottom-left: dim toggles + legend ────────────────── */}
       <div className="pointer-events-none absolute bottom-3 left-3 z-10 flex select-none flex-col items-start gap-2 sm:bottom-4 sm:left-4">
-        <button
-          type="button"
-          onClick={() => setMapDimmed((v) => !v)}
-          aria-pressed={mapDimmed}
-          aria-label="Dim the map to highlight aircraft"
-          className={`panel pointer-events-auto px-3 py-1.5 font-mono text-[10px] tracking-widest transition-colors ${
-            mapDimmed
-              ? "border-electric-cyan/50 text-electric-cyan"
-              : "text-hud-muted hover:text-white"
-          }`}
-        >
-          MAP {mapDimmed ? "50%" : "100%"}
-        </button>
+        <div className="pointer-events-auto flex flex-wrap items-center gap-1.5">
+          <button
+            type="button"
+            onClick={() => setMapDimmed((v) => !v)}
+            aria-pressed={mapDimmed}
+            aria-label="Dim the map to highlight aircraft"
+            className={`panel px-3 py-1.5 font-mono text-[10px] tracking-widest transition-colors ${
+              mapDimmed
+                ? "border-electric-cyan/50 text-electric-cyan"
+                : "text-hud-muted hover:text-white"
+            }`}
+          >
+            MAP {mapDimmed ? "50%" : "100%"}
+          </button>
+          <button
+            type="button"
+            onClick={() => setTorusDimmed((v) => !v)}
+            aria-pressed={torusDimmed}
+            aria-label="Dim the toroidal field lines"
+            className={`panel px-3 py-1.5 font-mono text-[10px] tracking-widest transition-colors ${
+              torusDimmed
+                ? "border-electric-cyan/50 text-electric-cyan"
+                : "text-hud-muted hover:text-white"
+            }`}
+          >
+            TORUS {torusDimmed ? "50%" : "100%"}
+          </button>
+        </div>
         <p className="hud-label">Azimuthal Equidistant · North Polar</p>
       </div>
 
