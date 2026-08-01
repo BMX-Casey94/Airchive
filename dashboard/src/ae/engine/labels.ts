@@ -145,7 +145,7 @@ const LABEL_LIFT = 0.06;
  * being keyed off the pole.
  */
 const TIER_FADE_IN = [Number.POSITIVE_INFINITY, 10, 5.5] as const;
-const TIER_OPACITY = [0.85, 0.8, 0.75] as const;
+const TIER_OPACITY = [0.62, 0.56, 0.5] as const;
 const FADE_SPEED = 3.5;
 
 const FONT_PX = 44;
@@ -190,7 +190,6 @@ function makeLabelTexture(
 
   const texture = new THREE.CanvasTexture(canvas);
   texture.colorSpace = THREE.SRGBColorSpace;
-  texture.anisotropy = 4;
   return { texture, aspect: canvas.width / canvas.height };
 }
 
@@ -214,7 +213,7 @@ export function createCountryLabels(): LabelsHandle {
   // Screen-height fraction per label line (sizeAttenuation off means sprite
   // scale is interpreted at unit camera distance, i.e. proportional to the
   // viewport rather than the world).
-  const heightScale = 0.028;
+  const heightScale = 0.019;
 
   for (const item of COUNTRY_LABELS) {
     const { texture, aspect } = makeLabelTexture(item.name);

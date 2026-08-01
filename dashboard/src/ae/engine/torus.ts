@@ -64,14 +64,19 @@ const LINE_FRAGMENT = /* glsl */ `
   varying vec3 vColor;
 
   void main() {
-    // Comet pulses flowing pole -> apex -> rim -> underside -> pole.
+    // Both ends of every loop converge on the pole; feather them away so
+    // lines emerge from and dissolve into nothing rather than terminating.
+    float taper = smoothstep(0.0, 0.14, vT) * smoothstep(1.0, 0.86, vT);
+
+    // Comet pulses flowing pole -> apex -> rim -> underside -> pole, with a
+    // feathered leading edge and a long exponential tail — no hard ends.
     float flow = fract(vT - uTime * 0.055 + vSeed);
     float p = fract(flow * 2.0);
-    float comet = exp(-p * 9.0);
+    float comet = smoothstep(0.0, 0.07, p) * exp(-p * 7.0);
 
     float base = 0.03;
-    vec3 color = vColor * (base + comet * 1.9);
-    float alpha = base + comet * 0.75;
+    vec3 color = vColor * (base + comet * 2.4);
+    float alpha = (base + comet * 1.05) * taper;
     gl_FragColor = vec4(color, alpha);
   }
 `;
@@ -178,7 +183,9 @@ const PARTICLE_VERTEX = /* glsl */ `
     gl_PointSize = min(aSize * swell * (22.0 / max(1.0, -mvPosition.z)), 7.0);
 
     vColor = aColor;
-    vFade = swell;
+    // Feather fully to nothing at both ends of the lap. sin() dips a hair
+    // negative at the seam, and pow of a negative is NaN in GLSL — clamp.
+    vFade = pow(max(sin(PI * t), 0.0), 1.3);
   }
 `;
 

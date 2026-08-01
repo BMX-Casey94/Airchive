@@ -182,13 +182,13 @@ function AeMapBanner() {
           }}
         />
 
-        <div className="relative flex items-center justify-between gap-4">
-          <div className="flex items-center gap-4 min-w-0">
+        <div className="relative flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
+          <div className="flex items-center gap-3 sm:gap-4 min-w-0">
             {/* Miniature polar disc */}
-            <div className="relative h-12 w-12 shrink-0" aria-hidden>
+            <div className="relative h-10 w-10 sm:h-12 sm:w-12 shrink-0" aria-hidden>
               <div className="absolute inset-0 rounded-full border border-electric-cyan/50" />
-              <div className="absolute inset-[7px] rounded-full border border-electric-cyan/30" />
-              <div className="absolute inset-[14px] rounded-full border border-electric-cyan/20" />
+              <div className="absolute inset-[6px] sm:inset-[7px] rounded-full border border-electric-cyan/30" />
+              <div className="absolute inset-[12px] sm:inset-[14px] rounded-full border border-electric-cyan/20" />
               <div className="absolute left-1/2 top-1/2 h-1.5 w-1.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-electric-cyan shadow-[0_0_8px_rgba(0,245,255,0.8)]" />
             </div>
 
@@ -196,14 +196,14 @@ function AeMapBanner() {
               <p className="hud-label text-electric-cyan/70">
                 Azimuthal Equidistant · North Polar
               </p>
-              <p className="mt-1 truncate font-mono text-sm text-white">
+              <p className="mt-1 font-mono text-xs leading-relaxed text-white sm:truncate sm:text-sm">
                 See the fleet from a different perspective — live flights across
                 the polar disc
               </p>
             </div>
           </div>
 
-          <span className="shrink-0 whitespace-nowrap font-mono text-xs tracking-widest text-electric-cyan transition-transform duration-300 group-hover:translate-x-1">
+          <span className="shrink-0 self-end whitespace-nowrap font-mono text-xs tracking-widest text-electric-cyan transition-transform duration-300 group-hover:translate-x-1 sm:self-auto">
             OPEN AE MAP →
           </span>
         </div>
