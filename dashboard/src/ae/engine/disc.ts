@@ -202,6 +202,11 @@ export function createDisc(renderer: THREE.WebGLRenderer): DiscHandle {
     transparent: true,
     blending: THREE.AdditiveBlending,
     depthWrite: false,
+    // The glow's inner reach is coplanar with the disc surface it overlaps, so
+    // depth-testing it decides a tie at every pixel and tears the band apart
+    // as the camera moves. Orbit is clamped above the disc plane, so the
+    // surface can never legitimately occlude the rim — testing buys nothing.
+    depthTest: false,
     side: THREE.DoubleSide,
     uniforms: {
       uRadius: { value: DISC_RADIUS },
