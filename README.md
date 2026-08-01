@@ -40,7 +40,7 @@ The goal is an auditable, append-only trail of flight activity suitable for safe
        │                          └───────────────┘
        ▼
   ┌──────────┐
-  │Dashboard │  Next.js + CesiumJS globe
+  │Dashboard │  Next.js + CesiumJS globe + AE polar map
   │(Operator)│  Fleet grid, blockchain feed, explorer,
   └──────────┘  alerts, agent marketplace panel
 ```
@@ -72,6 +72,7 @@ The operator dashboard ([https://airchive.vercel.app](https://airchive.vercel.ap
 | View | Description |
 |------|-------------|
 | **3D Globe** | CesiumJS globe with live aircraft positions, trails, labels, and custom aircraft billboards updated via WebSocket |
+| **AE Polar Flight Map** (`/ae`) | Full-screen azimuthal equidistant world disc centred on the North Pole, every active flight drawn as a complete take-off-to-landing trail. A bespoke three.js/WebGL engine rather than a Cesium view — [see below](#ae-polar-flight-map-ae) |
 | **Fleet Status Grid** | Card-per-aircraft showing ICAO, callsign, altitude, speed, heading, flight phase, and live on-chain write activity, with `All`, `Live`, and `Offline` filters |
 | **Selected Aircraft Panel** | Deep-dive into a single aircraft: telemetry readouts, altitude/speed charts, flight timeline, and a "View Wallet On-Chain" button linking to WhatsonChain |
 | **Blockchain Feed** | Fixed-height, scroll-free live viewer of the newest OP_RETURN transactions, with Chronicle badge, phase, size, fee, and timestamp |
@@ -85,6 +86,182 @@ The operator dashboard ([https://airchive.vercel.app](https://airchive.vercel.ap
 | **Funding Status** | Treasury state (`HEALTHY`, `LOW`, `DRY`, `RECOVERING`), balance, estimated runway and held-write count, with a banner when funding is unhealthy |
 | **Wallet List** | All 239 configured aircraft wallets with BIP44 index and WhatsonChain links, generated automatically from the configured fleet |
 | **Pitch / Cost Calculator** (`/demo`) | Interactive chain-write economics calculator — model the cost of full-fidelity archival per aircraft and per flight hour, adjust fleet size and flight hours, view the phase-by-phase write rate breakdown |
+
+## AE Polar Flight Map (`/ae`)
+
+A second projection of the live fleet: an **azimuthal equidistant world disc**
+centred on the North Pole, with every active flight drawn as a complete
+take-off-to-landing trail. It exists because a globe can only ever show you
+half the fleet at once — on a pole-centred AE disc, the transatlantic, polar
+and trans-Siberian routes that dominate long-haul traffic are all visible
+simultaneously, and the great-circle paths that look like arbitrary curves on
+a Mercator map read as the direct routes they actually are.
+
+Cesium renders an ellipsoid and cannot express this projection, so `/ae` is a
+self-contained three.js scene under `dashboard/src/ae` — its own renderer,
+shaders, projection maths and picking, sharing only the existing Zustand
+stores and WebSocket feed.
+
+### Projection: inverse-projected in the fragment shader
+
+The conventional way to draw an unusual projection on the web is to pre-warp
+raster tiles offline, which locks you to one resolution ladder and bakes
+resampling blur into the imagery. This does the opposite. The disc is a single
+circle mesh whose **fragment shader runs the inverse projection per pixel**:
+disc XZ → colatitude and longitude → equirectangular UV → sample NASA's
+unmodified equirectangular imagery.
+
+There is no pre-warped raster and no tile pyramid, so the map is exact at
+every zoom level and there is nothing to blur or seam. The disc radius (10
+world units) spans a colatitude of π — pole at the centre, Antarctic rim at
+the edge — which is the defining property of the projection: distance from the
+centre is linearly proportional to true great-circle distance from the pole.
+
+Two details matter more than they look:
+
+- **Antimeridian derivatives.** The `u` coordinate jumps 0↔1 along the
+  antimeridian ray. Left alone, the GPU sees an enormous UV derivative there,
+  selects the smallest mip level and paints a visible seam from pole to rim.
+  The screen-space derivatives are corrected across that discontinuity and the
+  texture fetched with `textureGrad`.
+- **Sphere normals, not disc normals.** The day/night terminator is shaded
+  against the *sphere* normal reconstructed from lat/lon, because the disc is
+  a projection of a sphere and its own flat normal carries no information. The
+  subsolar point comes from a standard low-precision solar ephemeris including
+  the equation of time, recomputed once a minute, so the terminator sits where
+  it genuinely is rather than being decorative.
+
+Vector linework (Natural Earth coastlines and borders, plus a 15° graticule)
+is projected once on the CPU and drawn as native GL hairlines — one pixel wide
+at any zoom. Every edge is **densified to 0.75° steps** before projection: a
+straight chord between two lat/lon points is badly wrong on an AE disc, and
+near the rim the distortion is extreme enough that undersampled coastlines cut
+visibly across the map. Meridians are the exception; on a polar aspect they
+are radial lines and straight by definition.
+
+Two further pieces of projection-specific geometry:
+
+- **Heading.** Local north at any point on a polar AE disc is the direction
+  toward the disc centre, so an aircraft's on-screen yaw depends on its
+  longitude as well as its ADS-B track.
+- **Altitude.** Vertical exaggeration is deliberate. At true scale a cruising
+  airliner sits about 7.5 miles above a disc whose radius represents roughly
+  12,400 miles, which is invisible. Altitude is scaled to lift cruise a little
+  clear of the surface — enough for relief, shallow enough that a climb-out
+  does not render as a steep glowing ramp over the departure airport.
+
+### Persisting full flight paths
+
+The harder half of this feature was data, not graphics. Trails were previously
+reconstructed client-side from whichever telemetry frames a browser happened
+to witness, so a dashboard opened mid-flight showed a trail that began the
+moment the page loaded, and a refresh threw away everything before it. A map
+whose whole premise is showing complete routes needed the real path.
+
+Migration `014_session_positions` adds a `session_positions` table — a
+thinned, phase-aware position stream per flight session, keyed to
+`flight_sessions` with cascade delete and indexed on `(flight_id, ts)`.
+Timestamps are epoch milliseconds because the consumers are browsers merging
+this stream with live WebSocket telemetry that already speaks epoch-ms.
+
+A `SessionPositionRecorder` in the ingestion service buffers and samples the
+stream. Sampling is **phase-aware**, mirroring the write-rate controller's
+philosophy without touching the on-chain write path:
+
+| Phase | Stored every |
+|-------|--------------|
+| TAKEOFF, APPROACH, LANDING | 2s |
+| TAXI, CLIMB, DESCENT, TAXI_IN | 5s |
+| CRUISE | 15s |
+| PARKED | 60s |
+
+Cruise is close to a straight line and needs very few points; turns and
+altitude changes cluster around airports, so those phases sample densely.
+Phase transitions force a point regardless of the interval, so the exact
+take-off and landing coordinates are always in the stored path. Movement below
+roughly 30 metres is treated as jitter and dropped, with a liveness point every
+60 seconds so a parked aircraft still has a heartbeat. Points are batch-inserted
+every 5 seconds or every 500 rows, and a failed flush requeues behind a
+2,000-row ceiling so a database outage cannot grow memory without bound. A
+complete flight typically lands under 1,000 rows.
+
+The gateway exposes `GET /api/sessions/active` (every open session with its
+path) and `GET /api/flights/:flightId/path` (any single flight, active or
+completed), with three optimisations worth noting:
+
+- **Thinning happens in SQL.** A window function decimates long paths with
+  `row_number() % step`, always keeping the final point, so a long-haul path
+  of several thousand rows is reduced in the database rather than shipped
+  whole and discarded client-side. Callers may request 50–4,000 points; the
+  default is 1,500.
+- **Tuples, not objects.** Path points go over the wire as
+  `[ts, lat, lon, alt_baro, gs, track]`, roughly halving the JSON payload
+  compared with named fields repeated thousands of times.
+- **A 2-second response cache** absorbs every open dashboard tab polling at
+  once, which is invisible against paths that gain a point every few seconds.
+
+The client fetches this on a 30-second SWR interval and feeds it into the
+existing fleet store through the same timestamp-aware `hydrateTrails` used for
+IndexedDB restores. Because that merge is ordered by timestamp and
+deduplicating, the server baseline, the browser's own IndexedDB history and
+live WebSocket telemetry all stitch into one continuous trail, and repeated
+refreshes converge rather than accumulating duplicates.
+
+### Scene composition
+
+| Layer | Approach |
+|-------|----------|
+| **Trails** | Drawn twice — a wide additive glow underlay and a crisp core line, both screen-space-width `Line2` so they stay legible at any zoom. Colour ramps from dim ember on the ground to bright gold at cruise |
+| **Aircraft** | Procedurally generated low-poly airliners (extruded plan-view silhouette plus a vertical stabiliser), the only lit objects in the scene — everything else is unlit shaders |
+| **Toroidal field** | A cage of poloidal loops through the pole, helically twisted with the swirl direction alternating per shell, plus 2,200 flowing particles and an axial beam |
+| **Country labels** | 111 billboarded sprites over three zoom tiers, fading in per-label by camera distance so the disc is never cluttered at a given zoom |
+| **Void** | A shader gradient with per-pixel dither — a dark gradient across a full screen bands visibly on 8-bit displays without it |
+
+The bloom pass is the reason several of these are tuned the way they are.
+Ordinary trails are deliberately capped *below* the bloom threshold so they
+stay crisp, and only the selected flight's core is pushed into HDR (channel
+values above 1) so exactly one trail halos. The toroidal field's particles
+went through the same calibration — an early build's sizing formula produced a
+single white bloom that washed out the entire scene.
+
+The field's particles are advected **entirely in the vertex shader**: their
+paths are baked into attributes and only a clock uniform changes per frame, so
+2,200 animated particles cost no per-frame CPU work and upload no buffers.
+Every loop begins and ends exactly at the pole, where the loop radius is zero,
+which is what lets any amount of helical twist still close cleanly. Both ends
+taper to nothing and the travelling pulses feather at the leading edge, so
+nothing in the field terminates on a hard line.
+
+### Interaction
+
+- **Free exploration.** Orbit with zoom-to-cursor and panning, with the pivot
+  clamped to the disc plane and inside the rim so the camera can dive toward
+  any point on the map but never wander off into empty void.
+- **Click to focus.** Selecting an aircraft glides the camera to frame it and
+  drops a pulsing pin at its take-off point, while every other trail dims. The
+  approach direction is preserved during the move — only the pivot and
+  distance change — because rotating the world underneath someone to reach a
+  target is disorienting. Grabbing the map cancels the animation instantly.
+- **Map dim toggle.** Halves the imagery brightness so aircraft and trails
+  dominate, animated in the shader and remembered in `localStorage`. It dims
+  brightness rather than opacity deliberately: the disc has to stay opaque or
+  the void gradient would show through the Earth's surface.
+- **Touch.** Taps are allowed 14px of travel before counting as a drag, versus
+  6px for a mouse. At the mouse threshold, ordinary finger jitter rejected most
+  taps and selecting an aircraft on a phone was a lottery.
+- **Degradation.** The intro camera move respects `prefers-reduced-motion`,
+  rendering pauses when the tab is hidden, WebGL context loss offers a reload
+  rather than a frozen canvas, and missing imagery falls back to vector-only
+  rendering instead of an empty scene.
+
+### Assets
+
+`dashboard/scripts/fetch-ae-assets.mjs` runs on `predev` and `prebuild` and
+fetches four files into `public/ae/`, all public domain or equivalent: NASA
+Blue Marble Next Generation (day, 5400×2700), NASA Black Marble 2016 (night
+lights), and Natural Earth 1:50m land and country TopoJSON. It skips anything
+already present and warns rather than fails when offline, so a build without
+network access still produces a working — if imagery-free — map.
 
 ## BSV Chronicle Compatibility
 
@@ -219,6 +396,7 @@ pnpm --filter @airchive/dashboard dev
 ### Live deployment
 
 - **Dashboard:** [https://airchive.vercel.app](https://airchive.vercel.app)
+- **AE polar flight map:** [https://airchive.vercel.app/ae](https://airchive.vercel.app/ae)
 - **Pitch / cost calculator:** [https://airchive.vercel.app/demo](https://airchive.vercel.app/demo)
 - **Wallet list:** [https://airchive.vercel.app/wallets](https://airchive.vercel.app/wallets)
 
@@ -239,7 +417,7 @@ The gateway's REST and WebSocket endpoints need to be reachable from Vercel. Eit
 
 - **Runtime:** Node.js 22+, TypeScript, pnpm workspaces
 - **Data:** PostgreSQL 16, Redis 7
-- **Web:** Next.js 15, React 19, Tailwind CSS, Framer Motion, Cesium (globe)
+- **Web:** Next.js 15, React 19, Tailwind CSS, Framer Motion, Cesium (globe), three.js + GLSL (AE polar map)
 - **Chain:** BSV mainnet (Arcade primary, TAAL ARC fallback, Whatsonchain, `@bsv/sdk` v2, `@bsv/simple`)
 - **Verification:** SPV — local proof-of-work-checked header chain, BUMP and TSC proof validation
 - **Agent infra:** `@bsv/simple` ServerWallet, BRC-100 Identity Registry, MessageBox P2P
@@ -263,6 +441,7 @@ The gateway's REST and WebSocket endpoints need to be reachable from Vercel. Eit
 | `services/overlay-node` | BSV overlay node — `tm_airchive` topic manager, `AirchiveLookupService`, REST + WebSocket API |
 | `services/alert-engine` | Configurable alerting (email/SMS via SendGrid/Twilio) |
 | `dashboard` | Next.js operator UI — globe, fleet grid, blockchain feed, agent marketplace panel |
+| `dashboard/src/ae` | Custom three.js engine for the AE polar flight map — projection maths, disc/field/label shaders, trail layer, flight dossier |
 | `deploy` | VPS runbook, systemd units, entrypoint and verified backup/restore scripts |
 | `k8s`, `nginx` | Kubernetes manifests and reverse-proxy configuration |
 
