@@ -105,7 +105,7 @@ export default function AeView() {
   }, []);
 
   return (
-    <div className="fixed inset-0 overflow-hidden bg-[#02040a]">
+    <div className="fixed inset-0 overflow-hidden bg-[#010104]">
       <div ref={containerRef} className="absolute inset-0" />
 
       {/* ── Top HUD ──────────────────────────────────────────── */}
@@ -147,7 +147,7 @@ export default function AeView() {
 
       {/* ── WebGL context loss ───────────────────────────────── */}
       {contextLost && (
-        <div className="absolute inset-0 z-30 flex items-center justify-center bg-[#02040a]/90">
+        <div className="absolute inset-0 z-30 flex items-center justify-center bg-[#010104]/90">
           <div className="panel flex flex-col items-center gap-4 p-8 text-center">
             <p className="font-mono text-sm text-white">
               The graphics context was lost.

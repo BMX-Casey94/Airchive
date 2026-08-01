@@ -9,6 +9,7 @@ import { DISC_RADIUS, latLonToUnitVector, subsolarPoint } from "./projection";
 import { createDisc, type DiscHandle } from "./disc";
 import { createVectorLayers, type VectorLayersHandle } from "./vectors";
 import { createToroidalField, type TorusHandle } from "./torus";
+import { createCountryLabels, type LabelsHandle } from "./labels";
 import { TrailsLayer } from "./trails";
 
 /**
@@ -25,7 +26,7 @@ export interface AeEngineOptions {
   onContextLost?: () => void;
 }
 
-const VOID_COLOR = 0x02040a;
+const VOID_COLOR = 0x010104;
 const CAMERA_HOME = new THREE.Vector3(0, 8.5, 14.5);
 const CAMERA_INTRO_START = new THREE.Vector3(0, 30, 0.8);
 const INTRO_DURATION_S = 2.4;
@@ -34,6 +35,39 @@ const CLICK_MAX_DISTANCE_PX = 6;
 const CLICK_MAX_DURATION_MS = 400;
 /** The orbit/zoom pivot may roam anywhere on the disc, but not off it. */
 const MAX_TARGET_RADIUS = DISC_RADIUS * 0.98;
+const FOCUS_DURATION_S = 1.5;
+
+/**
+ * The void: a slow vertical ramp from deep violet overhead through an
+ * indigo-teal band at the horizon down to near-black beneath the disc, with
+ * per-pixel dither so the dark gradient never bands.
+ */
+const VOID_VERTEX = /* glsl */ `
+  varying vec3 vDir;
+  void main() {
+    vDir = position;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  }
+`;
+
+const VOID_FRAGMENT = /* glsl */ `
+  precision highp float;
+  varying vec3 vDir;
+
+  void main() {
+    float h = normalize(vDir).y;
+    vec3 top = vec3(0.045, 0.024, 0.095);
+    vec3 mid = vec3(0.012, 0.027, 0.055);
+    vec3 bot = vec3(0.003, 0.004, 0.010);
+    vec3 col = h >= 0.0
+      ? mix(mid, top, smoothstep(0.0, 0.75, h))
+      : mix(mid, bot, smoothstep(0.0, 0.55, -h));
+    col += vec3(0.010, 0.045, 0.060) * exp(-abs(h) * 9.0);
+    float n = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
+    col += (n - 0.5) * (1.5 / 255.0);
+    gl_FragColor = vec4(col, 1.0);
+  }
+`;
 
 function easeInOutCubic(t: number): number {
   return t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2;
@@ -60,6 +94,13 @@ export class AeEngine {
 
   private readonly torus: TorusHandle;
 
+  private readonly labels: LabelsHandle;
+
+  private readonly voidBackground: THREE.Mesh<
+    THREE.SphereGeometry,
+    THREE.ShaderMaterial
+  >;
+
   private readonly trails = new TrailsLayer();
 
   private readonly raycaster = new THREE.Raycaster();
@@ -79,6 +120,19 @@ export class AeEngine {
   private sunTimer = Number.POSITIVE_INFINITY;
 
   private pointerDown: { x: number; y: number; at: number } | null = null;
+
+  private lastSelectedIcao: string | null = null;
+
+  /** Selection made before the marker existed; retried on later syncs. */
+  private pendingFocusIcao: string | null = null;
+
+  private focus: {
+    t: number;
+    fromTarget: THREE.Vector3;
+    toTarget: THREE.Vector3;
+    fromCam: THREE.Vector3;
+    toCam: THREE.Vector3;
+  } | null = null;
 
   constructor(opts: AeEngineOptions) {
     this.opts = opts;
@@ -106,12 +160,28 @@ export class AeEngine {
     this.camera.lookAt(0, 0, 0);
 
     // Scene content.
+    this.voidBackground = new THREE.Mesh(
+      new THREE.SphereGeometry(90, 48, 32),
+      new THREE.ShaderMaterial({
+        vertexShader: VOID_VERTEX,
+        fragmentShader: VOID_FRAGMENT,
+        side: THREE.BackSide,
+        depthWrite: false,
+      }),
+    );
+    this.voidBackground.renderOrder = -1;
+    this.voidBackground.frustumCulled = false;
+    this.scene.add(this.voidBackground);
+
     this.disc = createDisc(this.renderer);
     this.scene.add(this.disc.group);
     this.disc.loadTextures("/ae/textures/earth-day.jpg", "/ae/textures/earth-night.jpg");
 
     this.vectors = createVectorLayers();
     this.scene.add(this.vectors.group);
+
+    this.labels = createCountryLabels();
+    this.scene.add(this.labels.group);
 
     this.torus = createToroidalField();
     this.scene.add(this.torus.object);
@@ -188,6 +258,14 @@ export class AeEngine {
   ): void {
     if (this.disposed) return;
     this.trails.sync(aircraft, trails, selectedIcao);
+
+    if (selectedIcao !== this.lastSelectedIcao) {
+      this.lastSelectedIcao = selectedIcao;
+      this.pendingFocusIcao = selectedIcao;
+    }
+    if (this.pendingFocusIcao && this.beginFocus(this.pendingFocusIcao)) {
+      this.pendingFocusIcao = null;
+    }
   }
 
   dispose(): void {
@@ -203,9 +281,12 @@ export class AeEngine {
 
     this.controls.dispose();
     this.trails.dispose();
+    this.labels.dispose();
     this.torus.dispose();
     this.vectors.dispose();
     this.disc.dispose();
+    this.voidBackground.geometry.dispose();
+    this.voidBackground.material.dispose();
     this.composer.dispose();
     this.renderer.dispose();
     this.renderer.domElement.remove();
@@ -239,6 +320,14 @@ export class AeEngine {
           this.introDone = true;
           this.controls.enabled = true;
         }
+      } else if (this.focus) {
+        const focus = this.focus;
+        focus.t += dt / FOCUS_DURATION_S;
+        const k = easeInOutCubic(Math.min(1, focus.t));
+        this.controls.target.lerpVectors(focus.fromTarget, focus.toTarget, k);
+        this.camera.position.lerpVectors(focus.fromCam, focus.toCam, k);
+        this.camera.lookAt(this.controls.target);
+        if (focus.t >= 1) this.focus = null;
       } else {
         this.controls.update();
         this.clampTarget();
@@ -252,10 +341,38 @@ export class AeEngine {
       this.disc.update(dt);
       this.torus.update(elapsed);
       this.trails.updateFrame(this.camera, elapsed);
+      this.labels.update(this.camera, dt);
 
       this.composer.render();
     };
     tick();
+  }
+
+  /**
+   * Glide the camera to frame the selected aircraft. The approach direction
+   * is preserved (no disorienting spin); only the pivot and distance change.
+   * Returns false when the marker is not on stage yet so the caller can
+   * retry on a later sync.
+   */
+  private beginFocus(icao: string): boolean {
+    const markerPos = this.trails.getMarkerPosition(icao);
+    if (!markerPos) return false;
+    if (!this.introDone) return true; // let the intro land at home first
+
+    const toTarget = new THREE.Vector3(markerPos.x, 0, markerPos.z);
+    const offset = this.camera.position.clone().sub(this.controls.target);
+    const distance = THREE.MathUtils.clamp(offset.length() * 0.5, 3.2, 6.5);
+    const toCam = toTarget.clone().add(offset.normalize().multiplyScalar(distance));
+    if (toCam.y < 1.6) toCam.y = 1.6;
+
+    this.focus = {
+      t: 0,
+      fromTarget: this.controls.target.clone(),
+      toTarget,
+      fromCam: this.camera.position.clone(),
+      toCam,
+    };
+    return true;
   }
 
   /** Keep the orbit pivot glued to the disc plane and inside its rim. */
@@ -277,6 +394,8 @@ export class AeEngine {
   }
 
   private readonly onPointerDown = (e: PointerEvent): void => {
+    // A grab always hands control straight back to the user.
+    this.focus = null;
     this.pointerDown = { x: e.clientX, y: e.clientY, at: performance.now() };
   };
 

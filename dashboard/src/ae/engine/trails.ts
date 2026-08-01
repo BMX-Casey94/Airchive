@@ -33,6 +33,8 @@ interface TrailEntry {
   hitArea: THREE.Mesh;
   pointCount: number;
   lastTs: number;
+  /** World position of the oldest known trail point (the take-off end). */
+  originPos: THREE.Vector3 | null;
 }
 
 const CRUISE_FT = 42_000;
@@ -81,6 +83,13 @@ export class TrailsLayer {
 
   private selectedIcao: string | null = null;
 
+  /** Take-off pin shown at the selected flight's first known point. */
+  private readonly originPin = createOriginPin();
+
+  constructor() {
+    this.group.add(this.originPin.group);
+  }
+
   setResolution(width: number, height: number): void {
     this.resolution.set(width, height);
     for (const entry of this.entries.values()) {
@@ -96,6 +105,12 @@ export class TrailsLayer {
       if (entry.marker.visible) list.push(entry.hitArea);
     }
     return list;
+  }
+
+  /** Current world position of an aircraft's marker, for camera focus. */
+  getMarkerPosition(icao: string): THREE.Vector3 | null {
+    const entry = this.entries.get(icao);
+    return entry?.marker.visible ? entry.marker.position.clone() : null;
   }
 
   sync(
@@ -148,6 +163,14 @@ export class TrailsLayer {
       }
       entry.marker.scale.setScalar(scale);
     }
+
+    if (this.originPin.group.visible) {
+      const dist = camera.position.distanceTo(this.originPin.group.position);
+      this.originPin.group.scale.setScalar(
+        THREE.MathUtils.clamp(dist * 0.06, 0.5, 2.5),
+      );
+      this.originPin.animate(elapsedSeconds);
+    }
   }
 
   dispose(): void {
@@ -157,6 +180,7 @@ export class TrailsLayer {
     this.entries.clear();
     this.aircraftGeometry.dispose();
     this.hitGeometry.dispose();
+    this.originPin.dispose();
   }
 
   private createEntry(icao: string): TrailEntry {
@@ -235,6 +259,7 @@ export class TrailsLayer {
       hitArea,
       pointCount: 0,
       lastTs: 0,
+      originPos: null,
     };
     this.entries.set(icao, entry);
     return entry;
@@ -264,6 +289,16 @@ export class TrailsLayer {
     const last = points[points.length - 1];
     entry.pointCount = points.length;
     entry.lastTs = last?.ts ?? 0;
+
+    const first = points[0];
+    if (first) {
+      const [ox, , oz] = projectLatLon(first.lat, first.lon, 0);
+      entry.originPos = (entry.originPos ?? new THREE.Vector3()).set(
+        ox,
+        TRAIL_BASE_LIFT,
+        oz,
+      );
+    }
   }
 
   private updateMarker(entry: TrailEntry, state: AircraftState): void {
@@ -294,6 +329,17 @@ export class TrailsLayer {
 
   private applySelectionStyling(): void {
     const hasSelection = this.selectedIcao !== null;
+
+    const selected = hasSelection
+      ? this.entries.get(this.selectedIcao as string)
+      : undefined;
+    if (selected?.originPos) {
+      this.originPin.group.position.copy(selected.originPos);
+      this.originPin.group.visible = true;
+    } else {
+      this.originPin.group.visible = false;
+    }
+
     for (const [icao, entry] of this.entries) {
       const isSelected = icao === this.selectedIcao;
       if (isSelected) {
@@ -336,4 +382,100 @@ export class TrailsLayer {
     this.group.remove(entry.lineGlow);
     this.group.remove(entry.marker);
   }
+}
+
+interface OriginPin {
+  group: THREE.Group;
+  animate: (elapsedSeconds: number) => void;
+  dispose: () => void;
+}
+
+/**
+ * The take-off marker: a warm node on the surface with a slim stem and a
+ * pulse ring that breathes outward — enough to say "the flight began here"
+ * without competing with the aircraft itself.
+ */
+function createOriginPin(): OriginPin {
+  const group = new THREE.Group();
+  group.visible = false;
+  group.renderOrder = 7;
+
+  const geometries: THREE.BufferGeometry[] = [];
+  const materials: THREE.Material[] = [];
+  const track = <G extends THREE.BufferGeometry, M extends THREE.Material>(
+    geometry: G,
+    material: M,
+  ): THREE.Mesh => {
+    geometries.push(geometry);
+    materials.push(material);
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.renderOrder = 7;
+    return mesh;
+  };
+
+  const dot = track(
+    new THREE.CircleGeometry(0.035, 24),
+    new THREE.MeshBasicMaterial({
+      color: new THREE.Color("#ffd9a0"),
+      transparent: true,
+      opacity: 0.95,
+      depthWrite: false,
+    }),
+  );
+  dot.rotation.x = -Math.PI / 2;
+  dot.position.y = 0.004;
+  group.add(dot);
+
+  const stem = track(
+    new THREE.CylinderGeometry(0.006, 0.006, 0.16, 8),
+    new THREE.MeshBasicMaterial({
+      color: new THREE.Color("#ffb347"),
+      transparent: true,
+      opacity: 0.55,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+    }),
+  );
+  stem.position.y = 0.08;
+  group.add(stem);
+
+  const node = track(
+    new THREE.SphereGeometry(0.02, 12, 12),
+    new THREE.MeshBasicMaterial({
+      // HDR-tinted so the bloom pass gives the node a soft halo.
+      color: new THREE.Color(1.5, 1.05, 0.55),
+      transparent: true,
+      opacity: 0.95,
+      depthWrite: false,
+    }),
+  );
+  node.position.y = 0.16;
+  group.add(node);
+
+  const ringMaterial = new THREE.MeshBasicMaterial({
+    color: new THREE.Color("#ffb347"),
+    transparent: true,
+    opacity: 0.5,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  });
+  const ring = track(new THREE.RingGeometry(0.09, 0.11, 48), ringMaterial);
+  ring.rotation.x = -Math.PI / 2;
+  ring.position.y = 0.006;
+  group.add(ring);
+
+  return {
+    group,
+    animate(elapsedSeconds) {
+      const phase = (elapsedSeconds % 2.4) / 2.4;
+      const pulse = 1 + phase * 1.1;
+      ring.scale.setScalar(pulse);
+      ringMaterial.opacity = 0.5 * (1 - phase) ** 1.5;
+    },
+    dispose() {
+      for (const g of geometries) g.dispose();
+      for (const m of materials) m.dispose();
+    },
+  };
 }

@@ -2,6 +2,7 @@
 
 import { Suspense } from "react";
 import dynamic from "next/dynamic";
+import Link from "next/link";
 import { useWebSocket } from "@/hooks/useWebSocket";
 
 /* ── Lazy-loaded dashboard sections ──────────────────────────── */
@@ -162,6 +163,55 @@ function DashboardLogo() {
   );
 }
 
+/* ── AE Map Banner ───────────────────────────────────────────── */
+
+function AeMapBanner() {
+  return (
+    <section className="lg:col-span-12">
+      <Link
+        href="/ae"
+        className="panel group relative block overflow-hidden px-5 py-4 transition-colors hover:border-electric-cyan/40"
+      >
+        {/* Soft cyan wash that answers the hover */}
+        <div
+          aria-hidden
+          className="absolute inset-0 opacity-0 transition-opacity duration-500 group-hover:opacity-100"
+          style={{
+            background:
+              "radial-gradient(ellipse at right center, rgba(0,245,255,0.07) 0%, transparent 60%)",
+          }}
+        />
+
+        <div className="relative flex items-center justify-between gap-4">
+          <div className="flex items-center gap-4 min-w-0">
+            {/* Miniature polar disc */}
+            <div className="relative h-12 w-12 shrink-0" aria-hidden>
+              <div className="absolute inset-0 rounded-full border border-electric-cyan/50" />
+              <div className="absolute inset-[7px] rounded-full border border-electric-cyan/30" />
+              <div className="absolute inset-[14px] rounded-full border border-electric-cyan/20" />
+              <div className="absolute left-1/2 top-1/2 h-1.5 w-1.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-electric-cyan shadow-[0_0_8px_rgba(0,245,255,0.8)]" />
+            </div>
+
+            <div className="min-w-0">
+              <p className="hud-label text-electric-cyan/70">
+                Azimuthal Equidistant · North Polar
+              </p>
+              <p className="mt-1 truncate font-mono text-sm text-white">
+                See the fleet from a different perspective — live flights across
+                the polar disc
+              </p>
+            </div>
+          </div>
+
+          <span className="shrink-0 whitespace-nowrap font-mono text-xs tracking-widest text-electric-cyan transition-transform duration-300 group-hover:translate-x-1">
+            OPEN AE MAP →
+          </span>
+        </div>
+      </Link>
+    </section>
+  );
+}
+
 /* ── Dashboard ───────────────────────────────────────────────── */
 
 export default function DashboardPage() {
@@ -180,6 +230,9 @@ export default function DashboardPage() {
             <GlobeView />
           </Suspense>
         </section>
+
+        {/* ── Alternative projection: the /ae polar map ────── */}
+        <AeMapBanner />
 
         {/* ── Row 2: Aircraft Telemetry Services (full width) ────── */}
         <Suspense fallback={<PanelSkeleton className="h-96 lg:col-span-12" />}>
