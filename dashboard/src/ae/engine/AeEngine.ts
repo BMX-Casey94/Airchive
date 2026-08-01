@@ -32,6 +32,9 @@ const CAMERA_INTRO_START = new THREE.Vector3(0, 30, 0.8);
 const INTRO_DURATION_S = 2.4;
 const SUN_UPDATE_INTERVAL_S = 60;
 const CLICK_MAX_DISTANCE_PX = 6;
+/** Fingers wobble more than mice; allow taps a wider travel before they
+ * count as drags, or selecting aircraft on touch screens is a lottery. */
+const TAP_MAX_DISTANCE_PX = 14;
 const CLICK_MAX_DURATION_MS = 400;
 /** The orbit/zoom pivot may roam anywhere on the disc, but not off it. */
 const MAX_TARGET_RADIUS = DISC_RADIUS * 0.98;
@@ -119,7 +122,12 @@ export class AeEngine {
 
   private sunTimer = Number.POSITIVE_INFINITY;
 
-  private pointerDown: { x: number; y: number; at: number } | null = null;
+  private pointerDown: {
+    x: number;
+    y: number;
+    at: number;
+    touch: boolean;
+  } | null = null;
 
   private lastSelectedIcao: string | null = null;
 
@@ -248,6 +256,12 @@ export class AeEngine {
     document.addEventListener("visibilitychange", this.onVisibility);
 
     this.start();
+  }
+
+  /** Dim the map surface to half brightness so aircraft overlays pop. */
+  setMapDimmed(dimmed: boolean): void {
+    if (this.disposed) return;
+    this.disc.setDimmed(dimmed);
   }
 
   /** Feed the scene from the fleet store; call on every store change. */
@@ -396,7 +410,12 @@ export class AeEngine {
   private readonly onPointerDown = (e: PointerEvent): void => {
     // A grab always hands control straight back to the user.
     this.focus = null;
-    this.pointerDown = { x: e.clientX, y: e.clientY, at: performance.now() };
+    this.pointerDown = {
+      x: e.clientX,
+      y: e.clientY,
+      at: performance.now(),
+      touch: e.pointerType === "touch",
+    };
   };
 
   private readonly onPointerUp = (e: PointerEvent): void => {
@@ -406,8 +425,9 @@ export class AeEngine {
 
     const dx = e.clientX - down.x;
     const dy = e.clientY - down.y;
+    const maxDistance = down.touch ? TAP_MAX_DISTANCE_PX : CLICK_MAX_DISTANCE_PX;
     if (
-      Math.hypot(dx, dy) > CLICK_MAX_DISTANCE_PX
+      Math.hypot(dx, dy) > maxDistance
       || performance.now() - down.at > CLICK_MAX_DURATION_MS
     ) {
       return;

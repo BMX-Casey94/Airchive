@@ -30,6 +30,7 @@ const FRAGMENT = /* glsl */ `
   uniform float uHasDay;
   uniform float uHasNight;
   uniform float uTexFade;
+  uniform float uDim;
   uniform vec3 uSunDir;
   uniform float uRadius;
   uniform float uUnitsPerRadian;
@@ -79,6 +80,11 @@ const FRAGMENT = /* glsl */ `
     // Gentle radial falloff so the rim reads as a physical edge.
     color *= 1.0 - 0.16 * smoothstep(0.72 * uRadius, uRadius, rho);
 
+    // User-toggled dim: halve the map's brightness so overlaid aircraft and
+    // trails dominate. Brightness, not alpha — the disc must stay opaque or
+    // the void gradient would read through the surface.
+    color *= 1.0 - 0.5 * uDim;
+
     outColor = vec4(color, edge);
   }
 `;
@@ -86,7 +92,9 @@ const FRAGMENT = /* glsl */ `
 export interface DiscHandle {
   group: THREE.Group;
   setSunDirection: (v: [number, number, number]) => void;
-  /** Advance the texture fade-in; call each frame with delta seconds. */
+  /** Dim the map surface to half brightness so overlays stand out. */
+  setDimmed: (dimmed: boolean) => void;
+  /** Advance the texture fade-in and dim transition; call each frame. */
   update: (dt: number) => void;
   loadTextures: (dayUrl: string, nightUrl: string) => void;
   dispose: () => void;
@@ -118,6 +126,7 @@ export function createDisc(renderer: THREE.WebGLRenderer): DiscHandle {
       uHasDay: { value: 0 },
       uHasNight: { value: 0 },
       uTexFade: { value: 0 },
+      uDim: { value: 0 },
       uSunDir: { value: new THREE.Vector3(0, 1, 0) },
       uRadius: { value: DISC_RADIUS },
       uUnitsPerRadian: { value: UNITS_PER_RADIAN },
@@ -161,6 +170,7 @@ export function createDisc(renderer: THREE.WebGLRenderer): DiscHandle {
   group.add(rimHalo);
 
   let texFadeTarget = 0;
+  let dimTarget = 0;
   const loader = new THREE.TextureLoader();
 
   const handle: DiscHandle = {
@@ -170,10 +180,20 @@ export function createDisc(renderer: THREE.WebGLRenderer): DiscHandle {
       (material.uniforms.uSunDir.value as THREE.Vector3).set(v[0], v[1], v[2]).normalize();
     },
 
+    setDimmed(dimmed) {
+      dimTarget = dimmed ? 1 : 0;
+    },
+
     update(dt) {
       const fade = material.uniforms.uTexFade;
       if (fade.value < texFadeTarget) {
         fade.value = Math.min(texFadeTarget, fade.value + dt * 0.8);
+      }
+      const dim = material.uniforms.uDim;
+      const delta = dimTarget - (dim.value as number);
+      if (Math.abs(delta) > 1e-4) {
+        dim.value = (dim.value as number)
+          + Math.sign(delta) * Math.min(Math.abs(delta), dt * 3);
       }
     },
 

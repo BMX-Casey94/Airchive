@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { Area, AreaChart, ResponsiveContainer, YAxis } from "recharts";
 import { useFleetStore } from "@/stores/fleet";
@@ -33,6 +33,23 @@ const PHASE_STYLE: Record<string, string> = {
 
 const MAX_CHART_POINTS = 200;
 
+/**
+ * Below the sm breakpoint the dossier docks as a bottom sheet (sliding up)
+ * instead of a right-hand rail (sliding in), so the map stays visible above
+ * it on phones.
+ */
+function useIsNarrow(): boolean {
+  const [narrow, setNarrow] = useState(false);
+  useEffect(() => {
+    const mq = window.matchMedia("(max-width: 639px)");
+    const apply = () => setNarrow(mq.matches);
+    apply();
+    mq.addEventListener("change", apply);
+    return () => mq.removeEventListener("change", apply);
+  }, []);
+  return narrow;
+}
+
 function formatNumber(value: number | null | undefined, unit: string): string {
   if (value === null || value === undefined || !Number.isFinite(value)) return "—";
   return `${Math.round(value).toLocaleString("en-GB")}${unit}`;
@@ -57,6 +74,7 @@ function Stat({ label, value }: { label: string; value: string }) {
 }
 
 export default function FlightPanel({ sessions }: FlightPanelProps) {
+  const isNarrow = useIsNarrow();
   const selectedIcao = useFleetStore((s) => s.selectedIcao);
   const selectFleet = useFleetStore((s) => s.selectAircraft);
   const selectAircraft = useAircraftStore((s) => s.selectAircraft);
@@ -122,11 +140,11 @@ export default function FlightPanel({ sessions }: FlightPanelProps) {
       {selectedIcao && (
         <motion.aside
           key={selectedIcao}
-          initial={{ x: 400, opacity: 0 }}
-          animate={{ x: 0, opacity: 1 }}
-          exit={{ x: 400, opacity: 0 }}
+          initial={isNarrow ? { y: 360, opacity: 0 } : { x: 400, opacity: 0 }}
+          animate={isNarrow ? { y: 0, opacity: 1 } : { x: 0, opacity: 1 }}
+          exit={isNarrow ? { y: 360, opacity: 0 } : { x: 400, opacity: 0 }}
           transition={{ type: "spring", stiffness: 260, damping: 30 }}
-          className="panel pointer-events-auto absolute bottom-4 right-4 top-16 z-20 flex w-[340px] max-w-[calc(100vw-2rem)] flex-col gap-4 overflow-y-auto p-5"
+          className="panel pointer-events-auto absolute inset-x-3 bottom-3 z-20 flex max-h-[58vh] flex-col gap-3 overflow-y-auto p-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:inset-x-auto sm:bottom-4 sm:right-4 sm:top-16 sm:max-h-none sm:w-[340px] sm:max-w-[calc(100vw-2rem)] sm:gap-4 sm:p-5"
         >
           <div className="flex items-start justify-between">
             <div>

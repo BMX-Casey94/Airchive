@@ -18,17 +18,28 @@ import FlightPanel from "./panel/FlightPanel";
  */
 
 const PERSIST_INTERVAL_MS = 10_000;
+const MAP_DIM_STORAGE_KEY = "ae-map-dim";
 
 function selectBoth(icao: string | null): void {
   useFleetStore.getState().selectAircraft(icao);
   useAircraftStore.getState().selectAircraft(icao);
 }
 
+function readPersistedDim(): boolean {
+  try {
+    return window.localStorage.getItem(MAP_DIM_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
 export default function AeView() {
   const containerRef = useRef<HTMLDivElement>(null);
+  const engineRef = useRef<AeEngine | null>(null);
   const deepLinkApplied = useRef(false);
   const [contextLost, setContextLost] = useState(false);
   const [utc, setUtc] = useState("--:--:--");
+  const [mapDimmed, setMapDimmed] = useState(readPersistedDim);
 
   const { connected } = useWebSocket();
   const sessions = useActiveSessions();
@@ -44,6 +55,7 @@ export default function AeView() {
       onSelect: selectBoth,
       onContextLost: () => setContextLost(true),
     });
+    engineRef.current = engine;
     if (process.env.NODE_ENV === "development") {
       // Dev-only escape hatch for scene inspection in headless smoke tests.
       const w = window as unknown as Record<string, unknown>;
@@ -60,9 +72,20 @@ export default function AeView() {
 
     return () => {
       unsubscribe();
+      engineRef.current = null;
       engine.dispose();
     };
   }, []);
+
+  /* ── Map dim toggle ───────────────────────────────────────── */
+  useEffect(() => {
+    engineRef.current?.setMapDimmed(mapDimmed);
+    try {
+      window.localStorage.setItem(MAP_DIM_STORAGE_KEY, mapDimmed ? "1" : "0");
+    } catch {
+      // Storage unavailable (private mode); the toggle still works in-session.
+    }
+  }, [mapDimmed]);
 
   /* ── Trail persistence across reloads ─────────────────────── */
   useEffect(() => {
@@ -109,16 +132,16 @@ export default function AeView() {
       <div ref={containerRef} className="absolute inset-0" />
 
       {/* ── Top HUD ──────────────────────────────────────────── */}
-      <div className="pointer-events-none absolute inset-x-0 top-0 z-10 flex items-start justify-between gap-3 p-4 sm:p-5">
+      <div className="pointer-events-none absolute inset-x-0 top-0 z-10 flex items-start justify-between gap-2 p-3 sm:gap-3 sm:p-5">
         <Link
           href="/"
-          className="panel pointer-events-auto flex items-center gap-2 px-4 py-2 font-mono text-xs tracking-widest text-white transition-colors hover:text-electric-cyan"
+          className="panel pointer-events-auto flex items-center gap-2 px-3 py-2 font-mono text-xs tracking-widest text-white transition-colors hover:text-electric-cyan sm:px-4"
         >
           <span aria-hidden className="text-electric-cyan">←</span>
           AIRCHIVE
         </Link>
 
-        <div className="panel flex items-center gap-3 px-4 py-2 font-mono text-[11px] tracking-wider">
+        <div className="panel flex items-center gap-2 px-3 py-2 font-mono text-[10px] tracking-wider sm:gap-3 sm:px-4 sm:text-[11px]">
           <span className="flex items-center gap-1.5">
             <span
               className={`h-1.5 w-1.5 rounded-full ${
@@ -133,13 +156,26 @@ export default function AeView() {
           <span className="text-white">
             {sessions.length} ACTIVE · {trackedCount} TRACKED
           </span>
-          <span className="text-panel-border">|</span>
-          <span className="text-hud-muted">{utc} UTC</span>
+          <span className="hidden text-panel-border md:inline">|</span>
+          <span className="hidden text-hud-muted md:inline">{utc} UTC</span>
         </div>
       </div>
 
-      {/* ── Bottom-left legend ───────────────────────────────── */}
-      <div className="pointer-events-none absolute bottom-4 left-4 z-10 select-none">
+      {/* ── Bottom-left: map dim toggle + legend ─────────────── */}
+      <div className="pointer-events-none absolute bottom-3 left-3 z-10 flex select-none flex-col items-start gap-2 sm:bottom-4 sm:left-4">
+        <button
+          type="button"
+          onClick={() => setMapDimmed((v) => !v)}
+          aria-pressed={mapDimmed}
+          aria-label="Dim the map to highlight aircraft"
+          className={`panel pointer-events-auto px-3 py-1.5 font-mono text-[10px] tracking-widest transition-colors ${
+            mapDimmed
+              ? "border-electric-cyan/50 text-electric-cyan"
+              : "text-hud-muted hover:text-white"
+          }`}
+        >
+          MAP {mapDimmed ? "50%" : "100%"}
+        </button>
         <p className="hud-label">Azimuthal Equidistant · North Polar</p>
       </div>
 
