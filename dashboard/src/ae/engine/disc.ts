@@ -43,7 +43,10 @@ const FRAGMENT = /* glsl */ `
 
   void main() {
     float rho = length(vPos);
-    float edge = 1.0 - smoothstep(uRadius - 0.03, uRadius, rho);
+    // The surface dissolves over the last fraction of a percent of the
+    // radius rather than ending on a hard circle, so the imagery feathers
+    // into the void and the rim glow has something to bloom out of.
+    float edge = 1.0 - smoothstep(uRadius * 0.986, uRadius, rho);
     if (edge <= 0.001) discard;
 
     float colat = rho / uUnitsPerRadian;
@@ -88,6 +91,53 @@ const FRAGMENT = /* glsl */ `
     outColor = vec4(color, edge);
   }
 `;
+
+/**
+ * Rim glow. A single ring whose radial profile is a gaussian core line at the
+ * disc boundary plus an outward halo that decays to exactly zero — value and
+ * gradient both — before the geometry ends. Nothing terminates on an edge, so
+ * the band feathers into the void instead of stopping at a visible circle.
+ */
+const RIM_VERTEX = /* glsl */ `
+  varying float vR;
+  void main() {
+    vR = length(position.xy);
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  }
+`;
+
+const RIM_FRAGMENT = /* glsl */ `
+  precision highp float;
+
+  uniform float uRadius;
+  uniform vec3 uCoreColor;
+  uniform vec3 uHaloColor;
+  uniform float uCoreAlpha;
+  uniform float uHaloAlpha;
+  uniform float uCoreWidth;
+  uniform float uHaloReach;
+
+  varying float vR;
+
+  void main() {
+    float d = vR - uRadius;
+
+    float core = exp(-(d * d) / (uCoreWidth * uCoreWidth));
+
+    float t = clamp(max(d, 0.0) / uHaloReach, 0.0, 1.0);
+    float halo = pow(1.0 - t, 2.6);
+
+    float alpha = uCoreAlpha * core + uHaloAlpha * halo;
+    if (alpha < 0.002) discard;
+
+    gl_FragColor = vec4(mix(uHaloColor, uCoreColor, core), alpha);
+  }
+`;
+
+/** World-unit spread of the bright edge line either side of the boundary. */
+const RIM_CORE_WIDTH = 0.055;
+/** How far the halo reaches beyond the boundary before it is exactly zero. */
+const RIM_HALO_REACH = 0.78;
 
 export interface DiscHandle {
   group: THREE.Group;
@@ -137,37 +187,36 @@ export function createDisc(renderer: THREE.WebGLRenderer): DiscHandle {
   mesh.renderOrder = 0;
   group.add(mesh);
 
-  // Rim: a crisp cyan edge ring plus a wide faint halo; the bloom pass turns
-  // these into the disc's premium "contained world" glow.
-  const rimInner = new THREE.Mesh(
-    new THREE.RingGeometry(DISC_RADIUS * 0.999, DISC_RADIUS * 1.012, 256),
-    new THREE.MeshBasicMaterial({
-      color: new THREE.Color("#00f5ff"),
-      transparent: true,
-      opacity: 0.55,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-      side: THREE.DoubleSide,
-    }),
+  // Rim: a crisp cyan edge line bleeding into a wide halo, both feathered to
+  // nothing by the shader profile; the bloom pass turns them into the disc's
+  // premium "contained world" glow. The geometry is deliberately wider than
+  // the halo reaches, so the ring's own outer edge is never visible.
+  const rimGeometry = new THREE.RingGeometry(
+    DISC_RADIUS * 0.982,
+    DISC_RADIUS * 1.088,
+    256,
   );
-  rimInner.rotation.x = -Math.PI / 2;
-  rimInner.renderOrder = 2;
-  group.add(rimInner);
-
-  const rimHalo = new THREE.Mesh(
-    new THREE.RingGeometry(DISC_RADIUS * 1.012, DISC_RADIUS * 1.07, 256),
-    new THREE.MeshBasicMaterial({
-      color: new THREE.Color("#0aa8c8"),
-      transparent: true,
-      opacity: 0.10,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-      side: THREE.DoubleSide,
-    }),
-  );
-  rimHalo.rotation.x = -Math.PI / 2;
-  rimHalo.renderOrder = 2;
-  group.add(rimHalo);
+  const rimMaterial = new THREE.ShaderMaterial({
+    vertexShader: RIM_VERTEX,
+    fragmentShader: RIM_FRAGMENT,
+    transparent: true,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+    uniforms: {
+      uRadius: { value: DISC_RADIUS },
+      uCoreColor: { value: new THREE.Color("#00f5ff") },
+      uHaloColor: { value: new THREE.Color("#0aa8c8") },
+      uCoreAlpha: { value: 0.55 },
+      uHaloAlpha: { value: 0.16 },
+      uCoreWidth: { value: RIM_CORE_WIDTH },
+      uHaloReach: { value: RIM_HALO_REACH },
+    },
+  });
+  const rim = new THREE.Mesh(rimGeometry, rimMaterial);
+  rim.rotation.x = -Math.PI / 2;
+  rim.renderOrder = 2;
+  group.add(rim);
 
   let texFadeTarget = 0;
   let dimTarget = 0;
@@ -215,10 +264,8 @@ export function createDisc(renderer: THREE.WebGLRenderer): DiscHandle {
     dispose() {
       geometry.dispose();
       material.dispose();
-      rimInner.geometry.dispose();
-      (rimInner.material as THREE.Material).dispose();
-      rimHalo.geometry.dispose();
-      (rimHalo.material as THREE.Material).dispose();
+      rimGeometry.dispose();
+      rimMaterial.dispose();
       const day = material.uniforms.uDay.value as THREE.Texture | null;
       const night = material.uniforms.uNight.value as THREE.Texture | null;
       day?.dispose();
