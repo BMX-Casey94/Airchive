@@ -5,7 +5,7 @@ import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass.js";
 import { OutputPass } from "three/examples/jsm/postprocessing/OutputPass.js";
 import type { AircraftState, PositionSnapshot } from "@/types/dashboard";
-import { latLonToUnitVector, subsolarPoint } from "./projection";
+import { DISC_RADIUS, latLonToUnitVector, subsolarPoint } from "./projection";
 import { createDisc, type DiscHandle } from "./disc";
 import { createVectorLayers, type VectorLayersHandle } from "./vectors";
 import { createToroidalField, type TorusHandle } from "./torus";
@@ -32,6 +32,8 @@ const INTRO_DURATION_S = 2.4;
 const SUN_UPDATE_INTERVAL_S = 60;
 const CLICK_MAX_DISTANCE_PX = 6;
 const CLICK_MAX_DURATION_MS = 400;
+/** The orbit/zoom pivot may roam anywhere on the disc, but not off it. */
+const MAX_TARGET_RADIUS = DISC_RADIUS * 0.98;
 
 function easeInOutCubic(t: number): number {
   return t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2;
@@ -116,6 +118,17 @@ export class AeEngine {
 
     this.scene.add(this.trails.group);
 
+    // Lighting only affects the aircraft (MeshStandardMaterial); the disc,
+    // vectors and field are all unlit shaders. A cool key light plus a cyan
+    // rim light give the fuselages their metallic 3D read.
+    this.scene.add(new THREE.AmbientLight(0x8fb8d8, 0.55));
+    const keyLight = new THREE.DirectionalLight(0xffffff, 1.9);
+    keyLight.position.set(6, 12, 8);
+    this.scene.add(keyLight);
+    const rimLight = new THREE.DirectionalLight(0x66d9ff, 0.6);
+    rimLight.position.set(-8, 4, -6);
+    this.scene.add(rimLight);
+
     this.updateSun();
 
     // Post-processing: restrained bloom; only HDR-pushed elements halo.
@@ -130,17 +143,22 @@ export class AeEngine {
     this.composer.addPass(this.bloomPass);
     this.composer.addPass(new OutputPass());
 
-    // Orbit locked to the pole; the user can circle the disc and tilt, but
-    // never dive underneath it or drift the pivot off-centre.
+    // Free exploration of the whole disc: wheel zoom dives toward the cursor
+    // rather than the pole, and right-drag (or two-finger drag) pans the
+    // pivot across the surface. `clampTarget` keeps the pivot on the disc so
+    // the camera can never wander into empty void.
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.target.set(0, 0, 0);
-    this.controls.enablePan = false;
+    this.controls.enablePan = true;
+    this.controls.screenSpacePanning = false;
+    this.controls.panSpeed = 0.8;
+    this.controls.zoomToCursor = true;
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.06;
-    this.controls.minDistance = 2.5;
+    this.controls.minDistance = 1.1;
     this.controls.maxDistance = 34;
-    this.controls.minPolarAngle = 0.12;
-    this.controls.maxPolarAngle = 1.32;
+    this.controls.minPolarAngle = 0.05;
+    this.controls.maxPolarAngle = 1.35;
     this.controls.enabled = this.introDone;
 
     this.setSize(w, h);
@@ -223,6 +241,7 @@ export class AeEngine {
         }
       } else {
         this.controls.update();
+        this.clampTarget();
       }
 
       this.sunTimer += dt;
@@ -237,6 +256,18 @@ export class AeEngine {
       this.composer.render();
     };
     tick();
+  }
+
+  /** Keep the orbit pivot glued to the disc plane and inside its rim. */
+  private clampTarget(): void {
+    const target = this.controls.target;
+    target.y = 0;
+    const radial = Math.hypot(target.x, target.z);
+    if (radial > MAX_TARGET_RADIUS) {
+      const k = MAX_TARGET_RADIUS / radial;
+      target.x *= k;
+      target.z *= k;
+    }
   }
 
   private updateSun(): void {

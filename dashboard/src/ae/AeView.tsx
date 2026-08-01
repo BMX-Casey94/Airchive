@@ -44,6 +44,12 @@ export default function AeView() {
       onSelect: selectBoth,
       onContextLost: () => setContextLost(true),
     });
+    if (process.env.NODE_ENV === "development") {
+      // Dev-only escape hatch for scene inspection in headless smoke tests.
+      const w = window as unknown as Record<string, unknown>;
+      w.__aeEngine = engine;
+      w.__fleetStore = useFleetStore;
+    }
 
     const push = () => {
       const s = useFleetStore.getState();
@@ -135,9 +141,6 @@ export default function AeView() {
       {/* ── Bottom-left legend ───────────────────────────────── */}
       <div className="pointer-events-none absolute bottom-4 left-4 z-10 select-none">
         <p className="hud-label">Azimuthal Equidistant · North Polar</p>
-        <p className="mt-1 text-[10px] leading-relaxed text-hud-muted/70">
-          Imagery: NASA Blue Marble &amp; Black Marble · Coastlines: Natural Earth
-        </p>
       </div>
 
       <FlightPanel sessions={sessions} />

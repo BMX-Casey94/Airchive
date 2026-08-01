@@ -16,9 +16,11 @@ export const UNITS_PER_RADIAN = DISC_RADIUS / Math.PI;
 /**
  * Vertical exaggeration for altitude, in world units per foot. Real scale
  * would make a cruising airliner invisibly close to the disc: 40,000 ft is
- * ~12 km against a 20,000 km disc radius. This lifts cruise to ~0.26 units.
+ * ~12 km against a 20,000 km disc radius. This lifts cruise to ~0.06 units —
+ * enough for subtle relief, but shallow enough that a climb-out doesn't
+ * render as a steep glowing ramp above the departure airport.
  */
-export const ALT_UNITS_PER_FT = 6.5e-6;
+export const ALT_UNITS_PER_FT = 1.6e-6;
 
 /** Minimum lift above the disc so trails never z-fight the surface. */
 export const TRAIL_BASE_LIFT = 0.02;

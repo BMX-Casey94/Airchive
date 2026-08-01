@@ -9,20 +9,27 @@ import {
   projectLatLon,
   trackToWorldYaw,
 } from "./projection";
+import { createAircraftGeometry } from "./aircraft";
 
 /**
- * Live flight trails and aircraft markers, driven directly by the existing
- * fleet store (which already stitches server baselines, IndexedDB history and
- * live WebSocket telemetry). Trails are altitude-tinted ribbons — dim teal on
- * the ground rising to icy cyan at cruise — and the selected flight is pushed
- * into HDR so the bloom pass halos it.
+ * Live flight trails and aircraft, driven directly by the existing fleet
+ * store (which already stitches server baselines, IndexedDB history and live
+ * WebSocket telemetry).
+ *
+ * Trails are neon amber — a deliberate contrast against the cyan/violet field
+ * and rim. Each trail is drawn twice: a wide additive glow underlay and a
+ * crisp solid core, altitude-ramped from dim ember on the ground to bright
+ * gold at cruise. The selected flight's core is pushed into HDR so the bloom
+ * pass halos it.
  */
 
 interface TrailEntry {
-  line: Line2;
-  material: LineMaterial;
+  lineCore: Line2;
+  lineGlow: Line2;
+  materialCore: LineMaterial;
+  materialGlow: LineMaterial;
   marker: THREE.Group;
-  chevron: THREE.Mesh<THREE.BufferGeometry, THREE.MeshBasicMaterial>;
+  aircraft: THREE.Mesh<THREE.BufferGeometry, THREE.MeshStandardMaterial>;
   hitArea: THREE.Mesh;
   pointCount: number;
   lastTs: number;
@@ -30,25 +37,35 @@ interface TrailEntry {
 
 const CRUISE_FT = 42_000;
 
-const UNSELECTED_WIDTH = 2.1;
-const SELECTED_WIDTH = 3.6;
-const DIMMED_WIDTH = 1.4;
+const CORE_WIDTH = 1.6;
+const CORE_WIDTH_SELECTED = 3.0;
+const CORE_WIDTH_DIMMED = 1.0;
+const GLOW_WIDTH = 4.5;
+const GLOW_WIDTH_SELECTED = 9;
+const GLOW_WIDTH_DIMMED = 2.5;
 
-function pushTrailColor(altFt: number, out: number[]): void {
-  const t = Math.min(1, Math.max(0, altFt / CRUISE_FT));
-  out.push(0.06 + 0.5 * t, 0.45 + 0.5 * t, 0.7 + 0.3 * t);
+const BODY_COLOR = new THREE.Color("#dfeaf2");
+const BODY_EMISSIVE = new THREE.Color("#131c26");
+const BODY_EMISSIVE_SELECTED = new THREE.Color("#ffb347");
+
+function altRatio(altFt: number): number {
+  return Math.min(1, Math.max(0, altFt / CRUISE_FT));
 }
 
-function createChevronGeometry(): THREE.BufferGeometry {
-  // A flat delta pointing +Z; yaw rotation then aims it along the track.
-  const geometry = new THREE.BufferGeometry();
-  const vertices = new Float32Array([
-    0, 0, 0.55,   -0.38, 0, -0.4,   0, 0, -0.18,
-    0, 0, 0.55,    0, 0, -0.18,     0.38, 0, -0.4,
-  ]);
-  geometry.setAttribute("position", new THREE.BufferAttribute(vertices, 3));
-  geometry.computeVertexNormals();
-  return geometry;
+/** Saturated amber for the additive glow pass. */
+function pushGlowColor(altFt: number, out: number[]): void {
+  const t = altRatio(altFt);
+  out.push(0.5 + 0.35 * t, 0.18 + 0.32 * t, 0.03 + 0.08 * t);
+}
+
+/**
+ * Whiter ramp for the solid core line. Deliberately capped below the bloom
+ * threshold (0.85) so ordinary trails stay crisp; only the selected flight
+ * is pushed into HDR and halos.
+ */
+function pushCoreColor(altFt: number, out: number[]): void {
+  const t = altRatio(altFt);
+  out.push(0.62 + 0.2 * t, 0.38 + 0.34 * t, 0.14 + 0.36 * t);
 }
 
 export class TrailsLayer {
@@ -56,7 +73,7 @@ export class TrailsLayer {
 
   private readonly entries = new Map<string, TrailEntry>();
 
-  private readonly chevronGeometry = createChevronGeometry();
+  private readonly aircraftGeometry = createAircraftGeometry();
 
   private readonly hitGeometry = new THREE.CircleGeometry(1.1, 12);
 
@@ -67,7 +84,8 @@ export class TrailsLayer {
   setResolution(width: number, height: number): void {
     this.resolution.set(width, height);
     for (const entry of this.entries.values()) {
-      entry.material.resolution.copy(this.resolution);
+      entry.materialCore.resolution.copy(this.resolution);
+      entry.materialGlow.resolution.copy(this.resolution);
     }
   }
 
@@ -97,11 +115,13 @@ export class TrailsLayer {
           points.length !== entry.pointCount
           || (last !== undefined && last.ts !== entry.lastTs)
         ) {
-          this.rebuildLine(entry, points);
+          this.rebuildLines(entry, points);
         }
-        entry.line.visible = true;
+        entry.lineCore.visible = true;
+        entry.lineGlow.visible = true;
       } else {
-        entry.line.visible = false;
+        entry.lineCore.visible = false;
+        entry.lineGlow.visible = false;
       }
 
       this.updateMarker(entry, state);
@@ -122,7 +142,7 @@ export class TrailsLayer {
     for (const [icao, entry] of this.entries) {
       if (!entry.marker.visible) continue;
       const dist = camera.position.distanceTo(entry.marker.position);
-      let scale = THREE.MathUtils.clamp(dist * 0.014, 0.06, 0.4);
+      let scale = THREE.MathUtils.clamp(dist * 0.028, 0.1, 0.8);
       if (icao === this.selectedIcao) {
         scale *= 1.18 + 0.07 * Math.sin(elapsedSeconds * 4.2);
       }
@@ -135,59 +155,83 @@ export class TrailsLayer {
       this.disposeEntry(entry);
     }
     this.entries.clear();
-    this.chevronGeometry.dispose();
+    this.aircraftGeometry.dispose();
     this.hitGeometry.dispose();
   }
 
   private createEntry(icao: string): TrailEntry {
-    const material = new LineMaterial({
+    const materialGlow = new LineMaterial({
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.11,
+      linewidth: GLOW_WIDTH,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+    });
+    materialGlow.resolution.copy(this.resolution);
+
+    const materialCore = new LineMaterial({
       vertexColors: true,
       transparent: true,
       opacity: 0.85,
-      linewidth: UNSELECTED_WIDTH,
+      linewidth: CORE_WIDTH,
       depthWrite: false,
     });
-    material.resolution.copy(this.resolution);
+    materialCore.resolution.copy(this.resolution);
 
-    const geometry = new LineGeometry();
-    geometry.setPositions([0, 0, 0, 0, 0, 0]);
-    const line = new Line2(geometry, material);
-    line.visible = false;
-    line.renderOrder = 4;
-    line.frustumCulled = false;
+    const makeLine = (material: LineMaterial, order: number): Line2 => {
+      const geometry = new LineGeometry();
+      geometry.setPositions([0, 0, 0, 0, 0, 0]);
+      const line = new Line2(geometry, material);
+      line.visible = false;
+      line.renderOrder = order;
+      line.frustumCulled = false;
+      return line;
+    };
+    const lineGlow = makeLine(materialGlow, 4);
+    const lineCore = makeLine(materialCore, 5);
 
-    const chevron = new THREE.Mesh(
-      this.chevronGeometry,
-      new THREE.MeshBasicMaterial({
-        color: new THREE.Color("#bdf3ff"),
+    const aircraft = new THREE.Mesh(
+      this.aircraftGeometry,
+      new THREE.MeshStandardMaterial({
+        color: BODY_COLOR.clone(),
+        metalness: 0.4,
+        roughness: 0.42,
+        emissive: BODY_EMISSIVE.clone(),
+        emissiveIntensity: 1,
         transparent: true,
-        opacity: 0.95,
-        side: THREE.DoubleSide,
-        depthWrite: false,
+        opacity: 1,
       }),
     );
-    chevron.renderOrder = 5;
+    aircraft.renderOrder = 6;
 
     const hitArea = new THREE.Mesh(
       this.hitGeometry,
-      new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false }),
+      new THREE.MeshBasicMaterial({
+        transparent: true,
+        opacity: 0,
+        depthWrite: false,
+      }),
     );
     hitArea.rotation.x = -Math.PI / 2;
     hitArea.userData.icao = icao;
 
     const marker = new THREE.Group();
-    marker.add(chevron);
+    marker.add(aircraft);
     marker.add(hitArea);
     marker.visible = false;
 
-    this.group.add(line);
+    this.group.add(lineGlow);
+    this.group.add(lineCore);
     this.group.add(marker);
 
     const entry: TrailEntry = {
-      line,
-      material,
+      lineCore,
+      lineGlow,
+      materialCore,
+      materialGlow,
       marker,
-      chevron,
+      aircraft,
       hitArea,
       pointCount: 0,
       lastTs: 0,
@@ -196,20 +240,26 @@ export class TrailsLayer {
     return entry;
   }
 
-  private rebuildLine(entry: TrailEntry, points: PositionSnapshot[]): void {
+  private rebuildLines(entry: TrailEntry, points: PositionSnapshot[]): void {
     const positions: number[] = [];
-    const colors: number[] = [];
+    const coreColors: number[] = [];
+    const glowColors: number[] = [];
     for (const p of points) {
       const [x, y, z] = projectLatLon(p.lat, p.lon, p.alt ?? 0);
       positions.push(x, y, z);
-      pushTrailColor(p.alt ?? 0, colors);
+      pushCoreColor(p.alt ?? 0, coreColors);
+      pushGlowColor(p.alt ?? 0, glowColors);
     }
 
-    entry.line.geometry.dispose();
-    const geometry = new LineGeometry();
-    geometry.setPositions(positions);
-    geometry.setColors(colors);
-    entry.line.geometry = geometry;
+    const swap = (line: Line2, colors: number[]): void => {
+      line.geometry.dispose();
+      const geometry = new LineGeometry();
+      geometry.setPositions(positions);
+      geometry.setColors(colors);
+      line.geometry = geometry;
+    };
+    swap(entry.lineCore, coreColors);
+    swap(entry.lineGlow, glowColors);
 
     const last = points[points.length - 1];
     entry.pointCount = points.length;
@@ -247,28 +297,43 @@ export class TrailsLayer {
     for (const [icao, entry] of this.entries) {
       const isSelected = icao === this.selectedIcao;
       if (isSelected) {
-        entry.material.linewidth = SELECTED_WIDTH;
-        entry.material.opacity = 1;
-        // >1 channel values push the trail over the bloom threshold.
-        entry.material.color.setRGB(2.1, 2.1, 2.1);
-        entry.chevron.material.color.set("#00f5ff");
-        entry.chevron.material.opacity = 1;
+        entry.materialCore.linewidth = CORE_WIDTH_SELECTED;
+        entry.materialCore.opacity = 1;
+        // >1 channel values push the core over the bloom threshold.
+        entry.materialCore.color.setRGB(2.0, 2.0, 2.0);
+        entry.materialGlow.linewidth = GLOW_WIDTH_SELECTED;
+        entry.materialGlow.opacity = 0.32;
+        entry.materialGlow.color.setRGB(1.3, 1.3, 1.3);
+        entry.aircraft.material.emissive.copy(BODY_EMISSIVE_SELECTED);
+        entry.aircraft.material.emissiveIntensity = 0.9;
+        entry.aircraft.material.opacity = 1;
       } else {
-        entry.material.linewidth = hasSelection ? DIMMED_WIDTH : UNSELECTED_WIDTH;
-        entry.material.opacity = hasSelection ? 0.14 : 0.85;
-        entry.material.color.setRGB(1, 1, 1);
-        entry.chevron.material.color.set("#bdf3ff");
-        entry.chevron.material.opacity = hasSelection ? 0.35 : 0.95;
+        entry.materialCore.linewidth = hasSelection
+          ? CORE_WIDTH_DIMMED
+          : CORE_WIDTH;
+        entry.materialCore.opacity = hasSelection ? 0.12 : 0.85;
+        entry.materialCore.color.setRGB(1, 1, 1);
+        entry.materialGlow.linewidth = hasSelection
+          ? GLOW_WIDTH_DIMMED
+          : GLOW_WIDTH;
+        entry.materialGlow.opacity = hasSelection ? 0.04 : 0.11;
+        entry.materialGlow.color.setRGB(1, 1, 1);
+        entry.aircraft.material.emissive.copy(BODY_EMISSIVE);
+        entry.aircraft.material.emissiveIntensity = 1;
+        entry.aircraft.material.opacity = hasSelection ? 0.3 : 1;
       }
     }
   }
 
   private disposeEntry(entry: TrailEntry): void {
-    entry.line.geometry.dispose();
-    entry.material.dispose();
-    entry.chevron.material.dispose();
+    entry.lineCore.geometry.dispose();
+    entry.lineGlow.geometry.dispose();
+    entry.materialCore.dispose();
+    entry.materialGlow.dispose();
+    entry.aircraft.material.dispose();
     (entry.hitArea.material as THREE.Material).dispose();
-    this.group.remove(entry.line);
+    this.group.remove(entry.lineCore);
+    this.group.remove(entry.lineGlow);
     this.group.remove(entry.marker);
   }
 }
