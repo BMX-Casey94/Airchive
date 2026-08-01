@@ -1,12 +1,10 @@
 # Airchive — BSV Blockchain Aircraft Telemetry Platform
 
-> **BSV Hackathon (April) 2026 Submission** — Chronicle-era on-chain aviation data
-
 Airchive ingests multi-source ADS-B telemetry, normalises it into a canonical record model, and drives phase detection, adaptive on-chain write rates, and operator-facing dashboards backed by Redis, PostgreSQL, and BSV infrastructure.
 
-The goal is an auditable, append-only trail of flight activity suitable for safety analytics, insurers, and fleet operations. Airborne aircraft are archived at the full 1 Hz rate ADS-B broadcasts at — sampling faster would only duplicate records — while cadence drops on the ground and duplicate suppression removes samples carrying no new information. Every mined record is verified by SPV against a locally held, proof-of-work-checked block header rather than an explorer's say-so.
+The goal is an auditable, append-only trail of flight activity suitable for safety analytics, insurers, and fleet operations. Airborne aircraft are archived at the full 1 Hz rate ADS-B broadcasts at — sampling faster would only duplicate records — while cadence drops on the ground and duplicate suppression removes samples carrying no new information. Every mined record is verified by SPV against a locally held, proof-of-work-checked block header rather than an explorer's say-so. Transactions are broadcast under the **Chronicle** era of BSV (`tx.version = 2`).
 
-## Solo Dev
+## Author
 
 | Name | Role |
 |------|------|
@@ -47,7 +45,7 @@ The goal is an auditable, append-only trail of flight activity suitable for safe
 
 **Ingestion** polls adsb.fi, OpenSky, and optional RTL-SDR endpoints, merges and deduplicates into `TelemetryRecord` shapes, and publishes to Redis `telemetry:{ICAO}` channels. A **phase engine** subscribes to those channels, runs the flight-phase state machine and adaptive write-rate controller, emits `write:{ICAO}` for the blockchain writer, and broadcasts enriched payloads for real-time consumers. Write rates are configurable per phase via environment variables (`WRITE_RATE_*_MS`).
 
-**Gateway** exposes HTTP APIs and WebSockets for the **dashboard** (globe, fleet grid, alerts, blockchain feed, agent marketplace). **Blockchain writer** consumes `write:{ICAO}` events, builds OP_RETURN transactions with encoded telemetry, and broadcasts through **Arcade** — a Teranode-native, Arc-compatible endpoint — with TAAL ARC as fallback. Submissions are coalesced into Extended Format batches and status arrives over Arcade's SSE stream rather than inbound callbacks, so no public ingress is required. A **bounded-concurrency broadcaster** applies priority queuing, transient retry with exponential backoff, and a circuit breaker to prevent cascade failures. Each aircraft has its own independently funded wallet, and an **activity-aware auto-refill** monitor tops up wallets only for actively flying aircraft. The retry buffer coalesces superseded telemetry writes per aircraft, and change is only spent once Arcade confirms the parent is genuinely on the network.
+**Gateway** exposes HTTP APIs and WebSockets for the **dashboard** (globe, AE polar map, fleet grid, alerts, blockchain feed, agent marketplace), including live session paths via `/api/sessions/active`. **Blockchain writer** consumes `write:{ICAO}` events, builds OP_RETURN transactions with encoded telemetry, and broadcasts through **Arcade** — a Teranode-native, Arc-compatible endpoint — with TAAL ARC as fallback. Transactions are coalesced into Extended Format batches and status arrives over Arcade's SSE stream rather than inbound callbacks, so no public ingress is required. A **bounded-concurrency broadcaster** applies priority queuing, transient retry with exponential backoff, and a circuit breaker to prevent cascade failures. Each aircraft has its own independently funded wallet, and an **activity-aware auto-refill** monitor tops up wallets only for actively flying aircraft. The retry buffer coalesces superseded telemetry writes per aircraft during ordinary backpressure, preserves the full stream while the treasury is dry, and change is only spent once Arcade confirms the parent is genuinely on the network.
 
 **Overlay Node** runs a custom BSV overlay node (`services/overlay-node`) with an `AirchiveTopicManager` (`tm_airchive`) that indexes transactions by filtering for the `AIRCHIVE` protocol prefix in OP_RETURN outputs. It exposes a REST + WebSocket API for querying telemetry records by ICAO, transaction ID, time range, or flight session — providing a self-hosted, BSV-native lookup layer independent of third-party explorers.
 
@@ -71,7 +69,7 @@ The operator dashboard ([https://airchive.vercel.app](https://airchive.vercel.ap
 
 | View | Description |
 |------|-------------|
-| **3D Globe** | CesiumJS globe with live aircraft positions, trails, labels, and custom aircraft billboards updated via WebSocket |
+| **3D Globe** | CesiumJS globe with live aircraft positions, trails, labels, and custom aircraft billboards updated via WebSocket. The homepage links onward to the AE polar map for a full-fleet disc view |
 | **AE Polar Flight Map** (`/ae`) | Full-screen azimuthal equidistant world disc centred on the North Pole, every active flight drawn as a complete take-off-to-landing trail. A bespoke three.js/WebGL engine rather than a Cesium view — [see below](#ae-polar-flight-map-ae) |
 | **Fleet Status Grid** | Card-per-aircraft showing ICAO, callsign, altitude, speed, heading, flight phase, and live on-chain write activity, with `All`, `Live`, and `Offline` filters |
 | **Selected Aircraft Panel** | Deep-dive into a single aircraft: telemetry readouts, altitude/speed charts, flight timeline, and a "View Wallet On-Chain" button linking to WhatsonChain |
@@ -83,9 +81,9 @@ The operator dashboard ([https://airchive.vercel.app](https://airchive.vercel.ap
 | **Flight History** | Paginated completed flight log with origin/destination, duration, phase breakdown, and linked transactions |
 | **Aircraft Explorer** | Per-aircraft transaction history with decoded payload, block height, inclusion proof, and SPV verification state (verified / proof received / awaiting proof) |
 | **Historical Data** | Per-aircraft view that reads past transactions back off the chain and decodes them into a columnar telemetry table |
-| **Funding Status** | Treasury state (`HEALTHY`, `LOW`, `DRY`, `RECOVERING`), balance, estimated runway and held-write count, with a banner when funding is unhealthy |
+| **Funding Status** | Treasury state (`HEALTHY`, `LOW`, `DRY`, `RECOVERING`), balance, estimated runway and retry backlog, with a banner when funding is unhealthy |
 | **Wallet List** | All 239 configured aircraft wallets with BIP44 index and WhatsonChain links, generated automatically from the configured fleet |
-| **Pitch / Cost Calculator** (`/demo`) | Interactive chain-write economics calculator — model the cost of full-fidelity archival per aircraft and per flight hour, adjust fleet size and flight hours, view the phase-by-phase write rate breakdown |
+| **Cost Calculator** (`/demo`) | Interactive chain-write economics calculator — model the cost of full-fidelity archival per aircraft and per flight hour, adjust fleet size and flight hours, view the phase-by-phase write rate breakdown |
 
 ## AE Polar Flight Map (`/ae`)
 
@@ -240,7 +238,8 @@ refreshes converge rather than accumulating duplicates.
 |-------|----------|
 | **Trails** | Drawn twice — a wide additive glow underlay and a crisp core line, both screen-space-width fat lines (`LineSegments2`) so they stay legible at any zoom. Colour ramps from dim ember on the ground to bright gold at cruise. Coverage gaps render as breaks rather than chords slicing across the disc, and long segments are subdivided in lat/lon so they follow the projection's curvature near the rim |
 | **Aircraft** | Procedurally generated low-poly airliners (extruded plan-view silhouette plus a vertical stabiliser), the only lit objects in the scene — everything else is unlit shaders |
-| **Toroidal field** | A cage of poloidal loops through the pole, helically twisted with the swirl direction alternating per shell, plus 2,200 flowing particles and an axial beam |
+| **Toroidal field** | A cage of poloidal loops through the pole, helically twisted with the swirl direction alternating per shell, plus 2,200 flowing particles and a soft axial beam through the pole |
+| **Rim** | A single shader-driven glow: a gaussian cyan core at the disc boundary plus an outward halo that decays to exactly zero before the geometry ends, so the edge feathers into the void rather than terminating on a hard circle. The map surface itself dissolves across the last 1.4% of the radius underneath it |
 | **Country labels** | 111 billboarded sprites over three zoom tiers, fading in per-label by camera distance so the disc is never cluttered at a given zoom |
 | **Void** | A shader gradient with per-pixel dither — a dark gradient across a full screen bands visibly on 8-bit displays without it |
 
@@ -269,6 +268,11 @@ nothing in the field terminates on a hard line.
   approach direction is preserved during the move — only the pivot and
   distance change — because rotating the world underneath someone to reach a
   target is disorienting. Grabbing the map cancels the animation instantly.
+- **Flight dossier.** A side rail on desktop, a bottom sheet on phones. On
+  mobile the sheet can be minimised to a slim title bar (callsign, phase, and
+  expand/close) so the selected aircraft stays visible on the map; a brief
+  bouncing chevron hints that the sheet scrolls when it first opens with
+  overflow.
 - **Map dim toggle.** Halves the imagery brightness so aircraft and trails
   dominate, animated in the shader and remembered in `localStorage`. It dims
   brightness rather than opacity deliberately: the disc has to stay opaque or
@@ -424,7 +428,7 @@ pnpm --filter @airchive/dashboard dev
 
 - **Dashboard:** [https://airchive.vercel.app](https://airchive.vercel.app)
 - **AE polar flight map:** [https://airchive.vercel.app/ae](https://airchive.vercel.app/ae)
-- **Pitch / cost calculator:** [https://airchive.vercel.app/demo](https://airchive.vercel.app/demo)
+- **Cost calculator:** [https://airchive.vercel.app/demo](https://airchive.vercel.app/demo)
 - **Wallet list:** [https://airchive.vercel.app/wallets](https://airchive.vercel.app/wallets)
 
 ### Local development URLs
@@ -436,9 +440,9 @@ pnpm --filter @airchive/dashboard dev
 
 ### Deployment architecture
 
-The **dashboard** is deployed to Vercel (Next.js). The backend services run as a Docker Compose stack — Postgres, Redis, Arcade and the six Node services on one internal network, with only the gateway exposed. `deploy/README.md` is the full VPS runbook, covering host preparation, TLS via nginx and certbot, file-backed secrets, verified backups and systemd units for boot.
+Production is a **Docker Compose** stack on a VPS — Postgres, Redis, Arcade, the six Node services, the Next.js dashboard and nginx on one internal network, with TLS terminated at nginx (certbot). `deploy/README.md` is the full runbook: host preparation, file-backed secrets, verified backups and optional systemd units for boot.
 
-The gateway's REST and WebSocket endpoints need to be reachable from Vercel. Either terminate TLS at nginx on a domain pointed at the host, or front the gateway with a **named** Cloudflare Tunnel — the latter needs no open ports or certificates and, unlike a quick tunnel, keeps a stable hostname across restarts.
+The dashboard can also be served from Vercel while the backend remains on the VPS; in that case the gateway's REST and WebSocket endpoints need a stable public origin (TLS at nginx, or a **named** Cloudflare Tunnel — the latter needs no open ports or certificates and, unlike a quick tunnel, keeps a stable hostname across restarts). SEO surfaces (`robots.txt`, `sitemap.xml`, Open Graph, JSON-LD) resolve from `NEXT_PUBLIC_SITE_URL` / `PUBLIC_ORIGIN` at build time.
 
 ## Tech stack
 
@@ -467,8 +471,8 @@ The gateway's REST and WebSocket endpoints need to be reachable from Vercel. Eit
 | `services/agent-marketplace` | Three autonomous AI agents (Collector, Analyst, Monitor) with BSV micropayments |
 | `services/overlay-node` | BSV overlay node — `tm_airchive` topic manager, `AirchiveLookupService`, REST + WebSocket API |
 | `services/alert-engine` | Configurable alerting (email/SMS via SendGrid/Twilio) |
-| `dashboard` | Next.js operator UI — globe, fleet grid, blockchain feed, agent marketplace panel |
-| `dashboard/src/ae` | Custom three.js engine for the AE polar flight map — projection maths, disc/field/label shaders, trail layer, flight dossier |
+| `dashboard` | Next.js operator UI — globe, AE map entry banner, fleet grid, blockchain feed, agent marketplace panel, SEO metadata |
+| `dashboard/src/ae` | Custom three.js engine for the AE polar flight map — projection maths, disc/rim/field/label shaders, trail layer, flight dossier |
 | `deploy` | VPS runbook, systemd units, entrypoint and verified backup/restore scripts |
 | `k8s`, `nginx` | Kubernetes manifests and reverse-proxy configuration |
 
@@ -503,8 +507,8 @@ Funding state is persisted in Postgres, so it survives restarts of any length
 and no manual intervention is needed beyond sending funds.
 
 On entering `DRY` the writer stops retry churn, raises a `CRITICAL` alert and
-shows a dashboard banner. Held writes in `pending_writes` are preserved rather
-than aged out — the retry-exhaustion purge is skipped entirely while funding is
+shows a dashboard banner. Rows in `pending_writes` are preserved rather than
+aged out — the retry-exhaustion purge is skipped entirely while funding is
 unhealthy, so the backlog survives. The funding address is then polled on a
 backoff widening to `FUNDING_DRY_POLL_MAX_MS`, indefinitely.
 
@@ -526,7 +530,15 @@ When funds arrive it reconciles the pool, splits to `FUNDING_POOL_SPLIT_TARGET`,
 refills active aircraft first, then drains the backlog
 `FUNDING_RECOVERY_DRAIN_BATCH` writes at a time so recovery does not stampede
 the broadcaster. `GET /api/system/funding` reports state, balance, estimated
-runway and held writes throughout.
+**runway** and **retry backlog** throughout:
+
+- **Runway** is balance divided by a time-weighted burn rate. Quiet intervals
+  count as zero burn (so the estimate is not inflated by only sampling spend
+  windows), and balance increases are skipped so top-ups do not look like
+  negative burn. The smoother uses a 30-minute time constant.
+- **Retry backlog** is the count of deferred writes waiting to broadcast —
+  coalesced to the latest sample per aircraft during ordinary backpressure,
+  and preserved in full while the treasury is dry.
 
 ### Agent wallets (`@bsv/simple` ServerWallet)
 
@@ -614,7 +626,7 @@ Throughput scales linearly with the tracked fleet — adding aircraft increases 
 
 Throughput peaks during descent- and approach-heavy periods such as European evening arrivals, and dips when most tracked aircraft are cruising or parked. In practice the system is write-generation-limited rather than broadcast-limited: Arcade batching absorbs submission load comfortably, and the constraint is how much genuinely new telemetry the fleet produces.
 
-> The `/demo` route on the dashboard includes an interactive cost calculator where stakeholders can adjust fleet size and flight hours to model their own economics.
+> The `/demo` route on the dashboard includes an interactive cost calculator where fleet size and flight hours can be adjusted to model chain-write economics.
 
 ## Licence
 

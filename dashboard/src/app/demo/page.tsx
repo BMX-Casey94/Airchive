@@ -45,7 +45,7 @@ export default function DemoPage() {
       <div className="relative mx-auto flex max-w-6xl flex-col px-6 pb-24 pt-16 md:pt-20">
         {/* Header */}
         <div className="text-center">
-          <p className="hud-label mb-3 text-electric-cyan/80">BSV Hackathon 2026 · Chronicle era</p>
+          <p className="hud-label mb-3 text-electric-cyan/80">Chronicle-era on-chain aviation data</p>
           <h1 className="font-sans text-5xl font-bold tracking-[0.15em] text-white md:text-7xl">
             AIRCHIVE
           </h1>
