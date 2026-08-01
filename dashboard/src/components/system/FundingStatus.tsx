@@ -185,7 +185,14 @@ export default function FundingStatus() {
             <span className="text-hud-muted text-[10px]"> sats</span>
           </p>
         </div>
-        <div>
+        <div
+          title={
+            "Estimated time until the treasury reaches zero at the current "
+            + "spend rate, averaged over the last 30 minutes. Covers the whole "
+            + "treasury drain — aircraft refills and agent top-ups, not just "
+            + "transaction fees."
+          }
+        >
           <p className="hud-label text-[9px]">Runway</p>
           <p
             className={clsx(
@@ -196,8 +203,15 @@ export default function FundingStatus() {
             {formatRunway(funding.runway_hours)}
           </p>
         </div>
-        <div>
-          <p className="hud-label text-[9px]">Held Writes</p>
+        <div
+          title={
+            "Rows awaiting a retry after a failed broadcast. Telemetry is "
+            + "coalesced to the latest sample per aircraft, so this counts "
+            + "affected aircraft plus individual flight events — not the "
+            + "number of deferred telemetry samples."
+          }
+        >
+          <p className="hud-label text-[9px]">Retry Backlog</p>
           <p
             className={clsx(
               "font-mono text-sm tabular-nums",

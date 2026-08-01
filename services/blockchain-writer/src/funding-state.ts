@@ -38,8 +38,13 @@ const STATE_ORDINALS: Record<FundingStateName, number> = {
   RECOVERING: 3,
 };
 
-/** Smoothing factor for the burn estimate; low enough to ignore single spikes. */
-const BURN_EMA_ALPHA = 0.25;
+/**
+ * Wall-clock smoothing window for the burn estimate. Weighting samples by
+ * elapsed time rather than counting ticks keeps the figure meaningful if the
+ * poll interval is ever retuned, and stops a 5s burst reading as a permanent
+ * rate.
+ */
+const BURN_TIME_CONSTANT_MS = 30 * 60_000;
 /** Channel the gateway relays to the dashboard for the funding banner. */
 const FUNDING_CHANNEL = "funding-state";
 
@@ -75,6 +80,7 @@ export class FundingStateMachine {
   private lastBalance: number | null = null;
   private lastBalanceAt = 0;
   private burnEma = 0;
+  private burnInitialised = false;
   private cached: FundingSnapshot | null = null;
   /**
    * Published so operators can top the treasury up without shelling into the
@@ -442,20 +448,39 @@ export class FundingStateMachine {
     return Math.min(ceiling, base * 2 ** Math.min(consecutivePolls, 16));
   }
 
+  /**
+   * Quiet intervals count as zero burn. Sampling only the intervals that
+   * happened to contain a spend measured the burn rate *while spending*, which
+   * is a different quantity from the average burn and made the runway read
+   * materially shorter than the treasury actually had.
+   *
+   * A balance increase means a top-up landed, which masks whatever was spent
+   * alongside it, so those intervals carry no usable signal and are skipped.
+   * The estimate stays uninitialised — and the runway unreported — until real
+   * spending has been observed, rather than starting from an optimistic zero.
+   */
   private updateBurnEstimate(balance: number): void {
     const now = Date.now();
-    if (this.lastBalance !== null && now > this.lastBalanceAt) {
-      const spent = this.lastBalance - balance;
-      const hours = (now - this.lastBalanceAt) / 3_600_000;
-      if (spent > 0 && hours > 0) {
-        const instantaneous = spent / hours;
-        this.burnEma = this.burnEma === 0
-          ? instantaneous
-          : this.burnEma * (1 - BURN_EMA_ALPHA) + instantaneous * BURN_EMA_ALPHA;
-      }
-    }
+    const elapsedMs = now - this.lastBalanceAt;
+    const previous = this.lastBalance;
     this.lastBalance = balance;
     this.lastBalanceAt = now;
+
+    if (previous === null || elapsedMs <= 0) return;
+
+    const spent = previous - balance;
+    if (spent < 0) return;
+
+    const instantaneous = spent / (elapsedMs / 3_600_000);
+    if (!this.burnInitialised) {
+      if (spent === 0) return;
+      this.burnEma = instantaneous;
+      this.burnInitialised = true;
+      return;
+    }
+
+    const alpha = 1 - Math.exp(-elapsedMs / BURN_TIME_CONSTANT_MS);
+    this.burnEma += alpha * (instantaneous - this.burnEma);
   }
 
   private runwayHours(balance: number): number | null {
