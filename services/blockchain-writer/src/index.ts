@@ -464,6 +464,11 @@ async function main(): Promise<void> {
   await writeBuffer.coalesceTelemetryBacklog().catch((err) =>
     log.error({ err }, "Telemetry backlog coalescing failed"),
   );
+  // A restart following a long outage should trim the backlog immediately
+  // rather than waiting for the first scheduled prune.
+  await writeBuffer.prunePreservedBacklog().catch((err) =>
+    log.error({ err }, "Preserved backlog prune failed"),
+  );
 
   /* ── Bootstrap funding/treasury UTXO pool ── */
   log.info("Bootstrapping funding UTXO pool");

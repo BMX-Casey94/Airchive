@@ -205,10 +205,11 @@ export default function FundingStatus() {
         </div>
         <div
           title={
-            "Rows awaiting a retry after a failed broadcast. Telemetry is "
-            + "coalesced to the latest sample per aircraft, so this counts "
-            + "affected aircraft plus individual flight events — not the "
-            + "number of deferred telemetry samples."
+            "Writes awaiting a retry after a failed broadcast. During normal "
+            + "operation telemetry is coalesced to the latest sample per "
+            + "aircraft, so the figure reflects affected aircraft plus "
+            + "individual flight events. While the treasury is dry the full "
+            + "stream is preserved instead and drains in order once funded."
           }
         >
           <p className="hud-label text-[9px]">Retry Backlog</p>

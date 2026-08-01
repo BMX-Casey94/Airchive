@@ -233,6 +233,11 @@ export interface PendingWrite {
   created_at: Date;
   retry_count: number;
   last_error?: string;
+  /**
+   * Exempt from telemetry coalescing. Set while the treasury is dry, where the
+   * whole stream must survive rather than collapsing to the latest sample.
+   */
+  preserved: boolean;
 }
 
 export type AirportSizeType =

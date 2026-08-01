@@ -11,6 +11,7 @@ import {
   insertPendingWrite,
   markWriteDeferred,
   markWriteRetried,
+  prunePreservedWrites,
   upsertPendingTelemetryWrite,
 } from "@airchive/db";
 import { createLogger } from "@airchive/logger";
@@ -35,6 +36,14 @@ import type { AutoRefillMonitor } from "./auto-refill.js";
 const log = createLogger({ service: "blockchain-writer:write-buffer" });
 
 const RETRY_INTERVAL_MS = 2_500;
+/**
+ * How much of an outage backlog is kept. Beyond this the oldest deferred
+ * telemetry is dropped: at the measured write rate a dry treasury accrues
+ * around a million rows a day, and an unattended outage must not be able to
+ * fill the disk.
+ */
+const PRESERVED_RETENTION_MS = 24 * 60 * 60 * 1_000;
+const PRUNE_INTERVAL_MS = 5 * 60_000;
 const RETRY_BATCH_SIZE = 100;
 const RETRY_MAX_PARALLEL_AIRCRAFT = 12;
 const RETRY_CONCURRENCY_DIVISOR = 4;
@@ -83,6 +92,7 @@ function formatRetryBackoffReason(remainingMs: number): string {
 
 export class WriteBuffer {
   private intervalId: ReturnType<typeof setInterval> | null = null;
+  private pruneIntervalId: ReturnType<typeof setInterval> | null = null;
   private retrying = false;
   private redisPublisher: Redis | null = null;
   private autoRefill: AutoRefillMonitor | null = null;
@@ -122,13 +132,27 @@ export class WriteBuffer {
     this.redisPublisher = redis;
   }
 
+  /**
+   * Deferred telemetry is normally collapsed to the latest sample per aircraft,
+   * because a write held back by a momentary broadcaster blip really is
+   * superseded a second later.
+   *
+   * A dry treasury is a different situation entirely: the outage lasts until
+   * somebody sends coins, and collapsing there quietly destroyed the archive it
+   * claimed to be protecting — every arriving sample deleted the one being
+   * held. While funding is dry the whole stream is preserved instead, drained
+   * in order once the treasury recovers and aged out on a retention window so
+   * it cannot grow without bound.
+   */
   async buffer(
     icao: string,
     recordType: RecordType,
     payload: Uint8Array,
     flightId?: string,
   ): Promise<void> {
-    if (recordType === RecordTypeEnum.TELEMETRY) {
+    const preserveStream = this.fundingDryGate?.() === true;
+
+    if (recordType === RecordTypeEnum.TELEMETRY && !preserveStream) {
       const result = await upsertPendingTelemetryWrite(this.db, {
         aircraft_icao: icao,
         record_type: recordType,
@@ -147,10 +171,30 @@ export class WriteBuffer {
       record_type: recordType,
       payload: Buffer.from(payload),
       flight_id: flightId,
+      preserved: preserveStream,
     });
 
     pendingWritesGauge.inc();
-    log.debug({ icao, recordType }, "Write buffered for retry");
+    log.debug({ icao, recordType, preserved: preserveStream }, "Write buffered for retry");
+  }
+
+  /**
+   * Drops outage backlog older than the retention window. Runs on a timer
+   * rather than at insert time so the cost does not land on the write path
+   * during the outage itself.
+   */
+  async prunePreservedBacklog(): Promise<number> {
+    const cutoff = new Date(Date.now() - PRESERVED_RETENTION_MS);
+    const removed = await prunePreservedWrites(this.db, cutoff);
+    if (removed > 0) {
+      await this.syncPendingGauge();
+      log.warn(
+        { removed, retentionHours: PRESERVED_RETENTION_MS / 3_600_000 },
+        "Dropped preserved writes beyond the retention window — "
+          + "these telemetry samples will not reach the chain",
+      );
+    }
+    return removed;
   }
 
   startRetryLoop(): void {
@@ -159,6 +203,13 @@ export class WriteBuffer {
     this.intervalId = setInterval(() => {
       void this.retry();
     }, RETRY_INTERVAL_MS);
+
+    this.pruneIntervalId = setInterval(() => {
+      void this.prunePreservedBacklog().catch((err) =>
+        log.error({ err }, "Preserved backlog prune failed"),
+      );
+    }, PRUNE_INTERVAL_MS);
+    this.pruneIntervalId.unref?.();
 
     void this.syncPendingGauge().catch((err) =>
       log.warn({ err }, "Pending write gauge sync failed"),
@@ -179,6 +230,10 @@ export class WriteBuffer {
     if (this.intervalId) {
       clearInterval(this.intervalId);
       this.intervalId = null;
+    }
+    if (this.pruneIntervalId) {
+      clearInterval(this.pruneIntervalId);
+      this.pruneIntervalId = null;
     }
   }
 

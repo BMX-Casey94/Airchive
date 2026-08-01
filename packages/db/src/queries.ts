@@ -266,7 +266,7 @@ export async function getFlightSessions(
 export type NewPendingWrite = Pick<
   PendingWrite,
   "aircraft_icao" | "record_type" | "payload"
-> & { flight_id?: string };
+> & { flight_id?: string; preserved?: boolean };
 
 export async function insertPendingWrite(
   db: Knex,
@@ -279,9 +279,17 @@ export async function insertPendingWrite(
       ? write.payload
       : Buffer.from(write.payload),
     flight_id: write.flight_id,
+    preserved: write.preserved ?? false,
   });
 }
 
+/**
+ * Collapses an aircraft's deferred telemetry to its latest sample. Rows
+ * flagged `preserved` are invisible to this path in both directions: they are
+ * never chosen as the row to overwrite, and never deleted as superseded. A
+ * backlog held through a funding outage therefore survives the first ordinary
+ * deferral that follows recovery, which would otherwise have wiped it.
+ */
 export async function upsertPendingTelemetryWrite(
   db: Knex,
   write: NewPendingWrite,
@@ -295,6 +303,7 @@ export async function upsertPendingTelemetryWrite(
       .where({
         aircraft_icao: write.aircraft_icao,
         record_type: RecordType.TELEMETRY,
+        preserved: false,
       })
       .orderBy("id", "desc")
       .first<PendingWriteRow | undefined>();
@@ -305,6 +314,7 @@ export async function upsertPendingTelemetryWrite(
         record_type: RecordType.TELEMETRY,
         payload,
         flight_id: write.flight_id,
+        preserved: false,
       });
       return "inserted";
     }
@@ -323,6 +333,7 @@ export async function upsertPendingTelemetryWrite(
       .where({
         aircraft_icao: write.aircraft_icao,
         record_type: RecordType.TELEMETRY,
+        preserved: false,
       })
       .whereNot({ id: existing.id })
       .delete();
@@ -334,14 +345,40 @@ export async function upsertPendingTelemetryWrite(
 export async function coalescePendingTelemetryWrites(db: Knex): Promise<number> {
   return db("pending_writes as older")
     .where("older.record_type", RecordType.TELEMETRY)
+    .where("older.preserved", false)
     .whereExists(
       db("pending_writes as newer")
         .select(db.raw("1"))
         .whereRaw("newer.record_type = older.record_type")
         .whereRaw("newer.aircraft_icao = older.aircraft_icao")
+        .whereRaw("newer.preserved = false")
         .whereRaw("newer.id > older.id"),
     )
     .delete();
+}
+
+/**
+ * Ages out an outage backlog. Without a ceiling an unattended dry treasury
+ * would accumulate roughly a million rows a day at the measured write rate,
+ * so the oldest are dropped once they fall outside the retention window —
+ * the newest telemetry is the part still worth broadcasting.
+ */
+export async function prunePreservedWrites(
+  db: Knex,
+  olderThan: Date,
+): Promise<number> {
+  return db("pending_writes")
+    .where({ preserved: true })
+    .where("created_at", "<", olderThan)
+    .delete();
+}
+
+export async function getPreservedWriteCount(db: Knex): Promise<number> {
+  const row = await db("pending_writes")
+    .where({ preserved: true })
+    .count<{ count: string | number }>("* as count")
+    .first();
+  return Number(row?.count ?? 0);
 }
 
 export async function getPendingWrites(

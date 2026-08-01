@@ -345,7 +345,7 @@ The blockchain writer includes several production-grade mechanisms to maintain s
 - **Conservative UTXO settlement** — an input is only returned to the pool if the network was never offered it. Once broadcast, it stays locked and the wallet reconciles against chain truth, because unlocking risks a second transaction spending it
 - **Treasury reshaping** — the funding pool splits into spendable outputs sized above the refill floor, and consolidates automatically when fragmentation leaves it unable to fund a refill despite holding ample total value
 - **WoC reconciliation deduplication** — funding wallet reconciliation against WhatsonChain is globally deduplicated with rate-limit awareness (30s cooldown, 120s after a 429)
-- **Write coalescing** — the retry buffer keeps only the latest telemetry per aircraft, so stale queued writes are replaced rather than replayed
+- **Write coalescing** — the retry buffer keeps only the latest telemetry per aircraft, so a write deferred by a momentary broadcaster blip is replaced rather than replayed. This is suspended while the treasury is dry: a funding outage lasts until somebody sends coins, and collapsing there would destroy the archive it claims to be protecting, so the full stream is preserved instead (see below)
 
 ## Dashboard performance
 
@@ -480,6 +480,20 @@ shows a dashboard banner. Held writes in `pending_writes` are preserved rather
 than aged out — the retry-exhaustion purge is skipped entirely while funding is
 unhealthy, so the backlog survives. The funding address is then polled on a
 backoff widening to `FUNDING_DRY_POLL_MAX_MS`, indefinitely.
+
+Deferred telemetry is flagged `preserved` for the duration, which exempts it
+from the per-aircraft coalescing that applies in normal operation. Without that
+exemption the backlog was not a backlog at all: each arriving sample deleted the
+one being held, so however long the outage ran, exactly one telemetry frame per
+aircraft survived. Preserved rows drain in chronological order once funding
+returns, and are aged out on a 24-hour retention window so an unattended outage
+cannot fill the disk — at the measured write rate a dry treasury accrues roughly
+a million rows a day.
+
+Flight paths themselves do not depend on any of this. `session_positions` is
+written by the ingestion service straight to Postgres and never touches the
+treasury, so the operational record of a flight survives a funding outage
+intact; it is the on-chain archive that gains a gap.
 
 When funds arrive it reconciles the pool, splits to `FUNDING_POOL_SPLIT_TARGET`,
 refills active aircraft first, then drains the backlog
