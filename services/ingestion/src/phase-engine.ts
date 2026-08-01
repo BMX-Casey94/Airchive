@@ -16,6 +16,7 @@ import {
 } from "@airchive/types";
 import type { AirportLookup } from "@airchive/airports";
 import { haversineDistanceMiles } from "@airchive/airports";
+import { expireStaleFlightSessions, getSessionLastPositionTs } from "@airchive/db";
 import { createLogger } from "@airchive/logger";
 import { Redis } from "ioredis";
 import type { Knex } from "knex";
@@ -39,6 +40,53 @@ const AIRPORT_PROXIMITY_MILES = 10;
  * ceiling, cruise traffic over a busy region would sit permanently at 1 Hz.
  */
 const AIRPORT_PROXIMITY_MAX_ALT_FT = 10_000;
+
+/**
+ * A TAKEOFF observed after this much telemetry silence is a new flight: the
+ * previous session ended somewhere out of coverage and must not be continued,
+ * or the new flight inherits the old flight's origin and path. Go-arounds and
+ * touch-and-goes have continuous telemetry, so they are unaffected.
+ */
+const NEW_FLIGHT_GAP_MS = 30 * 60_000;
+/**
+ * Ceiling on how stale an open database session may be and still be resumed
+ * for an aircraft picked up mid-air. Long enough to survive transoceanic
+ * ADS-B coverage gaps within one flight; beyond it, a landing plus a new
+ * departure is the likelier explanation, and an unresolved origin is far
+ * better than a wrong one.
+ */
+const RESUME_MAX_GAP_MS = 3 * 60 * 60_000;
+/**
+ * Open sessions with no recorded position for this long are presumed to have
+ * ended out of coverage. The sweep is what stops `flight_sessions` filling
+ * with zombies that inflate the active count and get wrongly resumed days
+ * later.
+ */
+const STALE_SESSION_AFTER_MS = 6 * 60 * 60_000;
+const SESSION_SWEEP_INTERVAL_MS = 15 * 60_000;
+/**
+ * Destination resolution during APPROACH: below this altitude an airliner is
+ * minutes from touchdown, so the nearest airport within the radius is almost
+ * certainly where it is going. At the top of the approach band (10,000 ft)
+ * the nearest field could still be an unrelated one under the descent path.
+ */
+const DEST_RESOLVE_MAX_ALT_FT = 6_000;
+const DEST_RESOLVE_RADIUS_MILES = 12;
+/**
+ * Never resolve an origin airport from a position this high: a "take-off"
+ * detected at altitude is a data artefact, and the nearest airport to it is
+ * whatever happens to be overflown.
+ */
+const ORIGIN_RESOLVE_MAX_ALT_FT = 10_000;
+
+const AIRBORNE_PHASES = new Set<FlightPhase>([
+  FlightPhase.TAKEOFF,
+  FlightPhase.CLIMB,
+  FlightPhase.CRUISE,
+  FlightPhase.DESCENT,
+  FlightPhase.APPROACH,
+  FlightPhase.LANDING,
+]);
 
 function headingDeg(record: TelemetryRecord): number {
   const t = record.track;
@@ -108,6 +156,14 @@ export class PhaseEngine {
 
   private readonly sessionAggs = new Map<string, SessionAgg>();
 
+  /** Timestamp of each aircraft's previous telemetry frame, for gap detection. */
+  private readonly lastFrameTsByIcao = new Map<string, number>();
+
+  /** Airframes whose first-contact session resolution has already run. */
+  private readonly sessionResolutionDone = new Set<string>();
+
+  private sweepTimer: ReturnType<typeof setInterval> | null = null;
+
   private subscriber: Redis | null = null;
 
   private subscribedChannels: string[] = [];
@@ -164,9 +220,21 @@ export class PhaseEngine {
       sub.disconnect();
       throw err;
     }
+
+    // Sweep immediately so a backlog of zombie sessions is cleared at deploy
+    // time rather than on the first interval tick.
+    this.sweepTimer = setInterval(() => {
+      void this.sweepStaleSessions();
+    }, SESSION_SWEEP_INTERVAL_MS);
+    this.sweepTimer.unref?.();
+    void this.sweepStaleSessions();
   }
 
   async stop(): Promise<void> {
+    if (this.sweepTimer) {
+      clearInterval(this.sweepTimer);
+      this.sweepTimer = null;
+    }
     await this.positionRecorder.stop().catch(() => {});
     const sub = this.subscriber;
     this.subscriber = null;
@@ -287,6 +355,14 @@ export class PhaseEngine {
       await this.handlePhaseTransition(t);
     }
 
+    // An aircraft first seen already airborne fires no phase transition (the
+    // detector seeds its state silently), so transitions alone can never
+    // adopt or create its session. Resolve once per airframe on first contact.
+    if (!this.activeSessions.has(icao) && !this.sessionResolutionDone.has(icao)) {
+      this.sessionResolutionDone.add(icao);
+      await this.resolveSessionOnFirstContact(icao, phase, record);
+    }
+
     const emergency = isEmergencyCondition(record);
     this.writeRateController.setEmergencyOverride(icao, emergency);
     if (emergency) {
@@ -316,6 +392,16 @@ export class PhaseEngine {
     const session = this.activeSessions.get(icao);
     if (session) {
       this.positionRecorder.record(session.id, phase, record);
+      // On approach and low, the nearest airport is where this flight is
+      // going — fill the destination now instead of waiting for touchdown.
+      if (
+        !session.dest_icao
+        && phase === FlightPhase.APPROACH
+        && Number.isFinite(record.alt_baro)
+        && record.alt_baro < DEST_RESOLVE_MAX_ALT_FT
+      ) {
+        await this.maybeResolveDest(icao, session, record, DEST_RESOLVE_RADIUS_MILES);
+      }
     }
     const enriched: Record<string, unknown> = {
       ...record,
@@ -333,6 +419,12 @@ export class PhaseEngine {
     // operator's, so a visibly-flying aircraft can never be judged idle.
     await this.redis.publish("aircraft-activity", icao);
     this.accumulateTelemetry(icao, record);
+    // Updated last, so during transition handling the map still holds the
+    // previous frame's timestamp — that gap is what NEW_FLIGHT_GAP_MS tests.
+    this.lastFrameTsByIcao.set(
+      icao,
+      Number.isFinite(record.ts) && record.ts > 0 ? record.ts : Date.now(),
+    );
   }
 
   private accumulateTelemetry(icao: string, record: TelemetryRecord): void {
@@ -526,13 +618,188 @@ export class PhaseEngine {
     });
   }
 
+  /**
+   * Resume an open database session only if it shows recent life. A session
+   * whose last recorded position is older than `maxGapMs` is expired instead:
+   * resuming it would attribute the new observation — and its origin and
+   * path — to a flight that finished out of coverage.
+   */
+  private async adoptDbSession(
+    icao: string,
+    rec: TelemetryRecord,
+    recTs: number,
+    maxGapMs: number,
+  ): Promise<FlightSession | null> {
+    const dbSession = await sessionManager.getActiveSession(this.db, icao);
+    if (!dbSession) return null;
+
+    const lastMs =
+      (await getSessionLastPositionTs(this.db, dbSession.id))
+      ?? startedAtMs(dbSession);
+    if (recTs - lastMs > maxGapMs) {
+      await sessionManager.expireSession(this.db, dbSession, lastMs);
+      log.info(
+        {
+          icao,
+          sessionId: dbSession.id,
+          gapMinutes: Math.round((recTs - lastMs) / 60_000),
+        },
+        "Open session too stale to resume; expired",
+      );
+      return null;
+    }
+
+    this.activeSessions.set(icao, dbSession);
+    if (!this.sessionAggs.has(icao)) {
+      this.initSessionAgg(
+        icao,
+        dbSession.id,
+        startedAtMs(dbSession),
+        rec,
+        dbSession.total_tx_count,
+      );
+    }
+    return dbSession;
+  }
+
+  /** Expire one session (backdating `ended_at`) and drop its runtime state. */
+  private async retireSession(
+    icao: string,
+    session: FlightSession,
+    lastActivityMs?: number,
+  ): Promise<void> {
+    const lastMs =
+      lastActivityMs
+      ?? (await getSessionLastPositionTs(this.db, session.id))
+      ?? startedAtMs(session);
+    await sessionManager.expireSession(this.db, session, lastMs);
+    if (this.activeSessions.get(icao)?.id === session.id) {
+      this.activeSessions.delete(icao);
+      this.sessionAggs.delete(icao);
+    }
+    this.positionRecorder.clearAircraft(icao);
+    log.info(
+      { icao, sessionId: session.id, lastSeen: new Date(lastMs).toISOString() },
+      "Retired stale flight session",
+    );
+  }
+
+  /** Close whatever open session an aircraft still holds before a new departure. */
+  private async retireLingering(icao: string): Promise<void> {
+    const session =
+      this.activeSessions.get(icao)
+      ?? (await sessionManager.getActiveSession(this.db, icao));
+    if (!session) return;
+    await this.retireSession(icao, session, this.lastFrameTsByIcao.get(icao));
+  }
+
+  /**
+   * One-time session decision when an aircraft first appears in coverage:
+   * a recently-active open session resumes (ingestion restart, brief blip);
+   * a stale one is expired rather than poisoning the new observation with a
+   * previous flight's origin and path; and airborne aircraft left without a
+   * usable session get a fresh origin-less one, so mid-ocean pickups still
+   * record a path from here on.
+   */
+  private async resolveSessionOnFirstContact(
+    icao: string,
+    phase: FlightPhase,
+    record: TelemetryRecord,
+  ): Promise<void> {
+    try {
+      const recTs =
+        Number.isFinite(record.ts) && record.ts > 0 ? record.ts : Date.now();
+      const airborne = AIRBORNE_PHASES.has(phase);
+      // On the ground, any open session is a finished flight unless it is
+      // minutes old; in the air, tolerate the long gaps oceanic coverage
+      // holes produce within a single flight.
+      const maxGap = airborne ? RESUME_MAX_GAP_MS : NEW_FLIGHT_GAP_MS;
+
+      let session = await this.adoptDbSession(icao, record, recTs, maxGap);
+      if (!session && airborne) {
+        session = await sessionManager.startAirborneSession(
+          this.db,
+          icao,
+          record.callsign?.trim() || icao,
+          phase,
+        );
+        this.activeSessions.set(icao, session);
+        this.initSessionAgg(icao, session.id, recTs, record);
+        this.positionRecorder.record(session.id, phase, record, true);
+        log.info(
+          { icao, sessionId: session.id, phase },
+          "Started airborne session at first contact",
+        );
+      }
+    } catch (err) {
+      log.error({ err, icao }, "First-contact session resolution failed");
+    }
+  }
+
+  /** Resolve an unset destination to the nearest airport, in DB and memory. */
+  private async maybeResolveDest(
+    icao: string,
+    session: FlightSession,
+    rec: TelemetryRecord,
+    radiusMiles: number,
+  ): Promise<void> {
+    if (session.dest_icao) return;
+    try {
+      const nearest = this.airportLookup.findNearest(rec.lat, rec.lon, radiusMiles);
+      if (!nearest) return;
+      await sessionManager.updateSessionDest(
+        this.db,
+        session.id,
+        nearest.icao_code,
+        nearest.name,
+      );
+      session.dest_icao = nearest.icao_code;
+      session.dest_name = nearest.name;
+      this.activeSessions.set(icao, session);
+      log.info(
+        { icao, sessionId: session.id, dest: nearest.icao_code },
+        "Destination resolved",
+      );
+    } catch (err) {
+      log.warn({ err, icao }, "Destination resolution failed");
+    }
+  }
+
+  /** Periodic close of open sessions that stopped showing life hours ago. */
+  private async sweepStaleSessions(): Promise<void> {
+    try {
+      const expired = await expireStaleFlightSessions(
+        this.db,
+        Date.now() - STALE_SESSION_AFTER_MS,
+      );
+      if (expired.length === 0) return;
+      for (const row of expired) {
+        const icao = normaliseIcao(row.aircraft_icao);
+        if (this.activeSessions.get(icao)?.id === row.id) {
+          this.activeSessions.delete(icao);
+          this.sessionAggs.delete(icao);
+          this.positionRecorder.clearAircraft(icao);
+        }
+      }
+      log.info({ expired: expired.length }, "Expired stale flight sessions");
+    } catch (err) {
+      log.error({ err }, "Stale session sweep failed");
+    }
+  }
+
   private async handlePhaseTransition(t: PhaseTransition): Promise<void> {
     const icao = normaliseIcao(t.aircraft_icao);
     const rec = t.telemetry;
     const { from_phase: from, to_phase: to } = t;
+    const recTs = Number.isFinite(rec.ts) && rec.ts > 0 ? rec.ts : Date.now();
 
     try {
       if (from === FlightPhase.PARKED && to === FlightPhase.TAXI) {
+        // A fresh departure is proof the previous flight is over. Any session
+        // still open belongs to that flight and must not swallow this one —
+        // that is how a Kuala Lumpur departure ends up labelled "London
+        // Gatwick".
+        await this.retireLingering(icao);
         const session = await sessionManager.startSession(
           this.db,
           icao,
@@ -543,35 +810,68 @@ export class PhaseEngine {
           FlightPhase.TAXI,
         );
         this.activeSessions.set(icao, session);
-        const ts = rec.ts && Number.isFinite(rec.ts) ? rec.ts : Date.now();
-        this.initSessionAgg(icao, session.id, ts, rec);
+        this.initSessionAgg(icao, session.id, recTs, rec);
         this.positionRecorder.record(session.id, FlightPhase.TAXI, rec, true);
         const ev = this.generateFlightEvent("TAXI_START", rec, session, undefined);
         await this.publishFlightEvent(ev, icao);
         return;
       }
 
-      let session = this.activeSessions.get(icao) ?? (await sessionManager.getActiveSession(this.db, icao));
-      if (session && !this.activeSessions.has(icao)) {
-        this.activeSessions.set(icao, session);
-        if (!this.sessionAggs.has(icao)) {
-          this.initSessionAgg(icao, session.id, startedAtMs(session), rec, session.total_tx_count);
+      let session: FlightSession | null = this.activeSessions.get(icao) ?? null;
+      if (!session) {
+        session = await this.adoptDbSession(icao, rec, recTs, RESUME_MAX_GAP_MS);
+      }
+
+      // A take-off after a long telemetry silence is a new flight: whatever
+      // session we hold ended out of coverage. Retire it so the new flight
+      // starts with its own origin and an empty path.
+      if (to === FlightPhase.TAKEOFF && session) {
+        const prevTs = this.lastFrameTsByIcao.get(icao);
+        if (prevTs !== undefined && recTs - prevTs > NEW_FLIGHT_GAP_MS) {
+          await this.retireSession(icao, session, prevTs);
+          session = null;
         }
       }
 
       if (to === FlightPhase.TAKEOFF && !session) {
-        session = await sessionManager.startSession(
+        const lowEnough =
+          rec.on_ground === true
+          || (Number.isFinite(rec.alt_baro) && rec.alt_baro < ORIGIN_RESOLVE_MAX_ALT_FT);
+        session = lowEnough
+          ? await sessionManager.startSession(
+              this.db,
+              icao,
+              rec.callsign?.trim() || icao,
+              this.airportLookup,
+              rec.lat,
+              rec.lon,
+              FlightPhase.TAKEOFF,
+            )
+          : await sessionManager.startAirborneSession(
+              this.db,
+              icao,
+              rec.callsign?.trim() || icao,
+              FlightPhase.TAKEOFF,
+            );
+        this.activeSessions.set(icao, session);
+        this.initSessionAgg(icao, session.id, recTs, rec);
+      }
+
+      // Coverage pickup mid-flight: record the rest of the journey under a
+      // fresh session with an honestly-unresolved origin.
+      if (!session && AIRBORNE_PHASES.has(to)) {
+        session = await sessionManager.startAirborneSession(
           this.db,
           icao,
           rec.callsign?.trim() || icao,
-          this.airportLookup,
-          rec.lat,
-          rec.lon,
-          FlightPhase.TAKEOFF,
+          to,
         );
         this.activeSessions.set(icao, session);
-        const ts = rec.ts && Number.isFinite(rec.ts) ? rec.ts : Date.now();
-        this.initSessionAgg(icao, session.id, ts, rec);
+        this.initSessionAgg(icao, session.id, recTs, rec);
+        log.info(
+          { icao, sessionId: session.id, phase: to },
+          "Started airborne session for mid-flight coverage pickup",
+        );
       }
 
       if (session) {
@@ -602,24 +902,21 @@ export class PhaseEngine {
       }
 
       if (to === FlightPhase.LANDING && session) {
-        const nearest = this.airportLookup.findNearest(rec.lat, rec.lon, 15);
-        if (nearest && !session.dest_icao) {
-          await sessionManager.updateSessionDest(this.db, session.id, nearest.icao_code, nearest.name);
-          session.dest_icao = nearest.icao_code;
-          session.dest_name = nearest.name;
-          this.activeSessions.set(icao, session);
-        }
+        await this.maybeResolveDest(icao, session, rec, 15);
         const stats = await this.resolveSessionStats(icao, rec);
         const ev = this.generateFlightEvent("LANDING", rec, session, stats);
         await this.publishFlightEvent(ev, icao);
       }
 
-      if (from === FlightPhase.TAXI_IN && to === FlightPhase.PARKED && session) {
+      // Any arrival at PARKED ends the flight. Requiring the TAXI_IN→PARKED
+      // edge specifically used to leave sessions open whenever an aircraft
+      // went LANDING→PARKED directly (sparse telemetry, short taxi), which
+      // was one of the ways zombie sessions accumulated.
+      if (to === FlightPhase.PARKED && from !== FlightPhase.PARKED && session) {
         const stats = await this.resolveSessionStats(icao, rec);
-        const endTs = rec.ts && Number.isFinite(rec.ts) ? rec.ts : Date.now();
         const finalStats: FlightStats = {
           ...stats,
-          duration_min: Math.max(0, (endTs - startedAtMs(session)) / 60_000),
+          duration_min: Math.max(0, (recTs - startedAtMs(session)) / 60_000),
         };
         const fresh = await sessionManager.getActiveSession(this.db, icao);
         if (fresh) {

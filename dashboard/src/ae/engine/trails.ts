@@ -1,11 +1,12 @@
 import * as THREE from "three";
-import { Line2 } from "three/examples/jsm/lines/Line2.js";
-import { LineGeometry } from "three/examples/jsm/lines/LineGeometry.js";
+import { LineSegments2 } from "three/examples/jsm/lines/LineSegments2.js";
+import { LineSegmentsGeometry } from "three/examples/jsm/lines/LineSegmentsGeometry.js";
 import { LineMaterial } from "three/examples/jsm/lines/LineMaterial.js";
 import type { AircraftState, PositionSnapshot } from "@/types/dashboard";
 import {
   ALT_UNITS_PER_FT,
   TRAIL_BASE_LIFT,
+  haversineMiles,
   projectLatLon,
   trackToWorldYaw,
 } from "./projection";
@@ -24,8 +25,8 @@ import { createAircraftGeometry } from "./aircraft";
  */
 
 interface TrailEntry {
-  lineCore: Line2;
-  lineGlow: Line2;
+  lineCore: LineSegments2;
+  lineGlow: LineSegments2;
   materialCore: LineMaterial;
   materialGlow: LineMaterial;
   marker: THREE.Group;
@@ -33,11 +34,31 @@ interface TrailEntry {
   hitArea: THREE.Mesh;
   pointCount: number;
   lastTs: number;
+  /** False when every span between stored points was a coverage gap. */
+  hasGeometry: boolean;
   /** World position of the oldest known trail point (the take-off end). */
   originPos: THREE.Vector3 | null;
 }
 
 const CRUISE_FT = 42_000;
+
+/**
+ * Consecutive stored points further apart than this cannot belong to
+ * continuous flight — the thinned stream keeps neighbours within a few tens
+ * of miles — so the span is an ADS-B coverage gap and is rendered as a break
+ * in the trail rather than a straight chord slicing across the disc.
+ */
+const GAP_MAX_MILES = 150;
+/** Long-silence gaps split too, unless the aircraft barely moved (parked). */
+const GAP_SILENCE_MS = 15 * 60_000;
+const GAP_SILENCE_MIN_MILES = 25;
+/**
+ * Legitimate long segments are subdivided in lat/lon so they follow the
+ * projection's curvature instead of cutting world-space chords — the same
+ * treatment the coastline layer gets, matched to telemetry densities.
+ */
+const DENSIFY_STEP_DEG = 1.2;
+const DENSIFY_MAX_STEPS = 48;
 
 const CORE_WIDTH = 1.6;
 const CORE_WIDTH_SELECTED = 3.0;
@@ -132,8 +153,8 @@ export class TrailsLayer {
         ) {
           this.rebuildLines(entry, points);
         }
-        entry.lineCore.visible = true;
-        entry.lineGlow.visible = true;
+        entry.lineCore.visible = entry.hasGeometry;
+        entry.lineGlow.visible = entry.hasGeometry;
       } else {
         entry.lineCore.visible = false;
         entry.lineGlow.visible = false;
@@ -203,10 +224,10 @@ export class TrailsLayer {
     });
     materialCore.resolution.copy(this.resolution);
 
-    const makeLine = (material: LineMaterial, order: number): Line2 => {
-      const geometry = new LineGeometry();
+    const makeLine = (material: LineMaterial, order: number): LineSegments2 => {
+      const geometry = new LineSegmentsGeometry();
       geometry.setPositions([0, 0, 0, 0, 0, 0]);
-      const line = new Line2(geometry, material);
+      const line = new LineSegments2(geometry, material);
       line.visible = false;
       line.renderOrder = order;
       line.frustumCulled = false;
@@ -259,6 +280,7 @@ export class TrailsLayer {
       hitArea,
       pointCount: 0,
       lastTs: 0,
+      hasGeometry: false,
       originPos: null,
     };
     this.entries.set(icao, entry);
@@ -269,22 +291,60 @@ export class TrailsLayer {
     const positions: number[] = [];
     const coreColors: number[] = [];
     const glowColors: number[] = [];
-    for (const p of points) {
-      const [x, y, z] = projectLatLon(p.lat, p.lon, p.alt ?? 0);
-      positions.push(x, y, z);
-      pushCoreColor(p.alt ?? 0, coreColors);
-      pushGlowColor(p.alt ?? 0, glowColors);
+
+    for (let i = 1; i < points.length; i += 1) {
+      const a = points[i - 1]!;
+      const b = points[i]!;
+      const distMiles = haversineMiles(a.lat, a.lon, b.lat, b.lon);
+
+      // Coverage gaps become breaks, not chords slicing across the disc.
+      if (
+        distMiles > GAP_MAX_MILES
+        || (b.ts - a.ts > GAP_SILENCE_MS && distMiles > GAP_SILENCE_MIN_MILES)
+      ) {
+        continue;
+      }
+
+      const aAlt = Number.isFinite(a.alt) ? a.alt : 0;
+      const bAlt = Number.isFinite(b.alt) ? b.alt : 0;
+      // Interpolate the shorter way round in longitude so a segment crossing
+      // the antimeridian doesn't sweep the long way around the pole.
+      const dLon = ((b.lon - a.lon + 540) % 360) - 180;
+      const dLat = b.lat - a.lat;
+      const span = Math.max(Math.abs(dLat), Math.abs(dLon));
+      const steps = Math.max(
+        1,
+        Math.min(DENSIFY_MAX_STEPS, Math.ceil(span / DENSIFY_STEP_DEG)),
+      );
+
+      let prev = projectLatLon(a.lat, a.lon, aAlt);
+      let prevAlt = aAlt;
+      for (let s = 1; s <= steps; s += 1) {
+        const t = s / steps;
+        const alt = aAlt + (bAlt - aAlt) * t;
+        const next = projectLatLon(a.lat + dLat * t, a.lon + dLon * t, alt);
+        positions.push(prev[0], prev[1], prev[2], next[0], next[1], next[2]);
+        pushCoreColor(prevAlt, coreColors);
+        pushCoreColor(alt, coreColors);
+        pushGlowColor(prevAlt, glowColors);
+        pushGlowColor(alt, glowColors);
+        prev = next;
+        prevAlt = alt;
+      }
     }
 
-    const swap = (line: Line2, colors: number[]): void => {
-      line.geometry.dispose();
-      const geometry = new LineGeometry();
-      geometry.setPositions(positions);
-      geometry.setColors(colors);
-      line.geometry = geometry;
-    };
-    swap(entry.lineCore, coreColors);
-    swap(entry.lineGlow, glowColors);
+    entry.hasGeometry = positions.length > 0;
+    if (entry.hasGeometry) {
+      const swap = (line: LineSegments2, colors: number[]): void => {
+        line.geometry.dispose();
+        const geometry = new LineSegmentsGeometry();
+        geometry.setPositions(positions);
+        geometry.setColors(colors);
+        line.geometry = geometry;
+      };
+      swap(entry.lineCore, coreColors);
+      swap(entry.lineGlow, glowColors);
+    }
 
     const last = points[points.length - 1];
     entry.pointCount = points.length;

@@ -291,7 +291,9 @@ const BEAM_FRAGMENT = /* glsl */ `
   void main() {
     float falloff = pow(1.0 - abs(vV), 2.2);
     float flicker = 0.85 + 0.15 * sin(uTime * 2.7 + vV * 9.0);
-    vec3 color = uColor * (0.6 + 1.8 * falloff);
+    // Gain capped so the core stays below the bloom threshold's runaway
+    // range — the beam should read as a polar axis, not a searchlight.
+    vec3 color = uColor * (0.5 + 1.05 * falloff);
     gl_FragColor = vec4(color, falloff * uAlpha * flicker);
   }
 `;
@@ -344,8 +346,8 @@ export function createToroidalField(): TorusHandle {
   group.add(points);
 
   const beamHeight = cMax * 2.6;
-  const beamCore = buildBeam(0.03, beamHeight, "#d8fbff", 0.85);
-  const beamHalo = buildBeam(0.12, beamHeight * 0.92, "#57ccff", 0.22);
+  const beamCore = buildBeam(0.026, beamHeight, "#d8fbff", 0.5);
+  const beamHalo = buildBeam(0.12, beamHeight * 0.92, "#57ccff", 0.13);
   beamCore.mesh.renderOrder = 3;
   beamHalo.mesh.renderOrder = 3;
   group.add(beamCore.mesh);

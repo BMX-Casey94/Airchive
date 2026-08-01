@@ -26,6 +26,50 @@ export async function startSession(
   });
 }
 
+/**
+ * Session for an aircraft first observed already airborne (entering ADS-B
+ * coverage mid-flight). The origin is deliberately left unresolved: the
+ * departure was never witnessed, and "nearest airport" to a cruising
+ * aircraft is whatever it happens to be overflying — actively wrong, not
+ * merely unknown.
+ */
+export async function startAirborneSession(
+  db: Knex,
+  icao: string,
+  callsign: string,
+  initialPhase: FlightPhase,
+): Promise<FlightSession> {
+  return createFlightSession(db, {
+    aircraft_icao: icao,
+    callsign,
+    phase: initialPhase,
+  });
+}
+
+/**
+ * Closes a session whose real ending was never observed (coverage loss, or a
+ * later departure proving the previous flight finished). `ended_at` is
+ * backdated to the last known activity so durations stay honest; the phase
+ * is left as last observed rather than pretending the aircraft parked.
+ */
+export async function expireSession(
+  db: Knex,
+  session: FlightSession,
+  lastActivityMs: number,
+): Promise<void> {
+  const startedMs =
+    session.started_at instanceof Date
+      ? session.started_at.getTime()
+      : Date.parse(String(session.started_at));
+  const endedMs = Math.max(
+    Number.isFinite(startedMs) ? startedMs : lastActivityMs,
+    lastActivityMs,
+  );
+  await updateFlightSession(db, session.id, {
+    ended_at: new Date(endedMs),
+  });
+}
+
 export async function updateSessionPhase(
   db: Knex,
   sessionId: string,

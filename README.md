@@ -185,8 +185,35 @@ every 5 seconds or every 500 rows, and a failed flush requeues behind a
 2,000-row ceiling so a database outage cannot grow memory without bound. A
 complete flight typically lands under 1,000 rows.
 
-The gateway exposes `GET /api/sessions/active` (every open session with its
-path) and `GET /api/flights/:flightId/path` (any single flight, active or
+A stored path is only as truthful as the session it belongs to, and sessions
+used to be able to lie: the only close path was an observed `TAXI_IN → PARKED`
+transition, so any flight that ended out of ADS-B coverage left its session
+open forever. The next time that airframe appeared — days later, on a
+different continent — the zombie was resumed, and the new flight inherited the
+old flight's origin and path. The lifecycle is now defended at four points:
+
+- **A sweeper** closes any open session whose last recorded position is more
+  than six hours old, backdating `ended_at` to that last sign of life. It runs
+  at ingestion start-up and every fifteen minutes.
+- **A resumption guard** checks the activity gap before re-adopting an open
+  session: up to three hours is tolerated mid-air (transoceanic coverage holes
+  are real), thirty minutes on the ground. Beyond that, the session is expired
+  — an unresolved origin is far better than a wrong one.
+- **Close-before-open**: a new departure (`PARKED → TAXI`, or a take-off after
+  a long silence) retires whatever session the airframe still holds, so one
+  aircraft can never run two flights under one `flight_id`.
+- **Mid-air pickups get their own session.** An aircraft first seen at cruise
+  never fires a phase transition, so it previously got no session — and no
+  recorded path — at all. First contact now creates an origin-less session, so
+  the rest of the journey is recorded honestly.
+
+Destinations also resolve earlier: once a flight is on APPROACH below 6,000 ft,
+the nearest airport within 12 miles is written as the destination rather than
+waiting for touchdown.
+
+The gateway exposes `GET /api/sessions/active` (open sessions showing recent
+life — a stored position in the last fifteen minutes — one per airframe, with
+paths) and `GET /api/flights/:flightId/path` (any single flight, active or
 completed), with three optimisations worth noting:
 
 - **Thinning happens in SQL.** A window function decimates long paths with
@@ -211,7 +238,7 @@ refreshes converge rather than accumulating duplicates.
 
 | Layer | Approach |
 |-------|----------|
-| **Trails** | Drawn twice — a wide additive glow underlay and a crisp core line, both screen-space-width `Line2` so they stay legible at any zoom. Colour ramps from dim ember on the ground to bright gold at cruise |
+| **Trails** | Drawn twice — a wide additive glow underlay and a crisp core line, both screen-space-width fat lines (`LineSegments2`) so they stay legible at any zoom. Colour ramps from dim ember on the ground to bright gold at cruise. Coverage gaps render as breaks rather than chords slicing across the disc, and long segments are subdivided in lat/lon so they follow the projection's curvature near the rim |
 | **Aircraft** | Procedurally generated low-poly airliners (extruded plan-view silhouette plus a vertical stabiliser), the only lit objects in the scene — everything else is unlit shaders |
 | **Toroidal field** | A cage of poloidal loops through the pole, helically twisted with the swirl direction alternating per shell, plus 2,200 flowing particles and an axial beam |
 | **Country labels** | 111 billboarded sprites over three zoom tiers, fading in per-label by camera distance so the disc is never cluttered at a given zoom |

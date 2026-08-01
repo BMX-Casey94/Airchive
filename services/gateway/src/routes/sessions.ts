@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import {
   getDb,
-  getActiveFlightSessions,
+  getLiveFlightSessions,
   getSessionPath,
   type FlightSessionRow,
   type SessionPathPoint,
@@ -14,6 +14,13 @@ const DEFAULT_PATH_POINTS = 1_500;
 const MIN_PATH_POINTS = 50;
 const MAX_PATH_POINTS = 4_000;
 const MAX_ACTIVE_SESSIONS = 100;
+/**
+ * "Active" requires a recorded position inside this window (or a session
+ * younger than it). Long enough to ride out short coverage blips; short
+ * enough that a flight which ended out of coverage disappears from the HUD
+ * promptly instead of lingering until the ingestion sweeper closes it.
+ */
+const SESSION_ACTIVITY_WINDOW_MS = 15 * 60_000;
 /**
  * Active paths grow at ~1 point per few seconds, so a short server-side cache
  * absorbs every dashboard tab polling at once without observable staleness.
@@ -121,7 +128,11 @@ export async function sessionRoutes(app: FastifyInstance): Promise<void> {
       }
 
       const db = getDb();
-      const sessions = await getActiveFlightSessions(db, MAX_ACTIVE_SESSIONS);
+      const sessions = await getLiveFlightSessions(
+        db,
+        now - SESSION_ACTIVITY_WINDOW_MS,
+        MAX_ACTIVE_SESSIONS,
+      );
       const paths = await Promise.all(
         sessions.map((s) => getSessionPath(db, s.id, points)),
       );

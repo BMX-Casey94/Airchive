@@ -127,6 +127,85 @@ export async function getActiveFlightSessions(
     .limit(limit);
 }
 
+/**
+ * Open sessions with evidence of life: a stored position inside the activity
+ * window, or a session young enough that the recorder may not have flushed
+ * yet. One row per airframe (the newest) so a lingering zombie can never sit
+ * alongside the real flight. Sessions that ended out of ADS-B coverage stay
+ * open in the table until the sweeper catches them, so `ended_at IS NULL`
+ * alone badly overstates activity.
+ */
+export async function getLiveFlightSessions(
+  db: Knex,
+  activeSinceEpochMs: number,
+  limit = 100,
+): Promise<FlightSessionRow[]> {
+  const result = await db.raw(
+    `select * from (
+       select distinct on (fs.aircraft_icao) fs.*
+         from flight_sessions fs
+        where fs.ended_at is null
+          and (
+            exists (select 1 from session_positions sp
+                     where sp.flight_id = fs.id and sp.ts >= ?)
+            or fs.started_at >= to_timestamp(? / 1000.0)
+          )
+        order by fs.aircraft_icao asc, fs.started_at desc
+     ) live
+     order by live.started_at desc
+     limit ?`,
+    [activeSinceEpochMs, activeSinceEpochMs, limit],
+  );
+  return (result as { rows: FlightSessionRow[] }).rows;
+}
+
+/** Epoch ms of the newest stored position for a flight, or null if none. */
+export async function getSessionLastPositionTs(
+  db: Knex,
+  flightId: string,
+): Promise<number | null> {
+  const row = await db("session_positions")
+    .where({ flight_id: flightId })
+    .max<{ max: string | number | null }>("ts as max")
+    .first();
+  const v = row?.max;
+  return v === null || v === undefined ? null : Number(v);
+}
+
+/**
+ * Closes every open session whose last sign of life predates `cutoffEpochMs`.
+ * A session's "last activity" is its newest stored position, falling back to
+ * `started_at` for sessions that never recorded one. `ended_at` is backdated
+ * to that moment rather than now(), so the recorded duration reflects when
+ * the aircraft was actually last seen — not how long the zombie survived.
+ * Returns the expired rows so callers can drop matching in-memory state.
+ */
+export async function expireStaleFlightSessions(
+  db: Knex,
+  cutoffEpochMs: number,
+): Promise<Array<{ id: string; aircraft_icao: string }>> {
+  const result = await db.raw(
+    `with activity as (
+       select fs.id,
+              greatest(
+                coalesce((select max(sp.ts) from session_positions sp
+                           where sp.flight_id = fs.id), 0)::bigint,
+                (extract(epoch from fs.started_at) * 1000)::bigint
+              ) as last_ms
+         from flight_sessions fs
+        where fs.ended_at is null
+     )
+     update flight_sessions f
+        set ended_at = to_timestamp(a.last_ms / 1000.0)
+       from activity a
+      where f.id = a.id
+        and a.last_ms < ?
+     returning f.id, f.aircraft_icao`,
+    [cutoffEpochMs],
+  );
+  return (result as { rows: Array<{ id: string; aircraft_icao: string }> }).rows;
+}
+
 export type NewUtxo = Pick<
   UTXORecord,
   "aircraft_icao" | "txid" | "vout" | "satoshis" | "locking_script"
