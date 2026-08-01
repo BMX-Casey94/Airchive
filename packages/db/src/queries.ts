@@ -43,7 +43,88 @@ declare module "knex/types/tables" {
     pending_writes: PendingWriteRow;
     tx_results: TxResultRow;
     alerts: AlertRow;
+    session_positions: SessionPositionRow;
   }
+}
+
+/* ── Session position stream (flight-path persistence) ──────── */
+
+export interface SessionPositionRow {
+  id: number;
+  flight_id: string;
+  aircraft_icao: string;
+  /** Epoch milliseconds. Postgres returns bigint columns as strings. */
+  ts: number | string;
+  lat: number;
+  lon: number;
+  alt_baro: number | null;
+  gs: number | null;
+  track: number | null;
+  phase: string | null;
+}
+
+export type NewSessionPosition = Omit<SessionPositionRow, "id">;
+
+export type SessionPathPoint = Pick<
+  SessionPositionRow,
+  "ts" | "lat" | "lon" | "alt_baro" | "gs" | "track"
+>;
+
+export async function insertSessionPositions(
+  db: Knex,
+  rows: NewSessionPosition[],
+): Promise<void> {
+  if (rows.length === 0) return;
+  await db("session_positions").insert(rows);
+}
+
+/**
+ * Full path for one flight, oldest first. When the stored stream exceeds
+ * `maxPoints` the result is thinned evenly — keeping the first and last
+ * points — rather than truncated, so the route's overall shape survives at
+ * any cap. Mirrors the dashboard's client-side trail-thinning philosophy.
+ */
+export async function getSessionPath(
+  db: Knex,
+  flightId: string,
+  maxPoints = 1_500,
+): Promise<SessionPathPoint[]> {
+  const countRow = await db("session_positions")
+    .where({ flight_id: flightId })
+    .count<{ count: string | number }>("* as count")
+    .first();
+  const total = Number(countRow?.count ?? 0);
+  if (total === 0) return [];
+
+  if (total <= maxPoints) {
+    return db("session_positions")
+      .where({ flight_id: flightId })
+      .orderBy("ts", "asc")
+      .select("ts", "lat", "lon", "alt_baro", "gs", "track");
+  }
+
+  const step = Math.ceil(total / maxPoints);
+  const result = await db.raw(
+    `select ts, lat, lon, alt_baro, gs, track
+       from (select ts, lat, lon, alt_baro, gs, track,
+                    row_number() over (order by ts asc) as rn
+               from session_positions
+              where flight_id = ?) p
+      where (p.rn - 1) % ? = 0 or p.rn = ?
+      order by ts asc`,
+    [flightId, step, total],
+  );
+  return (result as { rows: SessionPathPoint[] }).rows;
+}
+
+export async function getActiveFlightSessions(
+  db: Knex,
+  limit = 100,
+): Promise<FlightSessionRow[]> {
+  return db("flight_sessions")
+    .whereNull("ended_at")
+    .orderBy("started_at", "desc")
+    .limit(limit);
 }
 
 export type NewUtxo = Pick<

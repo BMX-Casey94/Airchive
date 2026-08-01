@@ -20,6 +20,7 @@ import { createLogger } from "@airchive/logger";
 import { Redis } from "ioredis";
 import type { Knex } from "knex";
 import * as sessionManager from "./session-manager.js";
+import { SessionPositionRecorder } from "./session-position-recorder.js";
 import {
   phaseEngineMessagesTotal,
   phaseEngineWriteDecisionsTotal,
@@ -99,6 +100,8 @@ export class PhaseEngine {
 
   private readonly writeRateController: WriteRateController;
 
+  private readonly positionRecorder: SessionPositionRecorder;
+
   private readonly activeSessions = new Map<string, FlightSession>();
 
   private readonly sequenceCounters = new Map<string, number>();
@@ -116,6 +119,7 @@ export class PhaseEngine {
     this.airportLookup = opts.airportLookup;
     this.db = opts.db;
     this.writeRateController = new WriteRateController(opts.writeRateOverrides);
+    this.positionRecorder = new SessionPositionRecorder(opts.db);
   }
 
   async start(trackedAircraft: string[]): Promise<void> {
@@ -163,6 +167,7 @@ export class PhaseEngine {
   }
 
   async stop(): Promise<void> {
+    await this.positionRecorder.stop().catch(() => {});
     const sub = this.subscriber;
     this.subscriber = null;
     this.processChainsByIcao.clear();
@@ -309,6 +314,9 @@ export class PhaseEngine {
     }
 
     const session = this.activeSessions.get(icao);
+    if (session) {
+      this.positionRecorder.record(session.id, phase, record);
+    }
     const enriched: Record<string, unknown> = {
       ...record,
       flight_phase: phase,
@@ -537,6 +545,7 @@ export class PhaseEngine {
         this.activeSessions.set(icao, session);
         const ts = rec.ts && Number.isFinite(rec.ts) ? rec.ts : Date.now();
         this.initSessionAgg(icao, session.id, ts, rec);
+        this.positionRecorder.record(session.id, FlightPhase.TAXI, rec, true);
         const ev = this.generateFlightEvent("TAXI_START", rec, session, undefined);
         await this.publishFlightEvent(ev, icao);
         return;
@@ -569,6 +578,9 @@ export class PhaseEngine {
         await sessionManager.updateSessionPhase(this.db, session.id, to);
         const updated = { ...session, phase: to };
         this.activeSessions.set(icao, updated);
+        // Phase boundaries are the points a stored path can least afford to
+        // miss: they anchor take-off, landing and parked positions exactly.
+        this.positionRecorder.record(session.id, to, rec, true);
       }
 
       if (to === FlightPhase.TAKEOFF && session) {
@@ -620,6 +632,11 @@ export class PhaseEngine {
         this.activeSessions.delete(icao);
         this.sessionAggs.delete(icao);
         this.writeRateController.reset(icao);
+        this.positionRecorder.clearAircraft(icao);
+        // Make the completed flight's tail durable promptly rather than on
+        // the next timer tick, so /api/flights/:id/path is complete as soon
+        // as the session closes.
+        await this.positionRecorder.flush();
       }
     } catch (err) {
       log.error({ err, icao, from, to }, "Phase transition handling failed");

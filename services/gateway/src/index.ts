@@ -7,6 +7,7 @@ import { registerAuth } from "./plugins/auth.js";
 import { fleetRoutes, updateAircraftState } from "./routes/fleet.js";
 import { historyRoutes } from "./routes/history.js";
 import { flightRoutes } from "./routes/flights.js";
+import { sessionRoutes } from "./routes/sessions.js";
 import { explorerRoutes } from "./routes/explorer.js";
 import { alertRoutes } from "./routes/alerts.js";
 import { metricsRoutes } from "./routes/metrics.js";
@@ -87,6 +88,7 @@ async function main(): Promise<void> {
   await app.register(fleetRoutes);
   await app.register(historyRoutes);
   await app.register(flightRoutes);
+  await app.register(sessionRoutes);
   await app.register(explorerRoutes);
   await app.register(alertRoutes);
   await app.register(metricsRoutes);
