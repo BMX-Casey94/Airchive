@@ -170,7 +170,7 @@ function AeMapBanner() {
     <section className="lg:col-span-12">
       <Link
         href="/ae"
-        className="panel group relative block overflow-hidden px-5 py-4 transition-colors hover:border-electric-cyan/40"
+        className="panel group relative block overflow-hidden px-3.5 py-2.5 transition-colors hover:border-electric-cyan/40 sm:px-5 sm:py-4"
       >
         {/* Soft cyan wash that answers the hover */}
         <div
@@ -182,29 +182,32 @@ function AeMapBanner() {
           }}
         />
 
-        <div className="relative flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
-          <div className="flex items-center gap-3 sm:gap-4 min-w-0">
+        <div className="relative flex items-center justify-between gap-3 sm:gap-4">
+          <div className="flex min-w-0 items-center gap-3 sm:gap-4">
             {/* Miniature polar disc */}
-            <div className="relative h-10 w-10 sm:h-12 sm:w-12 shrink-0" aria-hidden>
+            <div className="relative h-8 w-8 shrink-0 sm:h-12 sm:w-12" aria-hidden>
               <div className="absolute inset-0 rounded-full border border-electric-cyan/50" />
-              <div className="absolute inset-[6px] sm:inset-[7px] rounded-full border border-electric-cyan/30" />
-              <div className="absolute inset-[12px] sm:inset-[14px] rounded-full border border-electric-cyan/20" />
-              <div className="absolute left-1/2 top-1/2 h-1.5 w-1.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-electric-cyan shadow-[0_0_8px_rgba(0,245,255,0.8)]" />
+              <div className="absolute inset-[5px] rounded-full border border-electric-cyan/30 sm:inset-[7px]" />
+              <div className="absolute inset-[10px] rounded-full border border-electric-cyan/20 sm:inset-[14px]" />
+              <div className="absolute left-1/2 top-1/2 h-1 w-1 -translate-x-1/2 -translate-y-1/2 rounded-full bg-electric-cyan shadow-[0_0_8px_rgba(0,245,255,0.8)] sm:h-1.5 sm:w-1.5" />
             </div>
 
             <div className="min-w-0">
-              <p className="hud-label text-electric-cyan/70">
+              <p className="hud-label text-[9px] text-electric-cyan/70 sm:text-xs">
                 Azimuthal Equidistant · North Polar
               </p>
-              <p className="mt-1 font-mono text-xs leading-relaxed text-white sm:truncate sm:text-sm">
-                See the fleet from a different perspective — live flights across
-                the polar disc
+              <p className="mt-0.5 font-mono text-xs leading-snug text-white sm:mt-1 sm:truncate sm:text-sm">
+                See the fleet from a different perspective
+                <span className="hidden sm:inline">
+                  {" "}
+                  — live flights across the polar disc
+                </span>
               </p>
             </div>
           </div>
 
-          <span className="shrink-0 self-end whitespace-nowrap font-mono text-xs tracking-widest text-electric-cyan transition-transform duration-300 group-hover:translate-x-1 sm:self-auto">
-            OPEN AE MAP →
+          <span className="shrink-0 whitespace-nowrap font-mono text-xs tracking-widest text-electric-cyan transition-transform duration-300 group-hover:translate-x-1">
+            <span className="hidden sm:inline">OPEN AE MAP </span>→
           </span>
         </div>
       </Link>
