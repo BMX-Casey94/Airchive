@@ -98,6 +98,48 @@ export function latLonToUnitVector(
   ];
 }
 
+/**
+ * Great-circle interpolator between two lat/lon points, with the endpoint
+ * vectors precomputed so `at()` stays cheap inside a densification loop.
+ * Interpolating linearly in lat/lon instead traces a rhumb-like path that
+ * bows away from the true route over long spans — very visible on the outer
+ * half of the disc, where AE stretches east-west distances several fold.
+ */
+export function greatCircle(
+  lat1: number,
+  lon1: number,
+  lat2: number,
+  lon2: number,
+): { omegaDeg: number; at: (t: number) => [number, number] } {
+  const a = latLonToUnitVector(lat1, lon1);
+  const b = latLonToUnitVector(lat2, lon2);
+  const dot = Math.min(
+    1,
+    Math.max(-1, a[0] * b[0] + a[1] * b[1] + a[2] * b[2]),
+  );
+  const omega = Math.acos(dot);
+  const sinOmega = Math.sin(omega);
+
+  return {
+    omegaDeg: omega * RAD2DEG,
+    at(t: number): [number, number] {
+      // Coincident or antipodal endpoints have no well-defined arc; both are
+      // degenerate for a trail segment, so hold the start point.
+      if (sinOmega < 1e-8) return [lat1, lon1];
+      const s1 = Math.sin((1 - t) * omega) / sinOmega;
+      const s2 = Math.sin(t * omega) / sinOmega;
+      const x = a[0] * s1 + b[0] * s2;
+      const y = a[1] * s1 + b[1] * s2;
+      const z = a[2] * s1 + b[2] * s2;
+      const r = Math.hypot(x, y, z) || 1;
+      return [
+        Math.asin(Math.min(1, Math.max(-1, y / r))) * RAD2DEG,
+        Math.atan2(x, z) * RAD2DEG,
+      ];
+    },
+  };
+}
+
 const EARTH_RADIUS_MILES = 3958.7613;
 
 /** Great-circle distance in miles. */

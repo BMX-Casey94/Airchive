@@ -29,12 +29,23 @@ function appendTrailPoint(
   existing: PositionSnapshot[] | undefined,
   snapshot: PositionSnapshot,
 ): PositionSnapshot[] {
-  const next = existing ? [...existing, snapshot] : [snapshot];
-  if (next.length <= TRAIL_BUFFER_SIZE) return next;
+  return capTrail(existing ? [...existing, snapshot] : [snapshot]);
+}
 
-  const split = next.length - TRAIL_RECENT_KEEP;
-  const thinned = next.slice(0, split).filter((_, i) => i % 2 === 0);
-  return [...thinned, ...next.slice(split)];
+/**
+ * Brings a trail down to the buffer ceiling by the same halving rule, however
+ * far over it starts. Stitching server history in front of live points can
+ * overshoot by hundreds at once, and slicing that back would throw away the
+ * departure — the one part of the route worth keeping at any cost.
+ */
+function capTrail(points: PositionSnapshot[]): PositionSnapshot[] {
+  let next = points;
+  while (next.length > TRAIL_BUFFER_SIZE) {
+    const split = next.length - TRAIL_RECENT_KEEP;
+    const thinned = next.slice(0, split).filter((_, i) => i % 2 === 0);
+    next = [...thinned, ...next.slice(split)];
+  }
+  return next;
 }
 
 function trailLastSeen(points: PositionSnapshot[]): number {
@@ -61,8 +72,17 @@ interface FleetState {
   removeAircraft: (icao: string) => void;
   clearFleet: () => void;
   pruneStale: (maxAgeMs?: number) => number;
-  /** Seeds trails restored from storage without disturbing live ones. */
-  hydrateTrails: (restored: Map<string, PositionSnapshot[]>) => void;
+  /**
+   * Seeds trails restored from storage or the gateway without disturbing live
+   * ones. `floors` optionally carries the current flight's start time per
+   * ICAO: trails are keyed by airframe and outlive a flight by design, so an
+   * aircraft on its second sector still holds the first one's points, and
+   * anchoring to the session start is what evicts them.
+   */
+  hydrateTrails: (
+    restored: Map<string, PositionSnapshot[]>,
+    floors?: Map<string, number>,
+  ) => void;
 }
 
 export const useFleetStore = create<FleetState>()((set, get) => ({
@@ -216,24 +236,54 @@ export const useFleetStore = create<FleetState>()((set, get) => ({
       selectedFlightId: null,
     }),
 
-  hydrateTrails: (restored) =>
+  hydrateTrails: (restored, floors) =>
     set((state) => {
-      if (restored.size === 0) return state;
+      if (restored.size === 0 && !floors?.size) return state;
       const nextTrails = new Map(state.trails);
+      let changed = false;
 
-      for (const [icao, points] of restored) {
-        const live = nextTrails.get(icao);
-        if (!live || live.length === 0) {
-          nextTrails.set(icao, points.slice(-TRAIL_BUFFER_SIZE));
+      const icaos = new Set<string>([
+        ...restored.keys(),
+        ...(floors?.keys() ?? []),
+      ]);
+
+      for (const icao of icaos) {
+        const floor = floors?.get(icao);
+        const inFlight = (p: PositionSnapshot): boolean =>
+          floor === undefined || p.ts >= floor;
+
+        const existing = nextTrails.get(icao);
+        const live = existing ? existing.filter(inFlight) : [];
+        const history = (restored.get(icao) ?? []).filter(inFlight);
+
+        if (live.length === 0 && history.length === 0) {
+          if (existing && existing.length > 0) {
+            nextTrails.delete(icao);
+            changed = true;
+          }
           continue;
         }
+
         // Points gathered since the page opened win; the restored history is
         // stitched on in front of them, dropping any overlap by timestamp.
-        const earliestLive = live[0]!.ts;
-        const history = points.filter((p) => p.ts < earliestLive);
-        nextTrails.set(icao, [...history, ...live].slice(-TRAIL_BUFFER_SIZE));
+        const earliestLive = live[0]?.ts ?? Infinity;
+        const merged = capTrail([
+          ...history.filter((p) => p.ts < earliestLive),
+          ...live,
+        ]);
+
+        if (
+          !existing
+          || existing.length !== merged.length
+          || existing[0] !== merged[0]
+          || existing[existing.length - 1] !== merged[merged.length - 1]
+        ) {
+          nextTrails.set(icao, merged);
+          changed = true;
+        }
       }
 
+      if (!changed) return state;
       return { trails: nextTrails };
     }),
 

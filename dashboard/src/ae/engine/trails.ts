@@ -6,6 +6,7 @@ import type { AircraftState, PositionSnapshot } from "@/types/dashboard";
 import {
   ALT_UNITS_PER_FT,
   TRAIL_BASE_LIFT,
+  greatCircle,
   haversineMiles,
   projectLatLon,
   trackToWorldYaw,
@@ -34,7 +35,7 @@ interface TrailEntry {
   hitArea: THREE.Mesh;
   pointCount: number;
   lastTs: number;
-  /** False when every span between stored points was a coverage gap. */
+  /** False when no span survived the plausibility test, so nothing is drawn. */
   hasGeometry: boolean;
   /** World position of the oldest known trail point (the take-off end). */
   originPos: THREE.Vector3 | null;
@@ -43,22 +44,32 @@ interface TrailEntry {
 const CRUISE_FT = 42_000;
 
 /**
- * Consecutive stored points further apart than this cannot belong to
- * continuous flight — the thinned stream keeps neighbours within a few tens
- * of miles — so the span is an ADS-B coverage gap and is rendered as a break
- * in the trail rather than a straight chord slicing across the disc.
+ * A break in the line has to mean "these two points cannot be the same
+ * flight", and the only test that survives thinning is physical plausibility.
+ * Absolute distance and silence thresholds do not: both the store and the
+ * gateway decimate older points, so an ordinary cruise pair can end up half
+ * an hour and several hundred miles apart without anything being wrong. What
+ * decimation can never do is imply a speed no airliner can fly, which is
+ * exactly what a seam between two unrelated flights looks like.
  */
-const GAP_MAX_MILES = 150;
-/** Long-silence gaps split too, unless the aircraft barely moved (parked). */
-const GAP_SILENCE_MS = 15 * 60_000;
-const GAP_SILENCE_MIN_MILES = 25;
+const MAX_PLAUSIBLE_MPH = 800;
+/** Floor so near-zero deltas (batching, clock skew) never split a real pair. */
+const GAP_FLOOR_MILES = 60;
 /**
- * Legitimate long segments are subdivided in lat/lon so they follow the
- * projection's curvature instead of cutting world-space chords — the same
- * treatment the coastline layer gets, matched to telemetry densities.
+ * Beyond this silence the aircraft did fly the span, it just was not heard —
+ * ADS-B is a volunteer receiver network with little ocean coverage. Those
+ * stretches are drawn dimmed so they read as inferred rather than tracked.
+ */
+const INFERRED_SILENCE_MS = 15 * 60_000;
+const INFERRED_GAIN = 0.4;
+/**
+ * Long segments are subdivided along the great circle so they follow the
+ * projection's curvature instead of cutting world-space chords. Step count
+ * follows longitude span as well as angular distance, since meridians project
+ * to straight radial lines but parallels project to circles.
  */
 const DENSIFY_STEP_DEG = 1.2;
-const DENSIFY_MAX_STEPS = 48;
+const DENSIFY_MAX_STEPS = 96;
 
 const CORE_WIDTH = 1.6;
 const CORE_WIDTH_SELECTED = 3.0;
@@ -76,9 +87,13 @@ function altRatio(altFt: number): number {
 }
 
 /** Saturated amber for the additive glow pass. */
-function pushGlowColor(altFt: number, out: number[]): void {
+function pushGlowColor(altFt: number, gain: number, out: number[]): void {
   const t = altRatio(altFt);
-  out.push(0.5 + 0.35 * t, 0.18 + 0.32 * t, 0.03 + 0.08 * t);
+  out.push(
+    (0.5 + 0.35 * t) * gain,
+    (0.18 + 0.32 * t) * gain,
+    (0.03 + 0.08 * t) * gain,
+  );
 }
 
 /**
@@ -86,9 +101,13 @@ function pushGlowColor(altFt: number, out: number[]): void {
  * threshold (0.85) so ordinary trails stay crisp; only the selected flight
  * is pushed into HDR and halos.
  */
-function pushCoreColor(altFt: number, out: number[]): void {
+function pushCoreColor(altFt: number, gain: number, out: number[]): void {
   const t = altRatio(altFt);
-  out.push(0.62 + 0.2 * t, 0.38 + 0.34 * t, 0.14 + 0.36 * t);
+  out.push(
+    (0.62 + 0.2 * t) * gain,
+    (0.38 + 0.34 * t) * gain,
+    (0.14 + 0.36 * t) * gain,
+  );
 }
 
 export class TrailsLayer {
@@ -296,22 +315,26 @@ export class TrailsLayer {
       const a = points[i - 1]!;
       const b = points[i]!;
       const distMiles = haversineMiles(a.lat, a.lon, b.lat, b.lon);
+      const dtMs = Math.max(0, b.ts - a.ts);
 
-      // Coverage gaps become breaks, not chords slicing across the disc.
-      if (
-        distMiles > GAP_MAX_MILES
-        || (b.ts - a.ts > GAP_SILENCE_MS && distMiles > GAP_SILENCE_MIN_MILES)
-      ) {
-        continue;
-      }
+      // Only an impossible jump is a seam between unrelated data. Anything an
+      // airliner could actually have flown gets drawn, however coarsely the
+      // pair happens to have been sampled.
+      const reachableMiles = Math.max(
+        GAP_FLOOR_MILES,
+        (dtMs / 3_600_000) * MAX_PLAUSIBLE_MPH,
+      );
+      if (distMiles > reachableMiles) continue;
 
+      const gain = dtMs > INFERRED_SILENCE_MS ? INFERRED_GAIN : 1;
       const aAlt = Number.isFinite(a.alt) ? a.alt : 0;
       const bAlt = Number.isFinite(b.alt) ? b.alt : 0;
-      // Interpolate the shorter way round in longitude so a segment crossing
-      // the antimeridian doesn't sweep the long way around the pole.
-      const dLon = ((b.lon - a.lon + 540) % 360) - 180;
-      const dLat = b.lat - a.lat;
-      const span = Math.max(Math.abs(dLat), Math.abs(dLon));
+
+      const arc = greatCircle(a.lat, a.lon, b.lat, b.lon);
+      // Shorter way round in longitude, so a segment crossing the antimeridian
+      // isn't subdivided as though it swept the long way around the pole.
+      const dLon = Math.abs(((b.lon - a.lon + 540) % 360) - 180);
+      const span = Math.max(arc.omegaDeg, dLon);
       const steps = Math.max(
         1,
         Math.min(DENSIFY_MAX_STEPS, Math.ceil(span / DENSIFY_STEP_DEG)),
@@ -322,12 +345,13 @@ export class TrailsLayer {
       for (let s = 1; s <= steps; s += 1) {
         const t = s / steps;
         const alt = aAlt + (bAlt - aAlt) * t;
-        const next = projectLatLon(a.lat + dLat * t, a.lon + dLon * t, alt);
+        const [lat, lon] = arc.at(t);
+        const next = projectLatLon(lat, lon, alt);
         positions.push(prev[0], prev[1], prev[2], next[0], next[1], next[2]);
-        pushCoreColor(prevAlt, coreColors);
-        pushCoreColor(alt, coreColors);
-        pushGlowColor(prevAlt, glowColors);
-        pushGlowColor(alt, glowColors);
+        pushCoreColor(prevAlt, gain, coreColors);
+        pushCoreColor(alt, gain, coreColors);
+        pushGlowColor(prevAlt, gain, glowColors);
+        pushGlowColor(alt, gain, glowColors);
         prev = next;
         prevAlt = alt;
       }

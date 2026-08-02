@@ -47,6 +47,14 @@ interface ActiveSessionsResponse {
 
 const REFRESH_INTERVAL_MS = 30_000;
 
+/**
+ * The session row is created on the first frame that qualifies as a departure,
+ * which can land a little after the earliest taxi telemetry. A couple of
+ * minutes of slack keeps that push-back detail (and absorbs clock skew between
+ * the gateway and the browser) without letting the previous sector back in.
+ */
+const SESSION_START_SLACK_MS = 120_000;
+
 export function useActiveSessions(): ActiveSessionDTO[] {
   const hydrateTrails = useFleetStore((s) => s.hydrateTrails);
 
@@ -71,9 +79,17 @@ export function useActiveSessions(): ActiveSessionDTO[] {
     if (sessions.length === 0) return;
 
     const restored = new Map<string, PositionSnapshot[]>();
+    const floors = new Map<string, number>();
+
     for (const session of sessions) {
-      if (session.path.length === 0) continue;
       const icao = session.aircraftIcao.toUpperCase();
+
+      const startedMs = Date.parse(session.startedAt);
+      if (Number.isFinite(startedMs)) {
+        floors.set(icao, startedMs - SESSION_START_SLACK_MS);
+      }
+
+      if (session.path.length === 0) continue;
       const points: PositionSnapshot[] = session.path.map((p) => ({
         ts: p[0],
         lat: p[1],
@@ -82,7 +98,8 @@ export function useActiveSessions(): ActiveSessionDTO[] {
       }));
       restored.set(icao, points);
     }
-    if (restored.size > 0) hydrateTrails(restored);
+
+    if (restored.size > 0 || floors.size > 0) hydrateTrails(restored, floors);
   }, [sessions, hydrateTrails]);
 
   return sessions;
