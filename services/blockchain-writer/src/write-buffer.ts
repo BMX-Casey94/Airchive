@@ -98,6 +98,8 @@ export class WriteBuffer {
   private autoRefill: AutoRefillMonitor | null = null;
   private drainBatchSize: number | null = null;
   private fundingDryGate: (() => boolean) | null = null;
+  /** When true, the 24h preserved-row prune is paused (e.g. during RECOVERING). */
+  private prunePauseGate: (() => boolean) | null = null;
 
   constructor(
     private readonly db: Knex,
@@ -128,8 +130,22 @@ export class WriteBuffer {
     this.fundingDryGate = gate;
   }
 
+  /**
+   * Pauses ageing-out of preserved backlog while recovery is draining it.
+   * Without this, a long RECOVERING window can drop 24h-old outage samples
+   * that have not yet been broadcast.
+   */
+  setPrunePauseGate(gate: () => boolean): void {
+    this.prunePauseGate = gate;
+  }
+
   setRedisPublisher(redis: Redis): void {
     this.redisPublisher = redis;
+  }
+
+  /** Lets callers bump the pending-write gauge after an external insert. */
+  async noteExternalEnqueue(): Promise<void> {
+    pendingWritesGauge.inc();
   }
 
   /**
@@ -184,6 +200,11 @@ export class WriteBuffer {
    * during the outage itself.
    */
   async prunePreservedBacklog(): Promise<number> {
+    if (this.prunePauseGate?.() === true) {
+      log.debug("Skipping preserved backlog prune — funding recovery in progress");
+      return 0;
+    }
+
     const cutoff = new Date(Date.now() - PRESERVED_RETENTION_MS);
     const removed = await prunePreservedWrites(this.db, cutoff);
     if (removed > 0) {

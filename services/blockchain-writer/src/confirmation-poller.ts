@@ -846,7 +846,11 @@ export class ConfirmationPoller {
 
       if (arcadeStatus === "REJECTED" || arcadeStatus === "DOUBLE_SPEND_ATTEMPTED") {
         await updateTxStatus(this.db, txid, "FAILED");
-        log.error({ txid, status: arcadeStatus }, "Transaction terminally rejected by the network");
+        log.error(
+          { txid, status: arcadeStatus },
+          "Transaction terminally rejected by the network — "
+            + "payload will be re-queued for a fresh broadcast when possible",
+        );
         if (this.onTerminalRejection) {
           await this.onTerminalRejection(txid).catch((err: unknown) => {
             log.error({ err, txid }, "Failed to unwind a rejection found by polling");

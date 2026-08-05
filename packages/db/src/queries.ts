@@ -31,6 +31,7 @@ export type PendingWriteRow = PendingWrite;
 export interface TxResultRow extends TxResult {
   flight_id: string | null;
   created_at: Date;
+  reject_requeues: number;
 }
 
 export type AlertRow = AlertRecord;
@@ -548,6 +549,63 @@ export async function updateTxStatus(
     patch.merkle_path = merklePath;
   }
   return db("tx_results").where({ txid }).update(patch);
+}
+
+export interface RejectRequeueClaim {
+  txid: string;
+  aircraft_icao: string;
+  record_type: number;
+  flight_id: string | null;
+  op_return: Buffer;
+  reject_requeues: number;
+}
+
+/**
+ * Atomically claims one reject-requeue slot for a failed transaction.
+ * Returns null when the row is missing, has no envelope, is mined, or has
+ * already been re-queued `maxRequeues` times.
+ */
+export async function claimRejectRequeue(
+  db: Knex,
+  txid: string,
+  maxRequeues: number,
+): Promise<RejectRequeueClaim | null> {
+  const safeMax = Math.max(1, Math.floor(maxRequeues));
+
+  return db.transaction(async (trx) => {
+    const row = await trx("tx_results")
+      .where({ txid })
+      .whereNot({ status: "MINED" })
+      .whereNotNull("op_return")
+      .forUpdate()
+      .first<{
+        txid: string;
+        aircraft_icao: string;
+        record_type: number;
+        flight_id: string | null;
+        op_return: Buffer;
+        reject_requeues: number | string | null;
+      }>();
+
+    if (!row?.op_return) return null;
+
+    const current = Number(row.reject_requeues ?? 0);
+    if (!Number.isFinite(current) || current >= safeMax) return null;
+
+    const next = current + 1;
+    await trx("tx_results").where({ txid }).update({ reject_requeues: next });
+
+    return {
+      txid: row.txid,
+      aircraft_icao: row.aircraft_icao,
+      record_type: Number(row.record_type),
+      flight_id: row.flight_id,
+      op_return: Buffer.isBuffer(row.op_return)
+        ? row.op_return
+        : Buffer.from(row.op_return),
+      reject_requeues: next,
+    };
+  });
 }
 
 export async function getTxResults(

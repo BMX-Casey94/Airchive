@@ -163,6 +163,11 @@ export interface TxResult {
   chronicle_validated?: boolean;
   /** Flat AIRCHIVE envelope as written to the OP_RETURN, for offline decoding. */
   op_return?: Uint8Array | null;
+  /**
+   * How many times this row has been re-queued after a terminal network reject.
+   * Capped by the writer so a permanently unmineable payload cannot loop.
+   */
+  reject_requeues?: number;
 }
 
 export enum AlertSeverity {

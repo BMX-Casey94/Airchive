@@ -1,8 +1,11 @@
 # Airchive VPS deployment
 
+**Production public origin:** [https://airchive.uk](https://airchive.uk)
+
 Runbook for moving Airchive off the developer machine and its ephemeral
 Cloudflare quick tunnels onto a VPS with a stable domain, TLS, verified
-backups and file-backed secrets.
+backups and file-backed secrets. Examples below use `airchive.example.com`
+as a placeholder; the live deployment is `airchive.uk`.
 
 Requirements: a 64-bit Linux host (Ubuntu 24.04 LTS assumed below) with at
 least 4 vCPU, 8 GB RAM and 80 GB SSD, Docker Engine 25+ and Compose v2.24 or
@@ -155,8 +158,8 @@ docker compose logs migrate
 Verify:
 
 ```bash
-curl -fsS https://airchive.example.com/api/system/health | jq
-curl -fsS https://airchive.example.com/api/system/funding | jq
+curl -fsS https://airchive.uk/api/system/health | jq
+curl -fsS https://airchive.uk/api/system/funding | jq
 ```
 
 `/api/system/funding` is the one to watch. It reports the persisted treasury
@@ -259,5 +262,5 @@ state in Postgres, so it survives restarts of any length:
 To recover, send BSV to the funding wallet address and wait. Watch it happen:
 
 ```bash
-watch -n 30 'curl -fsS https://airchive.example.com/api/system/funding | jq .data'
+watch -n 30 'curl -fsS https://airchive.uk/api/system/funding | jq .data'
 ```

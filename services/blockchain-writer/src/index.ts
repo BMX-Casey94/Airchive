@@ -48,9 +48,11 @@ import { buildChainLookup } from "./chain-lookup.js";
 import { recordUnverifiedProof, recordVerifiedProof, verifyBump } from "./spv.js";
 import { buildFlightEventTx, buildTelemetryTx, computeTxid } from "./tx-builder.js";
 import { BoundedTaskQueue } from "./task-queue.js";
+import { rebufferRejectedTransaction } from "./rebuffer-rejected.js";
 import {
   recordTypeMetricLabel,
   registry,
+  rejectRequeuesTotal,
   statusEventsShedTotal,
   statusQueueDepth,
   writerWriteIngressTotal,
@@ -536,16 +538,31 @@ async function main(): Promise<void> {
           { icao, txid: txid.slice(0, 12), purged },
           "Rejected transaction unwound and wallet reconciled against chain",
         );
-        return;
+      } else {
+        // No owning aircraft means the treasury broadcast it — a refill, split or
+        // consolidation — so the funding pool is the one holding phantom outputs.
+        await fundingUtxoManager.reconcile(config.fundingWalletWif);
       }
-
-      // No owning aircraft means the treasury broadcast it — a refill, split or
-      // consolidation — so the funding pool is the one holding phantom outputs.
-      await fundingUtxoManager.reconcile(config.fundingWalletWif);
     } catch (err) {
       log.error(
         { err, txid: txid.slice(0, 12) },
         "Failed to unwind a rejected transaction — pool may hold phantom outputs",
+      );
+    }
+
+    // The rejected txid must never be resubmitted, but the archive payload can
+    // be rebuilt into a new transaction once the wallet has a live UTXO again.
+    try {
+      const outcome = await rebufferRejectedTransaction(txid, {
+        db,
+        onQueued: () => writeBuffer.noteExternalEnqueue(),
+      });
+      rejectRequeuesTotal.inc({ outcome });
+    } catch (err) {
+      rejectRequeuesTotal.inc({ outcome: "failed" });
+      log.error(
+        { err, txid: txid.slice(0, 12) },
+        "Failed to re-queue payload after terminal rejection",
       );
     }
   }
@@ -573,12 +590,14 @@ async function main(): Promise<void> {
             reason: payload.extraInfo ?? "(upstream gave no reason)",
             competingTxs: payload.competingTxs,
           },
-          "Transaction terminally rejected by the network — will not be retried",
+          "Transaction terminally rejected by the network — "
+            + "payload will be re-queued for a fresh broadcast when possible",
         );
 
         // The rejected transaction's outputs do not exist, so anything the
         // writer optimistically recorded from it must go before it becomes the
         // parent of the aircraft's next write and propagates the rejection.
+        // handleTerminalRejection also re-queues the OP_RETURN into pending_writes.
         await handleTerminalRejection(payload.txid);
 
         await publisher
@@ -1174,6 +1193,7 @@ async function main(): Promise<void> {
     publisher,
   );
   writeBuffer.setFundingDryGate(() => fundingState.isDry());
+  writeBuffer.setPrunePauseGate(() => fundingState.isRecovering());
   await fundingState.start();
 
   autoRefill.start();

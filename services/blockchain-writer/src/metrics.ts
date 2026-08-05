@@ -176,6 +176,13 @@ export const statusEventsShedTotal = new Counter({
   registers: [registry],
 });
 
+export const rejectRequeuesTotal = new Counter({
+  name: "airchive_reject_requeues_total",
+  help: "Rejected broadcasts whose OP_RETURN payload was re-queued for a fresh attempt",
+  labelNames: ["outcome"] as const,
+  registers: [registry],
+});
+
 export const statusQueueDepth = new Gauge({
   name: "airchive_status_queue_depth",
   help: "Status events waiting to be processed",

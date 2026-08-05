@@ -426,10 +426,12 @@ pnpm --filter @airchive/dashboard dev
 
 ### Live deployment
 
-- **Dashboard:** [https://airchive.vercel.app](https://airchive.vercel.app)
-- **AE polar flight map:** [https://airchive.vercel.app/ae](https://airchive.vercel.app/ae)
-- **Cost calculator:** [https://airchive.vercel.app/demo](https://airchive.vercel.app/demo)
-- **Wallet list:** [https://airchive.vercel.app/wallets](https://airchive.vercel.app/wallets)
+- **Production (VPS):** [https://airchive.uk](https://airchive.uk) — canonical public origin for the Compose stack (API, WebSocket, dashboard behind nginx)
+- **Dashboard (Vercel mirror):** [https://airchive.vercel.app](https://airchive.vercel.app)
+- **AE polar flight map:** [https://airchive.uk/ae](https://airchive.uk/ae) · [https://airchive.vercel.app/ae](https://airchive.vercel.app/ae)
+- **Cost calculator:** [https://airchive.uk/demo](https://airchive.uk/demo) · [https://airchive.vercel.app/demo](https://airchive.vercel.app/demo)
+- **Wallet list:** [https://airchive.uk/wallets](https://airchive.uk/wallets) · [https://airchive.vercel.app/wallets](https://airchive.vercel.app/wallets)
+- **Funding health:** `GET https://airchive.uk/api/system/funding`
 
 ### Local development URLs
 
@@ -529,8 +531,12 @@ intact; it is the on-chain archive that gains a gap.
 When funds arrive it reconciles the pool, splits to `FUNDING_POOL_SPLIT_TARGET`,
 refills active aircraft first, then drains the backlog
 `FUNDING_RECOVERY_DRAIN_BATCH` writes at a time so recovery does not stampede
-the broadcaster. `GET /api/system/funding` reports state, balance, estimated
-**runway** and **retry backlog** throughout:
+the broadcaster. While state is `RECOVERING`, the 24-hour preserved-row prune is
+paused so outage samples are not aged out mid-drain. If the network later
+rejects a broadcast that Arcade had accepted, the writer unwinds the phantom
+UTXOs and re-queues the stored OP_RETURN for a **fresh** transaction (capped per
+txid) rather than discarding the archive sample. `GET /api/system/funding`
+reports state, balance, estimated **runway** and **retry backlog** throughout:
 
 - **Runway** is balance divided by a time-weighted burn rate. Quiet intervals
   count as zero burn (so the estimate is not inflated by only sampling spend

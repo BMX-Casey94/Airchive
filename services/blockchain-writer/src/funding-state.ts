@@ -158,6 +158,10 @@ export class FundingStateMachine {
     return this.cached?.state === "DRY";
   }
 
+  isRecovering(): boolean {
+    return this.cached?.state === "RECOVERING";
+  }
+
   async tick(): Promise<void> {
     if (this.ticking || this.stopped) return;
     this.ticking = true;
