@@ -2,11 +2,17 @@
 
 import useSWR from "swr";
 import { apiBaseUrl, fetcher } from "@/lib/api";
+import { resolveOperator } from "@/lib/airline-operators";
+import { resolveAircraftDescription } from "@/lib/aircraft-types";
+import { TRACKED_AIRCRAFT_MAP } from "@/lib/tracked-aircraft";
 
 interface WalletEntry {
   icao: string;
   address: string;
   walletIndex: number;
+  reg?: string | null;
+  aircraftType?: string | null;
+  callsign?: string | null;
   wocUrl: string;
 }
 
@@ -18,6 +24,36 @@ interface WalletsResponse {
   };
 }
 
+interface DisplayWallet extends WalletEntry {
+  registration: string | null;
+  typeLabel: string | null;
+  operator: string | null;
+}
+
+function enrichWallet(w: WalletEntry): DisplayWallet {
+  const icao = w.icao.trim().toUpperCase();
+  const staticInfo = TRACKED_AIRCRAFT_MAP.get(icao);
+  const typeCode = (w.aircraftType ?? staticInfo?.type ?? null)?.trim() || null;
+  const registration =
+    (w.reg ?? staticInfo?.reg ?? null)?.trim() || null;
+
+  return {
+    ...w,
+    icao,
+    registration,
+    typeLabel: resolveAircraftDescription(
+      staticInfo?.desc ?? null,
+      null,
+      typeCode,
+    ),
+    operator: resolveOperator({
+      curated: staticInfo?.operator,
+      callsign: w.callsign,
+      registration,
+    }),
+  };
+}
+
 export default function WalletsPage() {
   const { data, error, isLoading } = useSWR<WalletsResponse>(
     `${apiBaseUrl}/api/wallets`,
@@ -25,12 +61,12 @@ export default function WalletsPage() {
     { refreshInterval: 30_000 },
   );
 
-  const wallets = data?.data?.wallets ?? [];
+  const wallets = (data?.data?.wallets ?? []).map(enrichWallet);
   const derivationPath = data?.data?.derivationPath ?? "m/44'/236'/0'/0/{index}";
 
   return (
     <main className="min-h-screen bg-deep-space p-6 text-slate-100">
-      <div className="mx-auto max-w-4xl">
+      <div className="mx-auto max-w-6xl">
         <h1 className="mb-2 text-2xl font-bold tracking-tight text-electric-cyan">
           Aircraft Wallets
         </h1>
@@ -60,11 +96,13 @@ export default function WalletsPage() {
         )}
 
         {wallets.length > 0 && (
-          <div className="overflow-hidden rounded-lg border border-slate-700/50 bg-slate-900/60">
-            <table className="w-full text-left text-sm">
+          <div className="overflow-x-auto rounded-lg border border-slate-700/50 bg-slate-900/60">
+            <table className="w-full min-w-[56rem] text-left text-sm">
               <thead>
                 <tr className="border-b border-slate-700/50 text-xs uppercase tracking-wider text-slate-400">
                   <th className="px-4 py-3">ICAO</th>
+                  <th className="px-4 py-3">Type</th>
+                  <th className="px-4 py-3">Operator</th>
                   <th className="px-4 py-3">Index</th>
                   <th className="px-4 py-3">BSV Address</th>
                   <th className="px-4 py-3 text-right">Explorer</th>
@@ -76,8 +114,25 @@ export default function WalletsPage() {
                     key={w.icao}
                     className="border-b border-slate-800/50 transition-colors hover:bg-slate-800/30"
                   >
-                    <td className="px-4 py-2.5 font-mono font-semibold text-electric-cyan">
-                      {w.icao}
+                    <td className="px-4 py-2.5">
+                      <div className="font-mono font-semibold text-electric-cyan">
+                        {w.icao}
+                      </div>
+                      {w.registration && (
+                        <div className="mt-0.5 font-mono text-[11px] text-slate-500">
+                          {w.registration}
+                        </div>
+                      )}
+                    </td>
+                    <td className="px-4 py-2.5 text-slate-300">
+                      {w.typeLabel ?? (
+                        <span className="text-slate-600">—</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-2.5 text-slate-300">
+                      {w.operator ?? (
+                        <span className="text-slate-600">—</span>
+                      )}
                     </td>
                     <td className="px-4 py-2.5 font-mono text-slate-400">
                       {w.walletIndex}
@@ -118,6 +173,11 @@ export default function WalletsPage() {
         <p className="mt-4 text-xs text-slate-500">
           {wallets.length} wallet{wallets.length !== 1 ? "s" : ""} configured
           · Chronicle tx.version = 2
+        </p>
+        <p className="mt-1 text-xs text-slate-600">
+          Type and operator come from live telemetry when the airframe has
+          transmitted, otherwise from the curated registry or callsign /
+          registration hints. Quiet airframes may show — until first contact.
         </p>
       </div>
     </main>

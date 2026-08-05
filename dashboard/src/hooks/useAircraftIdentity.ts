@@ -4,6 +4,7 @@ import useSWR from "swr";
 import { apiBaseUrl, fetcher } from "@/lib/api";
 import { TRACKED_AIRCRAFT_MAP } from "@/lib/tracked-aircraft";
 import { resolveAircraftDescription } from "@/lib/aircraft-types";
+import { resolveOperator } from "@/lib/airline-operators";
 
 /** Beyond this the transponder is treated as quiet rather than live. */
 const LIVE_WINDOW_MS = 120_000;
@@ -87,18 +88,25 @@ export function useAircraftIdentity(
     ?? clean(staticInfo?.type)
     ?? clean(fallback?.typeCode);
 
+  const registration =
+    clean(row?.reg) ?? clean(staticInfo?.reg) ?? clean(fallback?.registration);
+  const callsign = clean(row?.callsign) ?? clean(fallback?.callsign);
+
   return {
     icao: upper,
-    registration:
-      clean(row?.reg) ?? clean(staticInfo?.reg) ?? clean(fallback?.registration),
+    registration,
     typeCode,
     description: resolveAircraftDescription(
       clean(staticInfo?.desc),
       clean(fallback?.description),
       typeCode,
     ),
-    operator: clean(staticInfo?.operator),
-    callsign: clean(row?.callsign) ?? clean(fallback?.callsign),
+    operator: resolveOperator({
+      curated: staticInfo?.operator,
+      callsign,
+      registration,
+    }),
+    callsign,
     phase: clean(row?.flight_phase),
     walletAddress: clean(row?.wallet_address),
     live,

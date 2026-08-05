@@ -121,14 +121,33 @@ export async function fleetRoutes(app: FastifyInstance): Promise<void> {
     const rows = await db("aircraft_config")
       .where({ enabled: true })
       .whereNotNull("wallet_address")
-      .select("icao", "wallet_address", "wallet_index");
+      .select(
+        "icao",
+        "wallet_address",
+        "wallet_index",
+        "reg",
+        "aircraft_type",
+        "callsign",
+      )
+      .orderBy("wallet_index", "asc")
+      .orderBy("icao", "asc");
 
-    const wallets = rows.map((r) => ({
-      icao: r.icao as string,
-      address: r.wallet_address as string,
-      walletIndex: r.wallet_index as number,
-      wocUrl: `https://whatsonchain.com/address/${r.wallet_address}`,
-    }));
+    const wallets = rows.map((r) => {
+      const icao = String(r.icao).toUpperCase();
+      const live = aircraftState.get(icao);
+      const configCallsign =
+        r.callsign && r.callsign !== icao ? String(r.callsign) : "";
+
+      return {
+        icao,
+        address: r.wallet_address as string,
+        walletIndex: r.wallet_index as number,
+        reg: (live?.reg ?? r.reg ?? null) || null,
+        aircraftType: (live?.aircraft_type ?? r.aircraft_type ?? null) || null,
+        callsign: (live?.callsign ?? configCallsign) || null,
+        wocUrl: `https://whatsonchain.com/address/${r.wallet_address}`,
+      };
+    });
 
     return reply.send({
       success: true,
