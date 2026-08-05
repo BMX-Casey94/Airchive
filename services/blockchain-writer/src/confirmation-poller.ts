@@ -1,6 +1,6 @@
 import type { Knex } from "knex";
 import { Hash } from "@bsv/sdk";
-import { updateTxStatus } from "@airchive/db";
+import { markTxRejected, updateTxStatus } from "@airchive/db";
 import { createLogger } from "@airchive/logger";
 import { spvVerificationsTotal } from "./metrics.js";
 import type { HeaderStore } from "./header-store.js";
@@ -17,6 +17,7 @@ import {
 } from "./block-merkle.js";
 import type { ChainLookup } from "./chain-lookup.js";
 import { isWocUnavailable } from "./woc-client.js";
+import type { TerminalRejectionContext } from "./broadcaster.js";
 
 const log = createLogger({ service: "blockchain-writer:confirmation-poller" });
 
@@ -122,6 +123,10 @@ interface ArcadeTxStatus {
   status?: string;
   blockHeight?: number;
   merklePath?: string;
+  extraInfo?: string;
+  detail?: string;
+  title?: string;
+  competingTxs?: string[];
 }
 
 interface TscProof {
@@ -197,7 +202,9 @@ export class ConfirmationPoller {
   private mode: PollMode = "catchup";
   private lastNudgePollAt = 0;
   private redisPublisher: { publish(channel: string, message: string): Promise<number> } | null = null;
-  private onTerminalRejection: ((txid: string) => Promise<void>) | null = null;
+  private onTerminalRejection:
+    | ((txid: string, rejection?: TerminalRejectionContext) => Promise<void>)
+    | null = null;
   /** Height → verified merkle tree. Avoids re-downloading the same hot block. */
   private readonly blockTrees = new Map<number, CachedBlockTree>();
 
@@ -220,7 +227,9 @@ export class ConfirmationPoller {
    * that never existed, and the aircraft's next write spends one and is
    * rejected in turn, which is how a single rejection becomes a stuck chain.
    */
-  setTerminalRejectionHandler(handler: (txid: string) => Promise<void>): void {
+  setTerminalRejectionHandler(
+    handler: (txid: string, rejection?: TerminalRejectionContext) => Promise<void>,
+  ): void {
     this.onTerminalRejection = handler;
   }
 
@@ -845,15 +854,48 @@ export class ConfirmationPoller {
       }
 
       if (arcadeStatus === "REJECTED" || arcadeStatus === "DOUBLE_SPEND_ATTEMPTED") {
-        await updateTxStatus(this.db, txid, "FAILED");
+        const reason = (
+          arcade?.extraInfo
+          ?? arcade?.detail
+          ?? arcade?.title
+          ?? ""
+        ).trim() || undefined;
+        const rejection: TerminalRejectionContext = {
+          status: arcadeStatus,
+          reason,
+          competingTxs: arcade?.competingTxs,
+          source: "poller",
+        };
+
+        await markTxRejected(this.db, txid, {
+          status: rejection.status,
+          reason: rejection.reason,
+          competingTxs: rejection.competingTxs,
+        });
         log.error(
-          { txid, status: arcadeStatus },
+          {
+            txid,
+            rejectStatus: rejection.status,
+            reason: rejection.reason ?? "(upstream gave no reason)",
+            competingTxs: rejection.competingTxs,
+            source: rejection.source,
+            icao: row.aircraft_icao,
+            recordType: Number(row.record_type),
+          },
           "Transaction terminally rejected by the network — "
             + "payload will be re-queued for a fresh broadcast when possible",
         );
         if (this.onTerminalRejection) {
-          await this.onTerminalRejection(txid).catch((err: unknown) => {
-            log.error({ err, txid }, "Failed to unwind a rejection found by polling");
+          await this.onTerminalRejection(txid, rejection).catch((err: unknown) => {
+            log.error(
+              {
+                err,
+                txid,
+                rejectStatus: rejection.status,
+                reason: rejection.reason,
+              },
+              "Failed to unwind a rejection found by polling",
+            );
           });
         }
         return 0;

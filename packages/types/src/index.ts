@@ -168,6 +168,12 @@ export interface TxResult {
    * Capped by the writer so a permanently unmineable payload cannot loop.
    */
   reject_requeues?: number;
+  /** Arcade/ARC terminal status, e.g. REJECTED or DOUBLE_SPEND_ATTEMPTED. */
+  reject_status?: string | null;
+  /** Upstream free-text reason (missing input, fee policy, conflict, …). */
+  reject_reason?: string | null;
+  /** Competing txids when the upstream reports a double-spend attempt. */
+  reject_competing_txs?: string[] | null;
 }
 
 export enum AlertSeverity {

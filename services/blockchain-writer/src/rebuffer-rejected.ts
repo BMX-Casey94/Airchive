@@ -3,6 +3,7 @@ import { RecordType } from "@airchive/types";
 import { parseOpReturnPayload } from "@airchive/telemetry-codec";
 import { claimRejectRequeue, insertPendingWrite } from "@airchive/db";
 import { createLogger } from "@airchive/logger";
+import type { TerminalRejectionContext } from "./broadcaster.js";
 
 const log = createLogger({ service: "blockchain-writer:rebuffer" });
 
@@ -20,6 +21,8 @@ export interface RebufferDeps {
   /** Called after a pending row is inserted so gauges stay honest. */
   onQueued?: () => void | Promise<void>;
   maxRequeues?: number;
+  /** Live rejection diagnosis from SSE/poller; falls back to stored columns. */
+  rejection?: TerminalRejectionContext;
 }
 
 /**
@@ -46,7 +49,10 @@ export async function rebufferRejectedTransaction(
 
   if (!claim) {
     log.info(
-      { txid: txid.slice(0, 12) },
+      {
+        txid: txid.slice(0, 12),
+        ...rejectionLogFields(deps.rejection),
+      },
       "Reject requeue skipped — no envelope, already mined, or requeue ceiling reached",
     );
     return "skipped_no_claim";
@@ -57,7 +63,12 @@ export async function rebufferRejectedTransaction(
     parsed = parseOpReturnPayload(new Uint8Array(claim.op_return));
   } catch (err) {
     log.error(
-      { err, txid: txid.slice(0, 12), requeues: claim.reject_requeues },
+      {
+        err,
+        txid: txid.slice(0, 12),
+        requeues: claim.reject_requeues,
+        ...rejectionLogFields(deps.rejection, claim),
+      },
       "Reject requeue skipped — stored OP_RETURN could not be parsed",
     );
     return "skipped_unparseable";
@@ -68,7 +79,11 @@ export async function rebufferRejectedTransaction(
     : claim.record_type;
   if (!isRebufferableRecordType(recordType)) {
     log.warn(
-      { txid: txid.slice(0, 12), recordType },
+      {
+        txid: txid.slice(0, 12),
+        recordType,
+        ...rejectionLogFields(deps.rejection, claim),
+      },
       "Reject requeue skipped — unsupported record type",
     );
     return "skipped_unparseable";
@@ -86,6 +101,7 @@ export async function rebufferRejectedTransaction(
       preserved: true,
     });
     await deps.onQueued?.();
+    const diagnosis = rejectionLogFields(deps.rejection, claim);
     log.warn(
       {
         txid: txid.slice(0, 12),
@@ -93,13 +109,19 @@ export async function rebufferRejectedTransaction(
         recordType,
         requeues: claim.reject_requeues,
         maxRequeues,
+        ...diagnosis,
       },
       "Re-queued rejected transaction payload for a fresh broadcast",
     );
     return "requeued";
   } catch (err) {
     log.error(
-      { err, txid: txid.slice(0, 12), icao },
+      {
+        err,
+        txid: txid.slice(0, 12),
+        icao,
+        ...rejectionLogFields(deps.rejection, claim),
+      },
       "Failed to insert pending write for rejected transaction",
     );
     return "failed";
@@ -114,4 +136,25 @@ function isRebufferableRecordType(recordType: number): boolean {
     || recordType === RecordType.AGENT_ANALYSIS
     || recordType === RecordType.AGENT_MONITOR
   );
+}
+
+function rejectionLogFields(
+  live?: TerminalRejectionContext,
+  stored?: {
+    reject_status?: string | null;
+    reject_reason?: string | null;
+    reject_competing_txs?: string[] | null;
+  },
+): Record<string, unknown> {
+  const rejectStatus = live?.status ?? stored?.reject_status ?? undefined;
+  const reason = live?.reason ?? stored?.reject_reason ?? undefined;
+  const competingTxs = live?.competingTxs ?? stored?.reject_competing_txs ?? undefined;
+  const source = live?.source;
+
+  return {
+    rejectStatus: rejectStatus || undefined,
+    reason: reason || "(upstream gave no reason)",
+    competingTxs: competingTxs?.length ? competingTxs : undefined,
+    source: source || undefined,
+  };
 }

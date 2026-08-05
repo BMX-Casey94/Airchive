@@ -18,6 +18,7 @@ import {
   getDb,
   getFundingState,
   insertTxResult,
+  markTxRejected,
   TREASURY_SCOPE,
   unlockAllAircraftUtxos,
   upsertAircraftConfig,
@@ -33,6 +34,7 @@ import {
   type ArcCallbackPayload,
   type BroadcastOutcome,
   type Broadcaster,
+  type TerminalRejectionContext,
 } from "./broadcaster.js";
 import { ArcadeBroadcaster, isTerminalArcadeFailure } from "./arcade-broadcaster.js";
 import { ArcadeSseClient } from "./arcade-sse.js";
@@ -521,7 +523,10 @@ async function main(): Promise<void> {
    * owning wallet against the chain is what stops a single rejection from
    * silently ending every subsequent write for that aircraft.
    */
-  async function handleTerminalRejection(txid: string): Promise<void> {
+  async function handleTerminalRejection(
+    txid: string,
+    rejection?: TerminalRejectionContext,
+  ): Promise<void> {
     try {
       const purged = await utxoManager.invalidateOutputsOf(txid);
 
@@ -535,7 +540,15 @@ async function main(): Promise<void> {
         await utxoManager.reconcile(icao, address);
         autoRefill.requestRefill(icao);
         log.warn(
-          { icao, txid: txid.slice(0, 12), purged },
+          {
+            icao,
+            txid: txid.slice(0, 12),
+            purged,
+            rejectStatus: rejection?.status,
+            reason: rejection?.reason ?? "(upstream gave no reason)",
+            competingTxs: rejection?.competingTxs,
+            source: rejection?.source,
+          },
           "Rejected transaction unwound and wallet reconciled against chain",
         );
       } else {
@@ -545,7 +558,13 @@ async function main(): Promise<void> {
       }
     } catch (err) {
       log.error(
-        { err, txid: txid.slice(0, 12) },
+        {
+          err,
+          txid: txid.slice(0, 12),
+          rejectStatus: rejection?.status,
+          reason: rejection?.reason,
+          source: rejection?.source,
+        },
         "Failed to unwind a rejected transaction — pool may hold phantom outputs",
       );
     }
@@ -556,12 +575,19 @@ async function main(): Promise<void> {
       const outcome = await rebufferRejectedTransaction(txid, {
         db,
         onQueued: () => writeBuffer.noteExternalEnqueue(),
+        rejection,
       });
       rejectRequeuesTotal.inc({ outcome });
     } catch (err) {
       rejectRequeuesTotal.inc({ outcome: "failed" });
       log.error(
-        { err, txid: txid.slice(0, 12) },
+        {
+          err,
+          txid: txid.slice(0, 12),
+          rejectStatus: rejection?.status,
+          reason: rejection?.reason,
+          source: rejection?.source,
+        },
         "Failed to re-queue payload after terminal rejection",
       );
     }
@@ -575,20 +601,29 @@ async function main(): Promise<void> {
       // FAILED stops the retry loop from resurrecting a transaction the network
       // has already refused, which for a double spend would be actively harmful.
       if (isTerminalArcadeFailure(upstreamStatus)) {
+        const rejection: TerminalRejectionContext = {
+          status: upstreamStatus,
+          reason: payload.extraInfo?.trim() || undefined,
+          competingTxs: payload.competingTxs,
+          source: "sse",
+        };
+
         // A transaction already proved to be in a block cannot subsequently be
         // rejected; such an event is stale ordering, not new information.
-        const marked = await db("tx_results")
-          .where({ txid: payload.txid })
-          .whereNot({ status: "MINED" })
-          .update({ status: "FAILED" });
+        const marked = await markTxRejected(db, payload.txid, {
+          status: rejection.status,
+          reason: rejection.reason,
+          competingTxs: rejection.competingTxs,
+        });
         if (marked === 0) return;
 
         log.error(
           {
             txid: payload.txid,
-            status: upstreamStatus,
-            reason: payload.extraInfo ?? "(upstream gave no reason)",
-            competingTxs: payload.competingTxs,
+            rejectStatus: rejection.status,
+            reason: rejection.reason ?? "(upstream gave no reason)",
+            competingTxs: rejection.competingTxs,
+            source: rejection.source,
           },
           "Transaction terminally rejected by the network — "
             + "payload will be re-queued for a fresh broadcast when possible",
@@ -598,10 +633,15 @@ async function main(): Promise<void> {
         // writer optimistically recorded from it must go before it becomes the
         // parent of the aircraft's next write and propagates the rejection.
         // handleTerminalRejection also re-queues the OP_RETURN into pending_writes.
-        await handleTerminalRejection(payload.txid);
+        await handleTerminalRejection(payload.txid, rejection);
 
         await publisher
-          .publish("txresult", JSON.stringify({ txid: payload.txid, status: "FAILED" }))
+          .publish("txresult", JSON.stringify({
+            txid: payload.txid,
+            status: "FAILED",
+            rejectStatus: rejection.status,
+            reason: rejection.reason,
+          }))
           .catch(() => {});
         return;
       }
@@ -676,7 +716,13 @@ async function main(): Promise<void> {
     statusQueueDepth.set(statusUpdateQueue.depth);
     if (!accepted) {
       log.warn(
-        { txid: payload.txid, status: payload.txStatus, maxDepth: STATUS_QUEUE_MAX_DEPTH },
+        {
+          txid: payload.txid,
+          rejectStatus: payload.txStatus,
+          reason: payload.extraInfo ?? undefined,
+          competingTxs: payload.competingTxs,
+          maxDepth: STATUS_QUEUE_MAX_DEPTH,
+        },
         "Status event shed — backlog saturated; the confirmation poller remains the backstop",
       );
     }

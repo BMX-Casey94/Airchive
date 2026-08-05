@@ -126,6 +126,19 @@ export interface ArcCallbackPayload {
 }
 
 /**
+ * Diagnosis carried from the terminal-reject source (SSE or poller) through
+ * unwind and rebuffer so logs and `tx_results` stay actionable.
+ */
+export interface TerminalRejectionContext {
+  /** Arcade/ARC status, e.g. REJECTED or DOUBLE_SPEND_ATTEMPTED. */
+  status: string;
+  /** Upstream free-text reason when provided. */
+  reason?: string;
+  competingTxs?: string[];
+  source: "sse" | "poller";
+}
+
+/**
  * The contract every broadcast upstream satisfies, so Arcade and ARC are
  * interchangeable at the call sites without those sites knowing which is live.
  */

@@ -32,6 +32,9 @@ export interface TxResultRow extends TxResult {
   flight_id: string | null;
   created_at: Date;
   reject_requeues: number;
+  reject_status: string | null;
+  reject_reason: string | null;
+  reject_competing_txs: string[] | null;
 }
 
 export type AlertRow = AlertRecord;
@@ -551,6 +554,54 @@ export async function updateTxStatus(
   return db("tx_results").where({ txid }).update(patch);
 }
 
+export interface TxRejectDetail {
+  status: string;
+  reason?: string | null;
+  competingTxs?: string[] | null;
+}
+
+/**
+ * Marks a transaction FAILED and records the upstream reject diagnosis.
+ * Returns 0 when the row is already MINED (stale ordering) or missing.
+ */
+export async function markTxRejected(
+  db: Knex,
+  txid: string,
+  detail: TxRejectDetail,
+): Promise<number> {
+  const rejectStatus = detail.status.trim().toUpperCase().slice(0, 40);
+  const reason = normaliseRejectReason(detail.reason);
+  const competing = normaliseCompetingTxs(detail.competingTxs);
+
+  return db("tx_results")
+    .where({ txid })
+    .whereNot({ status: "MINED" })
+    .update({
+      status: "FAILED",
+      reject_status: rejectStatus || null,
+      reject_reason: reason,
+      reject_competing_txs: competing,
+    });
+}
+
+function normaliseRejectReason(reason: string | null | undefined): string | null {
+  if (reason == null) return null;
+  const trimmed = reason.trim();
+  if (!trimmed) return null;
+  // Cap so a hostile/verbose upstream cannot inflate row size unbounded.
+  return trimmed.length > 2_000 ? `${trimmed.slice(0, 2_000)}…` : trimmed;
+}
+
+function normaliseCompetingTxs(
+  competingTxs: string[] | null | undefined,
+): string[] | null {
+  if (!competingTxs?.length) return null;
+  return competingTxs
+    .map((txid) => txid.trim().toLowerCase())
+    .filter((txid) => txid.length > 0)
+    .slice(0, 20);
+}
+
 export interface RejectRequeueClaim {
   txid: string;
   aircraft_icao: string;
@@ -558,6 +609,9 @@ export interface RejectRequeueClaim {
   flight_id: string | null;
   op_return: Buffer;
   reject_requeues: number;
+  reject_status: string | null;
+  reject_reason: string | null;
+  reject_competing_txs: string[] | null;
 }
 
 /**
@@ -585,6 +639,9 @@ export async function claimRejectRequeue(
         flight_id: string | null;
         op_return: Buffer;
         reject_requeues: number | string | null;
+        reject_status: string | null;
+        reject_reason: string | null;
+        reject_competing_txs: string[] | string | null;
       }>();
 
     if (!row?.op_return) return null;
@@ -604,8 +661,29 @@ export async function claimRejectRequeue(
         ? row.op_return
         : Buffer.from(row.op_return),
       reject_requeues: next,
+      reject_status: row.reject_status ?? null,
+      reject_reason: row.reject_reason ?? null,
+      reject_competing_txs: parseCompetingTxs(row.reject_competing_txs),
     };
   });
+}
+
+function parseCompetingTxs(
+  value: string[] | string | null | undefined,
+): string[] | null {
+  if (value == null) return null;
+  if (Array.isArray(value)) return normaliseCompetingTxs(value);
+  if (typeof value === "string") {
+    try {
+      const parsed: unknown = JSON.parse(value);
+      return Array.isArray(parsed)
+        ? normaliseCompetingTxs(parsed.map(String))
+        : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 export async function getTxResults(

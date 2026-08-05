@@ -91,12 +91,20 @@ describe("rebufferRejectedTransaction", () => {
       flight_id: "flight-1",
       op_return: sampleEnvelope(),
       reject_requeues: 1,
+      reject_status: "REJECTED",
+      reject_reason: "Missing inputs",
+      reject_competing_txs: null,
     });
     insertMock.mockResolvedValueOnce(undefined);
 
     const outcome = await rebufferRejectedTransaction("aa".repeat(32), {
       db: {} as never,
       onQueued,
+      rejection: {
+        status: "REJECTED",
+        reason: "Missing inputs",
+        source: "sse",
+      },
     });
 
     expect(outcome).toBe("requeued");
@@ -130,6 +138,9 @@ describe("rebufferRejectedTransaction", () => {
       flight_id: null,
       op_return: Buffer.from([1, 2, 3, 4]),
       reject_requeues: 1,
+      reject_status: "DOUBLE_SPEND_ATTEMPTED",
+      reject_reason: "Conflicting spend",
+      reject_competing_txs: ["dd".repeat(32)],
     });
 
     const outcome = await rebufferRejectedTransaction("cc".repeat(32), {
