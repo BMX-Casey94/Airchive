@@ -267,10 +267,30 @@ export default function DashboardPage() {
           </Suspense>
         </section>
 
-        <section className="lg:col-span-4">
+        <section className="lg:col-span-4 flex flex-col gap-3">
           <Suspense fallback={<PanelSkeleton className="h-72" />}>
             <AnalyticsCharts />
           </Suspense>
+          <Link
+            href="/wallets"
+            className="group flex items-center justify-between gap-3 rounded-lg border border-panel-border/40 bg-panel-bg/30 px-4 py-3 backdrop-blur-lg transition-colors hover:border-electric-cyan/35 hover:bg-electric-cyan/5"
+          >
+            <div className="min-w-0">
+              <p className="hud-label text-[9px]">Fleet wallets</p>
+              <p className="text-sm text-white/85 group-hover:text-electric-cyan transition-colors">
+                Aircraft Wallets
+              </p>
+              <p className="mt-0.5 text-[10px] text-hud-muted">
+                BIP44 addresses, type and operator
+              </p>
+            </div>
+            <span
+              className="shrink-0 font-mono text-xs text-electric-cyan/70 group-hover:text-electric-cyan"
+              aria-hidden="true"
+            >
+              →
+            </span>
+          </Link>
         </section>
 
         <section className="lg:col-span-4">

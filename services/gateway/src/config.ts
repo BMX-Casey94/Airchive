@@ -5,6 +5,9 @@ export interface GatewayConfig {
   jwtExpiry: string;
   corsOrigin: string | string[];
   devAuthBypass: boolean;
+  /** Production operator login for minting JWTs (empty = disabled). */
+  operatorUsername: string;
+  operatorPassword: string;
   redis: { host: string; port: number; password: string | undefined };
   nodeEnv: string;
 }
@@ -71,6 +74,8 @@ export function loadConfig(): GatewayConfig {
     // decision that should have to be written down, not something that happens
     // because a variable was left at its default.
     devAuthBypass: process.env.GATEWAY_DEV_AUTH_BYPASS === "true",
+    operatorUsername: (process.env.OPERATOR_USERNAME ?? "").trim(),
+    operatorPassword: process.env.OPERATOR_PASSWORD ?? "",
     redis: {
       host: process.env.REDIS_HOST ?? "127.0.0.1",
       port: parseInt(process.env.REDIS_PORT ?? "6379", 10),

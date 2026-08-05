@@ -55,27 +55,43 @@ function Stat({
   value,
   sub,
   tone = "cyan",
+  loading = false,
 }: {
   label: string;
   value: string;
   sub?: string;
   tone?: "cyan" | "green" | "amber" | "plain";
+  loading?: boolean;
 }) {
   return (
     <div className="min-w-0 border-l border-panel-border/40 px-4 first:border-l-0 first:pl-0">
       <p className="hud-label text-[9px]">{label}</p>
-      <p
-        className={clsx(
-          "truncate font-mono text-lg tabular-nums",
-          tone === "cyan" && "text-electric-cyan",
-          tone === "green" && "text-signal-green",
-          tone === "amber" && "text-neon-amber",
-          tone === "plain" && "text-white/85",
-        )}
-      >
-        {value}
-      </p>
-      {sub && <p className="truncate text-[10px] text-hud-muted">{sub}</p>}
+      {loading ? (
+        <div
+          className="mt-2 flex h-7 items-center"
+          role="status"
+          aria-label={`Loading ${label}`}
+        >
+          <div className="relative h-1.5 w-16 overflow-hidden rounded-full bg-panel-border/50">
+            <div className="absolute inset-y-0 w-1/2 animate-[stat-shimmer_1.1s_ease-in-out_infinite] rounded-full bg-electric-cyan/70" />
+          </div>
+        </div>
+      ) : (
+        <p
+          className={clsx(
+            "truncate font-mono text-lg tabular-nums",
+            tone === "cyan" && "text-electric-cyan",
+            tone === "green" && "text-signal-green",
+            tone === "amber" && "text-neon-amber",
+            tone === "plain" && "text-white/85",
+          )}
+        >
+          {value}
+        </p>
+      )}
+      {sub && !loading && (
+        <p className="truncate text-[10px] text-hud-muted">{sub}</p>
+      )}
     </div>
   );
 }
@@ -273,7 +289,7 @@ export default function AircraftExplorerPage({
     { keepPreviousData: true },
   );
 
-  const { data: summary } = useSWR<SummaryResponse>(
+  const { data: summary, isLoading: summaryLoading } = useSWR<SummaryResponse>(
     `${apiBaseUrl}/api/explorer/aircraft/${icao}/summary?${rangeParams.toString()}`,
     fetcher,
     { refreshInterval: 30_000 },
@@ -351,6 +367,7 @@ export default function AircraftExplorerPage({
   }, [exporting, exportQuery, icao, upperIcao]);
 
   const stats = summary?.data;
+  const statsLoading = summaryLoading && !stats;
 
   return (
     <div className="min-h-screen bg-space-black p-6 space-y-5">
@@ -403,6 +420,7 @@ export default function AircraftExplorerPage({
         <Stat
           label={filtered ? "Writes in range" : "Total writes"}
           value={stats ? stats.total.toLocaleString("en-GB") : "—"}
+          loading={statsLoading}
           sub={
             stats
               ? `${stats.mined.toLocaleString("en-GB")} confirmed · `
@@ -413,6 +431,7 @@ export default function AircraftExplorerPage({
         <Stat
           label="SPV verified"
           value={stats ? stats.spvVerified.toLocaleString("en-GB") : "—"}
+          loading={statsLoading}
           sub={
             !stats || stats.total === 0
               ? undefined
@@ -427,23 +446,27 @@ export default function AircraftExplorerPage({
         <Stat
           label="On-chain data"
           value={stats ? fmtBytes(stats.sizeBytes) : "—"}
+          loading={statsLoading}
           sub={stats ? `${stats.failed.toLocaleString("en-GB")} failed` : undefined}
           tone="plain"
         />
         <Stat
           label="Miner fees"
           value={stats ? stats.feeSats.toLocaleString("en-GB") : "—"}
+          loading={statsLoading}
           sub="satoshis"
           tone="amber"
         />
         <Stat
           label="First write"
           value={stats?.firstSeen ? formatTimestamp(stats.firstSeen) : "—"}
+          loading={statsLoading}
           tone="plain"
         />
         <Stat
           label="Latest write"
           value={stats?.lastSeen ? formatTimestamp(stats.lastSeen) : "—"}
+          loading={statsLoading}
           tone="plain"
         />
       </div>

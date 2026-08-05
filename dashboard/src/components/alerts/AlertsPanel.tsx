@@ -7,7 +7,6 @@ import { useAircraftStore } from "@/stores/aircraft-store";
 import { AlertSeverity } from "@/types/airchive";
 import type { AlertRecord } from "@/types/airchive";
 import { fmtTimePrecise } from "@/lib/format";
-import { postApi } from "@/lib/api";
 import Panel from "@/components/ui/Panel";
 
 const SEVERITY_ICON: Record<string, string> = {
@@ -53,7 +52,27 @@ export function AlertsPanel() {
     setActionError(null);
 
     try {
-      await postApi("/api/alerts/test", selectedIcao ? { icao: selectedIcao } : {});
+      // Same-origin BFF mints a short-lived operator JWT server-side; the
+      // browser never talks to the JWT-protected gateway route directly.
+      const res = await fetch("/api/alerts/test", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify(selectedIcao ? { icao: selectedIcao } : {}),
+      });
+      const payload = (await res.json().catch(() => null)) as {
+        success?: boolean;
+        error?: string;
+      } | null;
+
+      if (!res.ok || payload?.success === false) {
+        throw new Error(
+          payload?.error ?? `Alert test failed (${res.status})`,
+        );
+      }
+
       setActionMessage(
         selectedIcao
           ? `Test alert sent for ${selectedIcao}.`
