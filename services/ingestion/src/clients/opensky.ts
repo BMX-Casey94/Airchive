@@ -1,4 +1,4 @@
-import type { TelemetryRecord } from "@airchive/types";
+import { normaliseCallsign, type TelemetryRecord } from "@airchive/types";
 import { errorsTotal, pollDuration, pollsTotal } from "../metrics.js";
 
 const TIMEOUT_MS = 5_000;
@@ -73,7 +73,11 @@ function mapOpenSkyState(
   const icao = s[0] as string | null;
   if (!icao) return null;
 
-  const callsign = typeof s[1] === "string" ? s[1].trim() : "";
+  const upperIcao = icao.toUpperCase();
+  const callsign =
+    typeof s[1] === "string"
+      ? (normaliseCallsign(s[1], upperIcao) ?? "")
+      : "";
   const timePosition = s[3] as number | null;
   const lon = s[5] as number | null;
   const lat = s[6] as number | null;
@@ -87,8 +91,8 @@ function mapOpenSkyState(
   const positionSource = s[16] as number | null;
 
   return {
-    icao: icao.toUpperCase(),
-    callsign: callsign || "",
+    icao: upperIcao,
+    callsign,
     ts_pos: timePosition != null ? timePosition * 1000 : 0,
     lat: lat ?? 0,
     lon: lon ?? 0,

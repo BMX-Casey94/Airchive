@@ -5,6 +5,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import { Area, AreaChart, ResponsiveContainer, YAxis } from "recharts";
 import { useFleetStore } from "@/stores/fleet";
 import { useAircraftStore } from "@/stores/aircraft-store";
+import { normaliseCallsign } from "@/lib/callsign";
 import { haversineMiles } from "../engine/projection";
 import type { ActiveSessionDTO } from "../useActiveSessions";
 
@@ -184,10 +185,10 @@ export default function FlightPanel({ sessions }: FlightPanelProps) {
   const phaseStyle = PHASE_STYLE[phase] ?? "text-hud-muted border-panel-border";
 
   const callsign =
-    aircraft?.callsign ||
-    telemetry?.callsign ||
-    session?.callsign ||
-    selectedIcao;
+    normaliseCallsign(aircraft?.callsign, selectedIcao)
+    ?? normaliseCallsign(telemetry?.callsign, selectedIcao)
+    ?? normaliseCallsign(session?.callsign, selectedIcao)
+    ?? selectedIcao;
   const reg = aircraft?.reg || telemetry?.reg || "";
   const acType = aircraft?.aircraftType || telemetry?.aircraftType || "";
 

@@ -4,6 +4,7 @@ import useSWR from "swr";
 import { apiBaseUrl, fetcher } from "@/lib/api";
 import { resolveOperator } from "@/lib/airline-operators";
 import { resolveAircraftDescription } from "@/lib/aircraft-types";
+import { normaliseCallsign } from "@/lib/callsign";
 import { TRACKED_AIRCRAFT_MAP } from "@/lib/tracked-aircraft";
 
 interface WalletEntry {
@@ -66,8 +67,8 @@ function enrichWallet(
     ?? clean(w.reg)
     ?? clean(staticInfo?.reg);
   const callsign =
-    clean(live?.callsign)
-    ?? clean(w.callsign);
+    normaliseCallsign(live?.callsign, icao)
+    ?? normaliseCallsign(w.callsign, icao);
 
   return {
     ...w,

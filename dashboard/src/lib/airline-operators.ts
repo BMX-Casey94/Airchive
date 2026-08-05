@@ -89,8 +89,9 @@ function operatorFromRegistration(reg: string | null | undefined): string | null
 
 /** Leading ICAO airline designator from an ADS-B callsign. */
 export function callsignDesignator(callsign: string | null | undefined): string | null {
-  const cs = callsign?.trim().toUpperCase();
-  if (!cs) return null;
+  // Strip Mode S '@' pads before matching (e.g. BAW15@@@ → BAW15).
+  const cs = callsign?.replace(/@/g, "").trim().toUpperCase();
+  if (!cs || !/[A-Z0-9]/.test(cs)) return null;
   const match = cs.match(/^([A-Z]{3})(?=[0-9A-Z])/);
   if (!match) return null;
   return match[1];

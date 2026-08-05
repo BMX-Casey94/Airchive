@@ -287,3 +287,5 @@ export type EmergencySquawk = "7700" | "7600" | "7500";
 export function isEmergencySquawk(code: string): code is EmergencySquawk {
   return code === "7700" || code === "7600" || code === "7500";
 }
+
+export { normaliseCallsign } from "./callsign";

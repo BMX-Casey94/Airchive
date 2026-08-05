@@ -10,6 +10,7 @@ import {
   fmtVerticalRate,
   fmtWind,
 } from "@/lib/format";
+import { normaliseCallsign } from "@/lib/callsign";
 import Panel from "@/components/ui/Panel";
 import DataReadout from "@/components/ui/DataReadout";
 import PhaseBadge from "@/components/ui/PhaseBadge";
@@ -42,7 +43,8 @@ export default function TelemetryPanel() {
       headerAction={
         <div className="flex items-center gap-2">
           <span className="font-mono text-xs text-white">
-            {aircraft.callsign || aircraft.icao.toUpperCase()}
+            {normaliseCallsign(aircraft.callsign, aircraft.icao)
+              ?? aircraft.icao.toUpperCase()}
           </span>
           <PhaseBadge phase={aircraft.phase} />
         </div>

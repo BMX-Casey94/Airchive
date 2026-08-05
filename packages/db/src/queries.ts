@@ -2,6 +2,7 @@ import type { Knex } from "knex";
 import {
   FlightPhase,
   RecordType,
+  normaliseCallsign,
   type AircraftConfig,
   type AlertRecord,
   type AlertSeverity,
@@ -963,7 +964,7 @@ export async function upsertAircraftConfig(
 ): Promise<void> {
   const insertRow: Record<string, string | number | boolean | null> = {
     icao: config.icao,
-    callsign: config.callsign,
+    callsign: normaliseCallsign(config.callsign, config.icao),
     reg: config.reg,
     aircraft_type: config.aircraft_type,
     wallet_index: config.wallet_index,
@@ -972,11 +973,12 @@ export async function upsertAircraftConfig(
 
   // Ensure-on-boot paths often pass empty identity placeholders. Never let those
   // wipe reg / type / callsign learned from live telemetry on a prior run.
+  // Also reject Mode S '@' pad callsigns (e.g. @@@@@@@@) so they never stick.
   const mergeRow: Record<string, unknown> = {
     wallet_index: config.wallet_index,
     enabled: config.enabled,
     callsign: db.raw(
-      `CASE WHEN EXCLUDED.callsign IS NULL OR BTRIM(EXCLUDED.callsign) = '' OR UPPER(EXCLUDED.callsign) = UPPER(EXCLUDED.icao) THEN aircraft_config.callsign ELSE EXCLUDED.callsign END`,
+      `CASE WHEN EXCLUDED.callsign IS NULL OR BTRIM(EXCLUDED.callsign) = '' OR UPPER(EXCLUDED.callsign) = UPPER(EXCLUDED.icao) OR BTRIM(REPLACE(EXCLUDED.callsign, '@', '')) = '' THEN aircraft_config.callsign ELSE EXCLUDED.callsign END`,
     ),
     reg: db.raw(
       `CASE WHEN EXCLUDED.reg IS NULL OR BTRIM(EXCLUDED.reg) = '' THEN aircraft_config.reg ELSE EXCLUDED.reg END`,
@@ -1016,8 +1018,8 @@ export async function updateAircraftIdentity(
   const aircraftType = identity.aircraft_type?.trim();
   if (aircraftType) patch.aircraft_type = aircraftType;
 
-  const callsign = identity.callsign?.trim();
-  if (callsign && callsign.toUpperCase() !== upper) {
+  const callsign = normaliseCallsign(identity.callsign, upper);
+  if (callsign) {
     patch.callsign = callsign;
   }
 

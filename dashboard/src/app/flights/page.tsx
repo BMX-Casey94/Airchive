@@ -7,6 +7,7 @@ import { clsx } from "clsx";
 import { motion, AnimatePresence } from "framer-motion";
 import { apiBaseUrl, fetcher } from "@/lib/api";
 import { formatPhase } from "@/lib/format";
+import { normaliseCallsign } from "@/lib/callsign";
 import type { CompletedFlight } from "@/types/dashboard";
 
 const PHASE_BAR_COLOUR: Record<string, string> = {
@@ -64,7 +65,8 @@ function FlightCard({ flight }: { flight: CompletedFlight }) {
           <div className="flex items-center gap-4 min-w-0">
             <div className="flex flex-col items-center shrink-0">
               <span className="data-readout text-sm font-bold">
-                {flight.callsign || flight.aircraftIcao}
+                {normaliseCallsign(flight.callsign, flight.aircraftIcao)
+                  ?? flight.aircraftIcao}
               </span>
               <span className="text-[10px] text-hud-muted font-mono">
                 {flight.aircraftIcao}

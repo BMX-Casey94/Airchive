@@ -1,4 +1,8 @@
-import type { TelemetryRecord, EmergencyString } from "@airchive/types";
+import {
+  normaliseCallsign,
+  type TelemetryRecord,
+  type EmergencyString,
+} from "@airchive/types";
 import { errorsTotal, pollDuration, pollsTotal } from "../metrics.js";
 
 const TIMEOUT_MS = 3_000;
@@ -95,9 +99,10 @@ function mapDump1090Aircraft(
 
   const emergency = normaliseEmergency(ac.emergency);
 
+  const icao = ac.hex.toUpperCase();
   return {
-    icao: ac.hex.toUpperCase(),
-    callsign: ac.flight?.trim() ?? "",
+    icao,
+    callsign: normaliseCallsign(ac.flight, icao) ?? "",
     reg: ac.r ?? "",
     aircraft_type: ac.t ?? "",
     category: ac.category ?? "",

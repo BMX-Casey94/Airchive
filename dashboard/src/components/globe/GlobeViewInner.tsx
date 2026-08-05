@@ -5,6 +5,7 @@ import { useFleetStore } from "@/stores/fleet";
 import { useAircraftStore } from "@/stores/aircraft-store";
 import { aircraftColourHex, aircraftSprite } from "./aircraft-style";
 import { loadPersistedTrails, persistTrails } from "@/lib/trail-persistence";
+import { normaliseCallsign } from "@/lib/callsign";
 import type { AircraftState, PositionSnapshot } from "@/types/dashboard";
 
 /** Inlined by Next from next.config `env` + dotenv loading workspace `.env`. */
@@ -364,7 +365,7 @@ export default function GlobeViewInner() {
           ac.altBaro * ALT_EXAGGERATION,
         );
         // Shading is baked into the sprite, so the billboard must not tint it.
-        const labelText = ac.callsign || ac.icao;
+        const labelText = normaliseCallsign(ac.callsign, ac.icao) ?? ac.icao;
         const labelCondition = labelVisible(C, isSelected || isUrgent);
 
         let entity = v.entities.getById(ac.icao);

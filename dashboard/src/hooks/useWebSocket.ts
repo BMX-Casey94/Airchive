@@ -9,6 +9,7 @@ import { useAgentStore } from "@/stores/agent-store";
 import type { AircraftTelemetry } from "@/stores/aircraft-store";
 import type { AlertRecord, BlockchainEntry } from "@/types/airchive";
 import type { AircraftState as GlobeAircraftState } from "@/types/dashboard";
+import { normaliseCallsign } from "@/lib/callsign";
 
 /* ── Constants ────────────────────────────────────────────────── */
 
@@ -47,7 +48,7 @@ function mapTelemetry(raw: RawTelemetry): AircraftTelemetry {
   const validPos = hasValidPosition(raw);
   return {
     icao: raw.icao,
-    callsign: raw.callsign?.trim() || null,
+    callsign: normaliseCallsign(raw.callsign, raw.icao),
     reg: (raw.reg as string) || null,
     aircraftType: (raw.aircraft_type as string) || null,
     aircraftDesc: (raw.aircraft_desc as string) || null,
@@ -93,7 +94,7 @@ function mapToGlobeState(raw: RawTelemetry): Partial<GlobeAircraftState> {
   const validPos = hasValidPosition(raw);
   const patch: Partial<GlobeAircraftState> = {
     icao: raw.icao,
-    callsign: raw.callsign?.trim() ?? "",
+    callsign: normaliseCallsign(raw.callsign, raw.icao) ?? "",
     reg: (raw.reg as string) ?? "",
     aircraftType: (raw.aircraft_type as string) ?? "",
     squawk: raw.squawk ?? "",

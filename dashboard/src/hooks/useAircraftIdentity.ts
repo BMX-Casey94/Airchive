@@ -5,6 +5,7 @@ import { apiBaseUrl, fetcher } from "@/lib/api";
 import { TRACKED_AIRCRAFT_MAP } from "@/lib/tracked-aircraft";
 import { resolveAircraftDescription } from "@/lib/aircraft-types";
 import { resolveOperator } from "@/lib/airline-operators";
+import { normaliseCallsign } from "@/lib/callsign";
 
 /** Beyond this the transponder is treated as quiet rather than live. */
 const LIVE_WINDOW_MS = 120_000;
@@ -90,7 +91,9 @@ export function useAircraftIdentity(
 
   const registration =
     clean(row?.reg) ?? clean(staticInfo?.reg) ?? clean(fallback?.registration);
-  const callsign = clean(row?.callsign) ?? clean(fallback?.callsign);
+  const callsign =
+    normaliseCallsign(row?.callsign, upper)
+    ?? normaliseCallsign(fallback?.callsign, upper);
 
   return {
     icao: upper,

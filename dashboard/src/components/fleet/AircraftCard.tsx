@@ -5,6 +5,7 @@ import clsx from "clsx";
 import type { AircraftState } from "@/types/airchive";
 import PhaseBadge from "@/components/ui/PhaseBadge";
 import { fmtAltitude, fmtSpeed, fmtHeading, truncateTxid } from "@/lib/format";
+import { fleetTitle } from "@/lib/callsign";
 
 interface AircraftCardProps {
   aircraft: AircraftState;
@@ -47,7 +48,7 @@ export default function AircraftCard({
             {aircraft.icao.toUpperCase()}
           </span>
           <span className="font-mono text-sm text-white truncate">
-            {aircraft.callsign || "—"}
+            {fleetTitle(aircraft.callsign, aircraft.icao)}
           </span>
         </div>
         <PhaseBadge phase={aircraft.phase} />

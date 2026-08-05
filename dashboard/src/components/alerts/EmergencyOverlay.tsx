@@ -2,6 +2,7 @@
 
 import { motion, AnimatePresence } from "framer-motion";
 import { useAlertStore } from "@/stores/alert-store";
+import { normaliseCallsign } from "@/lib/callsign";
 
 const SQUAWK_DESCRIPTIONS: Record<string, string> = {
   "7700": "General Emergency",
@@ -54,7 +55,8 @@ export default function EmergencyOverlay() {
             {/* Aircraft info */}
             <div className="flex flex-col items-center gap-1">
               <span className="font-mono text-xl text-white">
-                {emergencyInfo.callsign || emergencyInfo.icao}
+                {normaliseCallsign(emergencyInfo.callsign, emergencyInfo.icao)
+                  ?? emergencyInfo.icao}
               </span>
               <span className="font-mono text-xs text-hud-muted tabular-nums">
                 ICAO {emergencyInfo.icao.toUpperCase()}

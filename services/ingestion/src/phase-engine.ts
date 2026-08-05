@@ -7,6 +7,7 @@ import {
 } from "@airchive/flight-phase";
 import {
   FlightPhase,
+  normaliseCallsign,
   type FlightEventRecord,
   type FlightEventType,
   type FlightSession,
@@ -494,7 +495,7 @@ export class PhaseEngine {
     stats: FlightStats | undefined,
   ): FlightEventRecord {
     const icao = normaliseIcao(record.icao);
-    const callsign = record.callsign?.trim() || icao;
+    const callsign = normaliseCallsign(record.callsign, icao) ?? icao;
     const reg = record.reg?.trim() || "";
     const acType = record.aircraft_type?.trim() || "unknown";
     const hdg = headingDeg(record);
@@ -720,7 +721,7 @@ export class PhaseEngine {
         session = await sessionManager.startAirborneSession(
           this.db,
           icao,
-          record.callsign?.trim() || icao,
+          normaliseCallsign(record.callsign, icao) ?? icao,
           phase,
         );
         this.activeSessions.set(icao, session);
@@ -803,7 +804,7 @@ export class PhaseEngine {
         const session = await sessionManager.startSession(
           this.db,
           icao,
-          rec.callsign?.trim() || icao,
+          normaliseCallsign(rec.callsign, icao) ?? icao,
           this.airportLookup,
           rec.lat,
           rec.lon,
@@ -841,7 +842,7 @@ export class PhaseEngine {
           ? await sessionManager.startSession(
               this.db,
               icao,
-              rec.callsign?.trim() || icao,
+              normaliseCallsign(rec.callsign, icao) ?? icao,
               this.airportLookup,
               rec.lat,
               rec.lon,
@@ -850,7 +851,7 @@ export class PhaseEngine {
           : await sessionManager.startAirborneSession(
               this.db,
               icao,
-              rec.callsign?.trim() || icao,
+              normaliseCallsign(rec.callsign, icao) ?? icao,
               FlightPhase.TAKEOFF,
             );
         this.activeSessions.set(icao, session);
@@ -863,7 +864,7 @@ export class PhaseEngine {
         session = await sessionManager.startAirborneSession(
           this.db,
           icao,
-          rec.callsign?.trim() || icao,
+          normaliseCallsign(rec.callsign, icao) ?? icao,
           to,
         );
         this.activeSessions.set(icao, session);

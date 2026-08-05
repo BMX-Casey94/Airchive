@@ -16,6 +16,7 @@ import {
   fmtHeading,
   fmtRelativeTime,
 } from "@/lib/format";
+import { normaliseCallsign } from "@/lib/callsign";
 import clsx from "clsx";
 
 function phaseFromString(p: string): FlightPhase {
@@ -66,7 +67,8 @@ function AircraftDetail({ ac }: { ac: AircraftTelemetry }) {
         <div className="flex flex-col gap-0.5">
           <div className="flex items-center gap-3">
             <span className="font-mono text-lg text-white">
-              {ac.callsign || (ac.icao ?? "—").toUpperCase()}
+              {normaliseCallsign(ac.callsign, ac.icao)
+                ?? (ac.icao ?? "—").toUpperCase()}
             </span>
             <span className="font-mono text-[11px] text-hud-muted tabular-nums">
               {(ac.icao ?? "—").toUpperCase()}

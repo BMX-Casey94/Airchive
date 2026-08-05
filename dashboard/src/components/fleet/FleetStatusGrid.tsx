@@ -8,6 +8,7 @@ import { refinePhase } from "@/lib/refine-phase";
 import PhaseBadge from "@/components/ui/PhaseBadge";
 import { FlightPhase } from "@/types/airchive";
 import { fmtAltitude, fmtSpeed, fmtHeading, fmtRelativeTime } from "@/lib/format";
+import { fleetTitle, normaliseCallsign } from "@/lib/callsign";
 import clsx from "clsx";
 import Panel from "@/components/ui/Panel";
 
@@ -65,7 +66,7 @@ const FleetCard = memo(function FleetCard({
             {ac.icao.toUpperCase()}
           </span>
           <span className="font-mono text-sm text-white truncate">
-            {ac.callsign || "—"}
+            {fleetTitle(ac.callsign, ac.icao, ac.reg || info?.reg)}
           </span>
         </div>
         {live && <PhaseBadge phase={phaseFromString(refinePhase(ac))} />}
@@ -209,7 +210,9 @@ export function FleetStatusGrid() {
     const aSeen = hasBeenSeen(a);
     const bSeen = hasBeenSeen(b);
     if (aSeen !== bSeen) return aSeen ? -1 : 1;
-    return (a.callsign ?? a.icao).localeCompare(b.callsign ?? b.icao);
+    const aLabel = normaliseCallsign(a.callsign, a.icao) ?? a.icao;
+    const bLabel = normaliseCallsign(b.callsign, b.icao) ?? b.icao;
+    return aLabel.localeCompare(bLabel);
   });
 
   const liveCount = liveFirst.filter(isLive).length;

@@ -1,4 +1,8 @@
-import type { TelemetryRecord, EmergencyString } from "@airchive/types";
+import {
+  normaliseCallsign,
+  type TelemetryRecord,
+  type EmergencyString,
+} from "@airchive/types";
 import { errorsTotal, pollDuration, pollsTotal } from "../metrics.js";
 
 const TIMEOUT_MS = 5_000;
@@ -114,9 +118,10 @@ function mapAdsbFiAircraft(ac: AdsbFiAircraft): Partial<TelemetryRecord> | null 
   const hasPosition =
     ac.lat != null && ac.lon != null && !(ac.lat === 0 && ac.lon === 0);
 
+  const icao = ac.hex.toUpperCase();
   const record: Partial<TelemetryRecord> = {
-    icao: ac.hex.toUpperCase(),
-    callsign: ac.flight?.trim() ?? "",
+    icao,
+    callsign: normaliseCallsign(ac.flight, icao) ?? "",
     reg: ac.r ?? "",
     aircraft_type: ac.t ?? "",
     aircraft_desc: ac.desc ?? "",
