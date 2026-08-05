@@ -24,31 +24,63 @@ interface WalletsResponse {
   };
 }
 
+interface FleetRow {
+  icao: string;
+  callsign?: string | null;
+  reg?: string | null;
+  aircraft_type?: string | null;
+}
+
+interface FleetResponse {
+  success: boolean;
+  data?: FleetRow[];
+}
+
 interface DisplayWallet extends WalletEntry {
   registration: string | null;
   typeLabel: string | null;
   operator: string | null;
 }
 
-function enrichWallet(w: WalletEntry): DisplayWallet {
+function clean(value: string | null | undefined): string | null {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : null;
+}
+
+function enrichWallet(
+  w: WalletEntry,
+  fleetByIcao: Map<string, FleetRow>,
+): DisplayWallet {
   const icao = w.icao.trim().toUpperCase();
   const staticInfo = TRACKED_AIRCRAFT_MAP.get(icao);
-  const typeCode = (w.aircraftType ?? staticInfo?.type ?? null)?.trim() || null;
+  const live = fleetByIcao.get(icao);
+
+  // Prefer live fleet (always populated while transmitting), then wallets API
+  // identity columns (after gateway deploy), then the curated registry.
+  const typeCode =
+    clean(live?.aircraft_type)
+    ?? clean(w.aircraftType)
+    ?? clean(staticInfo?.type);
   const registration =
-    (w.reg ?? staticInfo?.reg ?? null)?.trim() || null;
+    clean(live?.reg)
+    ?? clean(w.reg)
+    ?? clean(staticInfo?.reg);
+  const callsign =
+    clean(live?.callsign)
+    ?? clean(w.callsign);
 
   return {
     ...w,
     icao,
     registration,
     typeLabel: resolveAircraftDescription(
-      staticInfo?.desc ?? null,
+      clean(staticInfo?.desc),
       null,
       typeCode,
     ),
     operator: resolveOperator({
       curated: staticInfo?.operator,
-      callsign: w.callsign,
+      callsign,
       registration,
     }),
   };
@@ -61,8 +93,23 @@ export default function WalletsPage() {
     { refreshInterval: 30_000 },
   );
 
-  const wallets = (data?.data?.wallets ?? []).map(enrichWallet);
+  // Live fleet carries reg / type / callsign today; /api/wallets may still be
+  // the older payload until gateway is rebuilt, so merge both.
+  const { data: fleetData } = useSWR<FleetResponse>(
+    `${apiBaseUrl}/api/fleet`,
+    fetcher,
+    { refreshInterval: 30_000, revalidateOnFocus: false },
+  );
+
+  const fleetByIcao = new Map(
+    (fleetData?.data ?? []).map((row) => [row.icao.trim().toUpperCase(), row]),
+  );
+
+  const wallets = (data?.data?.wallets ?? []).map((w) =>
+    enrichWallet(w, fleetByIcao),
+  );
   const derivationPath = data?.data?.derivationPath ?? "m/44'/236'/0'/0/{index}";
+  const identified = wallets.filter((w) => w.typeLabel || w.operator).length;
 
   return (
     <main className="min-h-screen bg-deep-space p-6 text-slate-100">
@@ -172,6 +219,7 @@ export default function WalletsPage() {
 
         <p className="mt-4 text-xs text-slate-500">
           {wallets.length} wallet{wallets.length !== 1 ? "s" : ""} configured
+          · {identified} with type or operator
           · Chronicle tx.version = 2
         </p>
         <p className="mt-1 text-xs text-slate-600">

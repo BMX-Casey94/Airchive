@@ -2,7 +2,12 @@ import { Redis } from "ioredis";
 import { createLogger } from "@airchive/logger";
 import { FlightPhase } from "@airchive/types";
 import { loadAirports } from "@airchive/airports";
-import { createDb, getAllAircraftConfig, upsertAircraftConfig } from "@airchive/db";
+import {
+  createDb,
+  getAllAircraftConfig,
+  updateAircraftIdentity,
+  upsertAircraftConfig,
+} from "@airchive/db";
 import { getConfig } from "./config.js";
 import { PhaseEngine } from "./phase-engine.js";
 import { fetchOpenSky } from "./clients/opensky.js";
@@ -151,6 +156,8 @@ async function main(): Promise<void> {
 
   const publisher = new TelemetryPublisher(redis);
   const dedup = new DedupFilter();
+  /** Last persisted identity fingerprint per ICAO — avoids a DB write every poll. */
+  const lastIdentityFingerprint = new Map<string, string>();
 
   const writeRateOverrides = loadWriteRateOverrides();
   phaseEngine = new PhaseEngine({ redis, airportLookup: airports, db, writeRateOverrides });
@@ -198,6 +205,31 @@ async function main(): Promise<void> {
       const merged = mergeRecords(sources);
       if (merged.length > 0) {
         mergedRecordsTotal.inc(merged.length);
+      }
+
+      // Persist reg / type / callsign into aircraft_config so wallets and quiet
+      // airframes keep identity after gateway restarts (in-memory fleet alone is not enough).
+      for (const record of merged) {
+        const icao = record.icao?.toUpperCase();
+        if (!icao) continue;
+        const callsign = record.callsign?.trim() || "";
+        const reg = record.reg?.trim() || "";
+        const aircraftType = record.aircraft_type?.trim() || "";
+        if (!callsign && !reg && !aircraftType) continue;
+
+        const fingerprint = `${callsign}|${reg}|${aircraftType}`;
+        if (lastIdentityFingerprint.get(icao) === fingerprint) continue;
+        lastIdentityFingerprint.set(icao, fingerprint);
+
+        try {
+          await updateAircraftIdentity(db, icao, {
+            callsign,
+            reg,
+            aircraft_type: aircraftType,
+          });
+        } catch (err) {
+          log.warn({ err, icao }, "Failed to persist aircraft identity");
+        }
       }
 
       const toPublish = merged.filter((r) => dedup.shouldPublish(r));

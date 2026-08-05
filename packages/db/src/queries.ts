@@ -969,12 +969,21 @@ export async function upsertAircraftConfig(
     wallet_index: config.wallet_index,
     enabled: config.enabled,
   };
-  const mergeRow: Record<string, string | number | boolean | null> = {
-    callsign: config.callsign,
-    reg: config.reg,
-    aircraft_type: config.aircraft_type,
+
+  // Ensure-on-boot paths often pass empty identity placeholders. Never let those
+  // wipe reg / type / callsign learned from live telemetry on a prior run.
+  const mergeRow: Record<string, unknown> = {
     wallet_index: config.wallet_index,
     enabled: config.enabled,
+    callsign: db.raw(
+      `CASE WHEN EXCLUDED.callsign IS NULL OR BTRIM(EXCLUDED.callsign) = '' OR UPPER(EXCLUDED.callsign) = UPPER(EXCLUDED.icao) THEN aircraft_config.callsign ELSE EXCLUDED.callsign END`,
+    ),
+    reg: db.raw(
+      `CASE WHEN EXCLUDED.reg IS NULL OR BTRIM(EXCLUDED.reg) = '' THEN aircraft_config.reg ELSE EXCLUDED.reg END`,
+    ),
+    aircraft_type: db.raw(
+      `CASE WHEN EXCLUDED.aircraft_type IS NULL OR BTRIM(EXCLUDED.aircraft_type) = '' THEN aircraft_config.aircraft_type ELSE EXCLUDED.aircraft_type END`,
+    ),
   };
 
   if (config.wallet_address !== undefined) {
@@ -986,6 +995,35 @@ export async function upsertAircraftConfig(
     .insert(insertRow)
     .onConflict("icao")
     .merge(mergeRow);
+}
+
+/** Persist ADS-B identity fields when the feed supplies them. No-op if empty. */
+export async function updateAircraftIdentity(
+  db: Knex,
+  icao: string,
+  identity: {
+    callsign?: string | null;
+    reg?: string | null;
+    aircraft_type?: string | null;
+  },
+): Promise<void> {
+  const upper = icao.trim().toUpperCase();
+  const patch: Record<string, string> = {};
+
+  const reg = identity.reg?.trim();
+  if (reg) patch.reg = reg;
+
+  const aircraftType = identity.aircraft_type?.trim();
+  if (aircraftType) patch.aircraft_type = aircraftType;
+
+  const callsign = identity.callsign?.trim();
+  if (callsign && callsign.toUpperCase() !== upper) {
+    patch.callsign = callsign;
+  }
+
+  if (Object.keys(patch).length === 0) return;
+
+  await db("aircraft_config").where({ icao: upper }).update(patch);
 }
 
 /* ── Agent marketplace activity ─────────────────────────────── */
