@@ -155,6 +155,7 @@ function rejectionLogFields(
     rejectStatus: rejectStatus || undefined,
     reason: reason || "(upstream gave no reason)",
     competingTxs: competingTxs?.length ? competingTxs : undefined,
+    upstreamSnippet: live?.upstreamSnippet || undefined,
     source: source || undefined,
   };
 }

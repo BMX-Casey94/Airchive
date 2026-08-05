@@ -37,6 +37,7 @@ import {
   type TerminalRejectionContext,
 } from "./broadcaster.js";
 import { ArcadeBroadcaster, isTerminalArcadeFailure } from "./arcade-broadcaster.js";
+import { extractArcadeRejectDiagnosis } from "./arcade-reject-diagnosis.js";
 import { ArcadeSseClient } from "./arcade-sse.js";
 import { StalePoolError, UtxoManager } from "./utxo-manager.js";
 import { FundingUtxoManager } from "./funding-utxo-manager.js";
@@ -601,18 +602,23 @@ async function main(): Promise<void> {
       // FAILED stops the retry loop from resurrecting a transaction the network
       // has already refused, which for a double spend would be actively harmful.
       if (isTerminalArcadeFailure(upstreamStatus)) {
+        const diagnosis = extractArcadeRejectDiagnosis(payload, upstreamStatus);
         const rejection: TerminalRejectionContext = {
-          status: upstreamStatus,
-          reason: payload.extraInfo?.trim() || undefined,
-          competingTxs: payload.competingTxs,
+          status: diagnosis.status || upstreamStatus,
+          reason: diagnosis.reason,
+          competingTxs: diagnosis.competingTxs ?? payload.competingTxs,
           source: "sse",
+          upstreamSnippet: diagnosis.upstreamSnippet,
         };
 
         // A transaction already proved to be in a block cannot subsequently be
         // rejected; such an event is stale ordering, not new information.
         const marked = await markTxRejected(db, payload.txid, {
           status: rejection.status,
-          reason: rejection.reason,
+          reason: rejection.reason
+            ?? (rejection.upstreamSnippet
+              ? `no reason field; upstream=${rejection.upstreamSnippet}`
+              : null),
           competingTxs: rejection.competingTxs,
         });
         if (marked === 0) return;
@@ -623,6 +629,7 @@ async function main(): Promise<void> {
             rejectStatus: rejection.status,
             reason: rejection.reason ?? "(upstream gave no reason)",
             competingTxs: rejection.competingTxs,
+            upstreamSnippet: rejection.upstreamSnippet,
             source: rejection.source,
           },
           "Transaction terminally rejected by the network — "

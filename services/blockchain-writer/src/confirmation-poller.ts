@@ -18,6 +18,10 @@ import {
 import type { ChainLookup } from "./chain-lookup.js";
 import { isWocUnavailable } from "./woc-client.js";
 import type { TerminalRejectionContext } from "./broadcaster.js";
+import {
+  extractArcadeRejectDiagnosis,
+  isArcadeTxNotFound,
+} from "./arcade-reject-diagnosis.js";
 
 const log = createLogger({ service: "blockchain-writer:confirmation-poller" });
 
@@ -120,13 +124,14 @@ interface BlockSummary {
 
 interface ArcadeTxStatus {
   txStatus?: string;
-  status?: string;
+  status?: string | number;
   blockHeight?: number;
   merklePath?: string;
   extraInfo?: string;
   detail?: string;
   title?: string;
-  competingTxs?: string[];
+  competingTxs?: string[] | string[][];
+  [key: string]: unknown;
 }
 
 interface TscProof {
@@ -313,8 +318,18 @@ export class ConfirmationPoller {
         headers,
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
-      if (!res.ok) return null;
-      return (await res.json()) as ArcadeTxStatus;
+      let body: unknown = null;
+      try {
+        body = await res.json();
+      } catch {
+        body = null;
+      }
+
+      // Arcade drops rejected txids from its store quickly. A 404 / "not found"
+      // body is absence of evidence, not a terminal REJECTED verdict.
+      if (!res.ok || isArcadeTxNotFound(body)) return null;
+      if (body == null || typeof body !== "object") return null;
+      return body as ArcadeTxStatus;
     } catch {
       return null;
     }
@@ -832,7 +847,15 @@ export class ConfirmationPoller {
         (allowPerTxProof && wocBlockHeight !== undefined)
         || age > REJECTION_RECHECK_AGE_MS;
       const arcade = shouldAskArcade ? await this.fetchArcadeProof(txid) : null;
-      const arcadeStatus = (arcade?.txStatus ?? arcade?.status ?? "").toUpperCase();
+      // Prefer txStatus — ARC/Arcade also send a numeric HTTP `status` that is
+      // not a transaction state and must not be stringified into the verdict.
+      const arcadeStatus = (
+        typeof arcade?.txStatus === "string"
+          ? arcade.txStatus
+          : typeof arcade?.status === "string"
+            ? arcade.status
+            : ""
+      ).trim().toUpperCase();
 
       if (arcade?.merklePath) {
         const result = await verifyBump(txid, arcade.merklePath, this.headers);
@@ -854,22 +877,21 @@ export class ConfirmationPoller {
       }
 
       if (arcadeStatus === "REJECTED" || arcadeStatus === "DOUBLE_SPEND_ATTEMPTED") {
-        const reason = (
-          arcade?.extraInfo
-          ?? arcade?.detail
-          ?? arcade?.title
-          ?? ""
-        ).trim() || undefined;
+        const diagnosis = extractArcadeRejectDiagnosis(arcade, arcadeStatus);
         const rejection: TerminalRejectionContext = {
-          status: arcadeStatus,
-          reason,
-          competingTxs: arcade?.competingTxs,
+          status: diagnosis.status || arcadeStatus,
+          reason: diagnosis.reason,
+          competingTxs: diagnosis.competingTxs,
           source: "poller",
+          upstreamSnippet: diagnosis.upstreamSnippet,
         };
 
         await markTxRejected(this.db, txid, {
           status: rejection.status,
-          reason: rejection.reason,
+          reason: rejection.reason
+            ?? (rejection.upstreamSnippet
+              ? `no reason field; upstream=${rejection.upstreamSnippet}`
+              : null),
           competingTxs: rejection.competingTxs,
         });
         log.error(
@@ -878,6 +900,7 @@ export class ConfirmationPoller {
             rejectStatus: rejection.status,
             reason: rejection.reason ?? "(upstream gave no reason)",
             competingTxs: rejection.competingTxs,
+            upstreamSnippet: rejection.upstreamSnippet,
             source: rejection.source,
             icao: row.aircraft_icao,
             recordType: Number(row.record_type),
@@ -893,6 +916,7 @@ export class ConfirmationPoller {
                 txid,
                 rejectStatus: rejection.status,
                 reason: rejection.reason,
+                upstreamSnippet: rejection.upstreamSnippet,
               },
               "Failed to unwind a rejection found by polling",
             );

@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import { createLogger } from "@airchive/logger";
 import { arcadeSseConnected, arcadeStatusEventsTotal } from "./metrics.js";
 import type { ArcCallbackPayload } from "./broadcaster.js";
+import { extractArcadeRejectDiagnosis } from "./arcade-reject-diagnosis.js";
 
 const log = createLogger({ service: "blockchain-writer:arcade-sse" });
 
@@ -187,6 +188,7 @@ export class ArcadeSseClient extends EventEmitter {
     const status = (event.txStatus ?? event.status ?? "").trim().toUpperCase();
     if (!event.txid || status === "") return;
 
+    const diagnosis = extractArcadeRejectDiagnosis(event, status);
     arcadeStatusEventsTotal.inc({ status });
     this.emit("status-update", {
       txid: event.txid,
@@ -194,8 +196,8 @@ export class ArcadeSseClient extends EventEmitter {
       blockHeight: event.blockHeight,
       blockHash: event.blockHash,
       merklePath: event.merklePath,
-      extraInfo: event.extraInfo,
-      competingTxs: event.competingTxs,
+      extraInfo: diagnosis.reason ?? event.extraInfo,
+      competingTxs: diagnosis.competingTxs ?? event.competingTxs,
     } satisfies ArcCallbackPayload);
   }
 }

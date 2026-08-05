@@ -136,6 +136,11 @@ export interface TerminalRejectionContext {
   reason?: string;
   competingTxs?: string[];
   source: "sse" | "poller";
+  /**
+   * Truncated upstream JSON when Arcade returned a terminal status but no
+   * human-readable reason field — used for log diagnosis only.
+   */
+  upstreamSnippet?: string;
 }
 
 /**
