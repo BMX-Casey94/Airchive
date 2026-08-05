@@ -7,9 +7,9 @@ export interface TrackedAircraftInfo {
 }
 
 /**
- * Static lookup for our 15 tracked aircraft.
- * Ensures every aircraft appears in the fleet list even when its
- * transponder is off and adsb.fi returns no data.
+ * Static identity lookup for curated aircraft.
+ * Ensures featured airframes still resolve registration/operator when their
+ * transponder is quiet and live fleet state has no row yet.
  */
 export const TRACKED_AIRCRAFT: TrackedAircraftInfo[] = [
   { icao: "4076E8", reg: "G-XWBA", type: "A35K", desc: "Airbus A350-1041", operator: "British Airways" },
@@ -27,6 +27,25 @@ export const TRACKED_AIRCRAFT: TrackedAircraftInfo[] = [
   { icao: "43C919", reg: "ZP802", type: "P8",   desc: "Boeing P-8A Poseidon MRA1", operator: "Royal Air Force" },
   { icao: "43C5EB", reg: "ZM417", type: "A400", desc: "Airbus A400M Atlas C1", operator: "Royal Air Force" },
   { icao: "43C61D", reg: "ZZ504", type: "SHDW", desc: "Beechcraft Shadow R1", operator: "Royal Air Force" },
+  // Cathay Pacific A350-1000 — CX805 (CPA805) rotates across this subfleet
+  { icao: "789213", reg: "B-LXA", type: "A35K", desc: "Airbus A350-1041", operator: "Cathay Pacific" },
+  { icao: "789214", reg: "B-LXB", type: "A35K", desc: "Airbus A350-1041", operator: "Cathay Pacific" },
+  { icao: "789215", reg: "B-LXC", type: "A35K", desc: "Airbus A350-1041", operator: "Cathay Pacific" },
+  { icao: "789216", reg: "B-LXD", type: "A35K", desc: "Airbus A350-1041", operator: "Cathay Pacific" },
+  { icao: "789217", reg: "B-LXE", type: "A35K", desc: "Airbus A350-1041", operator: "Cathay Pacific" },
+  { icao: "789218", reg: "B-LXF", type: "A35K", desc: "Airbus A350-1041", operator: "Cathay Pacific" },
+  { icao: "789219", reg: "B-LXG", type: "A35K", desc: "Airbus A350-1041", operator: "Cathay Pacific" },
+  { icao: "78921A", reg: "B-LXH", type: "A35K", desc: "Airbus A350-1041", operator: "Cathay Pacific" },
+  { icao: "78922F", reg: "B-LXI", type: "A35K", desc: "Airbus A350-1041", operator: "Cathay Pacific" },
+  { icao: "789230", reg: "B-LXJ", type: "A35K", desc: "Airbus A350-1041", operator: "Cathay Pacific" },
+  { icao: "789231", reg: "B-LXK", type: "A35K", desc: "Airbus A350-1041", operator: "Cathay Pacific" },
+  { icao: "789232", reg: "B-LXL", type: "A35K", desc: "Airbus A350-1041", operator: "Cathay Pacific" },
+  { icao: "789245", reg: "B-LXM", type: "A35K", desc: "Airbus A350-1041", operator: "Cathay Pacific" },
+  { icao: "789246", reg: "B-LXN", type: "A35K", desc: "Airbus A350-1041", operator: "Cathay Pacific" },
+  { icao: "789247", reg: "B-LXO", type: "A35K", desc: "Airbus A350-1041", operator: "Cathay Pacific" },
+  { icao: "789269", reg: "B-LXP", type: "A35K", desc: "Airbus A350-1041", operator: "Cathay Pacific" },
+  { icao: "78926A", reg: "B-LXQ", type: "A35K", desc: "Airbus A350-1041", operator: "Cathay Pacific" },
+  { icao: "78926B", reg: "B-LXR", type: "A35K", desc: "Airbus A350-1041", operator: "Cathay Pacific" },
 ];
 
 export const TRACKED_AIRCRAFT_MAP = new Map(

@@ -82,7 +82,7 @@ The operator dashboard ([https://airchive.vercel.app](https://airchive.vercel.ap
 | **Aircraft Explorer** | Per-aircraft transaction history with decoded payload, block height, inclusion proof, and SPV verification state (verified / proof received / awaiting proof) |
 | **Historical Data** | Per-aircraft view that reads past transactions back off the chain and decodes them into a columnar telemetry table |
 | **Funding Status** | Treasury state (`HEALTHY`, `LOW`, `DRY`, `RECOVERING`), balance, estimated runway and retry backlog, with a banner when funding is unhealthy |
-| **Wallet List** | All 239 configured aircraft wallets with BIP44 index and WhatsonChain links, generated automatically from the configured fleet |
+| **Wallet List** | All 253 configured aircraft wallets with BIP44 index and WhatsonChain links, generated automatically from the configured fleet |
 | **Cost Calculator** (`/demo`) | Interactive chain-write economics calculator — model the cost of full-fidelity archival per aircraft and per flight hour, adjust fleet size and flight hours, view the phase-by-phase write rate breakdown |
 
 ## AE Polar Flight Map (`/ae`)
@@ -480,11 +480,11 @@ The dashboard can also be served from Vercel while the backend remains on the VP
 
 ### Aircraft wallets (HD-derived)
 
-The system currently tracks **239 aircraft** in `aircraft_config`, each with its own deterministic P2PKH wallet derived from the master seed via BIP44 path `m/44'/236'/0'/0/{index}`. Total active wallets: **239 aircraft + 3 agent wallets + 1 treasury/funding wallet = 243 wallets**.
+The system currently tracks **253 aircraft** in `aircraft_config`, each with its own deterministic P2PKH wallet derived from the master seed via BIP44 path `m/44'/236'/0'/0/{index}`. Total active wallets: **253 aircraft + 3 agent wallets + 1 treasury/funding wallet = 257 wallets**.
 
 | Wallet | Count | Purpose |
 |--------|-------|---------|
-| Aircraft (HD-derived) | 239 | One per tracked ICAO — holds UTXOs for telemetry broadcasts |
+| Aircraft (HD-derived) | 253 | One per tracked ICAO — holds UTXOs for telemetry broadcasts |
 | Agent (ServerWallet) | 3 | Collector, Analyst, Monitor — micropayments and inscriptions, topped up from the treasury |
 | Treasury / Funding | 1 | Top-level wallet that distributes satoshis to aircraft wallets via activity-aware auto-refill, and to the agent wallets on a fixed schedule (`FUNDING_WALLET_WIF`) |
 
@@ -586,11 +586,11 @@ pnpm run db:migrate
 
 ## Fleet Scale And Throughput Headroom
 
-The current configured fleet database contains **239 aircraft** across five carrier groups (Qatar Airways, British Airways, Singapore Airlines, Cathay Pacific, Qantas). Not all aircraft are airborne simultaneously — commercial utilisation typically means **30–50% of a fleet is active at any given moment**, with individual aircraft averaging 8–12 flight hours per day. The maths below reflects a realistic concurrent active fraction rather than the theoretical maximum.
+The current configured fleet database contains **253 aircraft** across five carrier groups (Qatar Airways, British Airways, Singapore Airlines, Cathay Pacific, Qantas). Not all aircraft are airborne simultaneously — commercial utilisation typically means **30–50% of a fleet is active at any given moment**, with individual aircraft averaging 8–12 flight hours per day. The maths below reflects a realistic concurrent active fraction rather than the theoretical maximum.
 
 | Parameter | Value |
 |-----------|-------|
-| Configured aircraft | **239** |
+| Configured aircraft | **253** |
 | Realistic concurrent active aircraft | **80–120** (30–50% utilisation) |
 | Weighted-avg tx/s per active aircraft | 0.97 ceiling (phase-weighted, before duplicate suppression) |
 | Measured sustained TX/s | **11 TX/s** mean across active minutes |

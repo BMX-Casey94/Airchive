@@ -8,29 +8,31 @@ import clsx from "clsx";
  * Weighted-average tx/s during active flight, derived from DEFAULT_WRITE_RATES
  * and a typical commercial phase mix. Every airborne phase sits at the 1s
  * source floor, because ADS-B does not update faster than that:
- *   CRUISE   70% @ 1s = 1.000 tx/s
- *   CLIMB     8% @ 1s = 1.000 tx/s
- *   DESCENT   7% @ 1s = 1.000 tx/s
- *   APPROACH  5% @ 1s = 1.000 tx/s
- *   TAKEOFF   2% @ 1s = 1.000 tx/s
- *   LANDING   2% @ 1s = 1.000 tx/s
- *   TAXI      6% @ 2s = 0.500 tx/s
+ *   CRUISE    70% @ 1s = 1.000 tx/s
+ *   CLIMB      8% @ 1s = 1.000 tx/s
+ *   DESCENT    7% @ 1s = 1.000 tx/s
+ *   APPROACH   5% @ 1s = 1.000 tx/s
+ *   TAKEOFF    2% @ 1s = 1.000 tx/s
+ *   LANDING    2% @ 1s = 1.000 tx/s
+ *   TAXI       4% @ 2s = 0.500 tx/s
+ *   TAXI_IN    2% @ 2s = 0.500 tx/s
  *   Weighted ≈ 0.97 tx/s
  *
- * This is a ceiling: duplicate-suppression drops samples that carry no new
- * information, so real spend runs below the figure shown here.
+ * Phase throttling only trims ground movement (~3% vs a flat 1 Hz). The larger
+ * gap to measured spend comes from duplicate suppression dropping unchanged
+ * samples — so real cost runs below this ceiling.
  */
 const ADAPTIVE_TX_PER_SECOND = 0.97;
 
 const BSV_PRICE_GBP = 11.9;
 
 /**
- * Fee = ceil((bytes / 1000) × 100 × 1.1)
- * Aircraft telemetry tx ≈ 738 bytes → ceil(0.738 × 110) = 82 sats
- * Agent tx ≈ 226 bytes → ceil(0.226 × 110) = 25 sats
+ * Fee = ceil((bytes / 1000) × 100 × 1.1)  →  110 sat/KB effective
+ * Measured average aircraft telemetry tx ≈ 767 bytes → ceil(0.767 × 110) = 85 sats
  * The calculator models aircraft telemetry (the vast majority of writes).
  */
-const SATS_PER_TX = 82;
+const AVG_TX_BYTES = 767;
+const SATS_PER_TX = 85;
 const BSV_PER_TX = SATS_PER_TX / 100_000_000;
 
 const gbpFormatter = new Intl.NumberFormat("en-GB", {
@@ -108,8 +110,9 @@ export function RoiCalculator({ className }: { className?: string }) {
           On-Chain Write Cost Calculator
         </h2>
         <p className="mx-auto mt-2 max-w-2xl text-center text-sm text-hud-muted">
-          What it costs to archive every second of every flight, on chain, at
-          full fidelity. Adjust the sliders to model your fleet.
+          Phase-weighted ceiling cost to archive full-fidelity flight telemetry
+          on chain. Realised spend is lower once duplicate suppression drops
+          unchanged samples. Adjust the sliders to model your fleet.
         </p>
 
         {/* Sliders */}
@@ -171,12 +174,12 @@ export function RoiCalculator({ className }: { className?: string }) {
         {/* Results cards */}
         <div className="mt-8 grid gap-4 md:grid-cols-3">
           <div className="rounded-lg border border-panel-border/50 bg-deep-navy/40 p-5">
-            <span className="hud-label text-hud-muted">Sampling ceiling</span>
+            <span className="hud-label text-hud-muted">1 Hz ceiling</span>
             <p className="mt-2 data-readout text-2xl text-white">
               {intFormatter.format(Math.round(animConstantTx))}
             </p>
             <p className="text-xs text-hud-muted">
-              transactions / day at 1 tx/s
+              transactions / day if every flight second wrote once
             </p>
             <p className="mt-2 text-sm font-semibold text-neon-amber">
               {gbpFormatter.format(animConstantGbp)}
@@ -184,12 +187,12 @@ export function RoiCalculator({ className }: { className?: string }) {
           </div>
 
           <div className="rounded-lg border border-electric-cyan/30 bg-electric-cyan/[0.04] p-5">
-            <span className="hud-label text-electric-cyan">Airchive modelled</span>
+            <span className="hud-label text-electric-cyan">Phase-weighted ceiling</span>
             <p className="mt-2 data-readout text-2xl text-electric-cyan">
               {intFormatter.format(Math.round(animAdaptiveTx))}
             </p>
             <p className="text-xs text-hud-muted">
-              transactions / day across the phase mix
+              transactions / day (~3% below 1 Hz from taxi @ 2s)
             </p>
             <p className="mt-2 text-sm font-semibold text-neon-amber">
               {gbpFormatter.format(animAdaptiveGbp)}
@@ -252,12 +255,18 @@ export function RoiCalculator({ className }: { className?: string }) {
                 <td className="px-4 py-2">TAXI</td>
                 <td className="px-4 py-2 data-readout">2s</td>
                 <td className="px-4 py-2 data-readout">0.50</td>
-                <td className="px-4 py-2 text-hud-muted">~6%</td>
+                <td className="px-4 py-2 text-hud-muted">~4%</td>
+              </tr>
+              <tr className="border-b border-panel-border/20">
+                <td className="px-4 py-2">TAXI_IN</td>
+                <td className="px-4 py-2 data-readout">2s</td>
+                <td className="px-4 py-2 data-readout">0.50</td>
+                <td className="px-4 py-2 text-hud-muted">~2%</td>
               </tr>
               <tr>
                 <td className="px-4 py-2">PARKED</td>
                 <td className="px-4 py-2 data-readout">60s</td>
-                <td className="px-4 py-2 data-readout">0.02</td>
+                <td className="px-4 py-2 data-readout">0.017</td>
                 <td className="px-4 py-2 text-hud-muted">not in flight</td>
               </tr>
             </tbody>
@@ -265,9 +274,9 @@ export function RoiCalculator({ className }: { className?: string }) {
         </div>
 
         <div className="mt-5 flex flex-wrap items-center gap-x-6 gap-y-1 text-[11px] text-hud-muted">
-          <span>BSV price: <strong className="text-slate-300">£{BSV_PRICE_GBP.toFixed(2)}</strong></span>
-          <span>Avg fee: <strong className="text-slate-300">{SATS_PER_TX} sats/tx</strong> (110 sat/KB × ~738 bytes)</span>
-          <span>Effective rate: <strong className="text-slate-300">~{ADAPTIVE_TX_PER_SECOND} tx/s</strong> (weighted avg, before duplicate suppression)</span>
+          <span>BSV price: <strong className="text-slate-300">£{BSV_PRICE_GBP.toFixed(2)}</strong> (illustrative)</span>
+          <span>Avg fee: <strong className="text-slate-300">{SATS_PER_TX} sats/tx</strong> (110 sat/KB × ~{AVG_TX_BYTES} bytes, measured)</span>
+          <span>Phase-weighted rate: <strong className="text-slate-300">~{ADAPTIVE_TX_PER_SECOND} tx/s</strong> (ceiling, before duplicate suppression)</span>
           <span>Emergency: <strong className="text-alert-red/80">1s</strong> (squawk 7700/7600/7500)</span>
         </div>
       </div>

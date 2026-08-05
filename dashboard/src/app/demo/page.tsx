@@ -14,7 +14,7 @@ const features = [
   },
   {
     title: "Adaptive write rates",
-    body: "Phase-aware throttling: 1s during takeoff/climb/landing, 3s cruise, 15s taxi. Reduces chain volume whilst preserving dense sampling when it matters.",
+    body: "Phase-aware sampling at the ADS-B floor: 1s airborne, 2s taxi, 60s parked. Duplicate suppression then drops unchanged samples so realised spend sits below the phase-weighted ceiling.",
     accent: "border-neon-amber/25 bg-neon-amber/[0.03]",
   },
   {
