@@ -2,7 +2,15 @@
 
 import { animate } from "framer-motion";
 import { useEffect, useRef, useState } from "react";
+import useSWR from "swr";
 import clsx from "clsx";
+import {
+  BSV_PRICE_FALLBACK_GBP,
+  BSV_PRICE_REFRESH_MS,
+  type BsvPriceResponse,
+  type BsvPriceSource,
+  isFinitePositivePrice,
+} from "@/lib/bsv-price";
 
 /**
  * Weighted-average tx/s during active flight, derived from DEFAULT_WRITE_RATES
@@ -24,8 +32,6 @@ import clsx from "clsx";
  */
 const ADAPTIVE_TX_PER_SECOND = 0.97;
 
-const BSV_PRICE_GBP = 11.9;
-
 /**
  * Fee = ceil((bytes / 1000) × 100 × 1.1)  →  110 sat/KB effective
  * Measured average aircraft telemetry tx ≈ 767 bytes → ceil(0.767 × 110) = 85 sats
@@ -34,6 +40,24 @@ const BSV_PRICE_GBP = 11.9;
 const AVG_TX_BYTES = 767;
 const SATS_PER_TX = 85;
 const BSV_PER_TX = SATS_PER_TX / 100_000_000;
+
+const PRICE_SOURCE_LABEL: Record<BsvPriceSource, string> = {
+  coingecko: "CoinGecko",
+  coinbase: "Coinbase",
+  fallback: "fallback",
+};
+
+async function fetchBsvPrice(url: string): Promise<BsvPriceResponse> {
+  const res = await fetch(url, { headers: { Accept: "application/json" } });
+  if (!res.ok) {
+    throw new Error(`BSV price HTTP ${res.status}`);
+  }
+  const json = (await res.json()) as BsvPriceResponse;
+  if (!isFinitePositivePrice(json.gbp)) {
+    throw new Error("BSV price payload missing gbp");
+  }
+  return json;
+}
 
 const gbpFormatter = new Intl.NumberFormat("en-GB", {
   style: "currency",
@@ -68,6 +92,30 @@ export function RoiCalculator({ className }: { className?: string }) {
   const [aircraft, setAircraft] = useState(50);
   const [hoursPerDay, setHoursPerDay] = useState(8);
 
+  const { data: priceQuote, isLoading: priceLoading } = useSWR<BsvPriceResponse>(
+    "/api/bsv-price",
+    fetchBsvPrice,
+    {
+      refreshInterval: BSV_PRICE_REFRESH_MS,
+      revalidateOnFocus: false,
+      dedupingInterval: 60_000,
+      fallbackData: {
+        gbp: BSV_PRICE_FALLBACK_GBP,
+        source: "fallback",
+        updatedAt: 0,
+        stale: true,
+      },
+    },
+  );
+
+  const bsvPriceGbp = isFinitePositivePrice(priceQuote?.gbp)
+    ? priceQuote.gbp
+    : BSV_PRICE_FALLBACK_GBP;
+  const priceLive = priceQuote?.source !== "fallback" && priceQuote?.stale !== true;
+  const priceLabel = priceQuote
+    ? PRICE_SOURCE_LABEL[priceQuote.source]
+    : PRICE_SOURCE_LABEL.fallback;
+
   const flightSecondsPerDay = aircraft * hoursPerDay * 3600;
 
   const constantTx = Math.round(flightSecondsPerDay);
@@ -76,8 +124,8 @@ export function RoiCalculator({ className }: { className?: string }) {
   const constantBsv = constantTx * BSV_PER_TX;
   const adaptiveBsv = adaptiveTx * BSV_PER_TX;
 
-  const constantGbp = constantBsv * BSV_PRICE_GBP;
-  const adaptiveGbp = adaptiveBsv * BSV_PRICE_GBP;
+  const constantGbp = constantBsv * bsvPriceGbp;
+  const adaptiveGbp = adaptiveBsv * bsvPriceGbp;
 
   const perAircraftGbp = aircraft > 0 ? adaptiveGbp / aircraft : 0;
   const perHourGbp = hoursPerDay > 0 ? perAircraftGbp / hoursPerDay : 0;
@@ -274,7 +322,18 @@ export function RoiCalculator({ className }: { className?: string }) {
         </div>
 
         <div className="mt-5 flex flex-wrap items-center gap-x-6 gap-y-1 text-[11px] text-hud-muted">
-          <span>BSV price: <strong className="text-slate-300">£{BSV_PRICE_GBP.toFixed(2)}</strong> (illustrative)</span>
+          <span>
+            BSV price:{" "}
+            <strong className="text-slate-300">£{bsvPriceGbp.toFixed(2)}</strong>
+            {" "}
+            {priceLoading && !priceLive
+              ? "(loading live quote…)"
+              : priceLive
+                ? `(live · ${priceLabel})`
+                : priceQuote?.source === "fallback"
+                  ? "(offline fallback)"
+                  : `(cached · ${priceLabel})`}
+          </span>
           <span>Avg fee: <strong className="text-slate-300">{SATS_PER_TX} sats/tx</strong> (110 sat/KB × ~{AVG_TX_BYTES} bytes, measured)</span>
           <span>Phase-weighted rate: <strong className="text-slate-300">~{ADAPTIVE_TX_PER_SECOND} tx/s</strong> (ceiling, before duplicate suppression)</span>
           <span>Emergency: <strong className="text-alert-red/80">1s</strong> (squawk 7700/7600/7500)</span>

@@ -622,7 +622,7 @@ information, so realised throughput runs below the table.
 
 Throughput scales linearly with the tracked fleet — adding aircraft increases daily volume with no architectural change, since each aircraft wallet is independently funded and manages its own UTXO chain, enabling fully parallel transaction construction with no contention.
 
-**Cost estimate:** At 110 sats/KB, the measured average transaction is 767 bytes and costs 85 sats. At the measured sustained rate that is roughly **0.8 BSV/day** (approx. £10 at £11.90/BSV), rising to about **1.7 BSV/day** (approx. £20) at p90. The activity-aware auto-refill system distributes funding automatically from the treasury, topping up only actively flying aircraft.
+**Cost estimate:** At 110 sats/KB, the measured average transaction is 767 bytes and costs 85 sats. At the measured sustained rate that is roughly **0.8 BSV/day**, rising to about **1.7 BSV/day** at p90 (GBP figures on `/demo` use a live BSV/GBP quote). The activity-aware auto-refill system distributes funding automatically from the treasury, topping up only actively flying aircraft.
 
 Throughput peaks during descent- and approach-heavy periods such as European evening arrivals, and dips when most tracked aircraft are cruising or parked. In practice the system is write-generation-limited rather than broadcast-limited: Arcade batching absorbs submission load comfortably, and the constraint is how much genuinely new telemetry the fleet produces.
 
