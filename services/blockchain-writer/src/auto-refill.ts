@@ -14,7 +14,12 @@ import type {
   FundingUtxoManager,
 } from "./funding-utxo-manager.js";
 import { buildRefillTx, derivePubKeyHash, estimateRefillFee } from "./tx-builder.js";
-import { aircraftDryCount, refillOutcomesTotal, treasuryDry } from "./metrics.js";
+import {
+  aircraftDryCount,
+  refillOutcomesTotal,
+  spendBlockedTotal,
+  treasuryDry,
+} from "./metrics.js";
 
 const log = createLogger({ service: "blockchain-writer:auto-refill" });
 
@@ -104,6 +109,7 @@ export class AutoRefillMonitor {
   private readonly retryBackoffUntil = new Map<string, number>();
   private treasuryBlockedUntil = 0;
   private treasuryConsecutiveFailures = 0;
+  private spendGate: (() => boolean) | null = null;
   /** Aircraft observed with no spendable UTXOs during the current cycle. */
   private readonly dryAircraft = new Set<string>();
   private refillActive = 0;
@@ -136,6 +142,19 @@ export class AutoRefillMonitor {
   /** True while the treasury is backing off after a funding failure. */
   isTreasuryBlocked(): boolean {
     return Date.now() < this.treasuryBlockedUntil;
+  }
+
+  /**
+   * Supplies the spend governor's verdict. A refill is a treasury spend like
+   * any other, and refilling into a network that is refusing transactions just
+   * moves coin into wallets whose writes will also be refused.
+   */
+  setSpendGate(gate: () => boolean): void {
+    this.spendGate = gate;
+  }
+
+  private isSpendHalted(): boolean {
+    return this.spendGate !== null && this.spendGate() === false;
   }
 
   /** Aircraft observed with no spendable UTXOs on the most recent sweep. */
@@ -219,6 +238,12 @@ export class AutoRefillMonitor {
     const cooldownUntil = this.refillCooldowns.get(key) ?? 0;
     if (Date.now() < cooldownUntil) return;
 
+    if (this.isSpendHalted()) {
+      spendBlockedTotal.inc({ site: "refill_request" });
+      log.debug({ icao }, "Skipping refill — spending is halted by the governor");
+      return;
+    }
+
     if (this.isTreasuryBlocked()) {
       refillOutcomesTotal.inc({ outcome: "treasury_cooldown" });
       log.debug({ icao }, "Skipping refill — treasury backing off after recent failure");
@@ -268,6 +293,15 @@ export class AutoRefillMonitor {
 
   async checkAll(force = false): Promise<void> {
     if (this.running) return;
+
+    if (this.isSpendHalted()) {
+      spendBlockedTotal.inc({ site: "refill_sweep" });
+      log.warn(
+        "Refill sweep skipped — spending is halted, so the treasury is left intact",
+      );
+      return;
+    }
+
     this.running = true;
 
     const tally: Record<RefillOutcome, number> = {

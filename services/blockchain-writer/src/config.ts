@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { SpendGuardConfig } from "./spend-governor.js";
 
 export interface RedisConfig {
   host: string;
@@ -27,6 +28,7 @@ export interface ArcadeConfig {
 
 export interface Config {
   arcade: ArcadeConfig;
+  spendGuard: SpendGuardConfig;
   arcEndpoints: ArcEndpointConfig[];
   arcCallbackPort: number;
   wocApiUrl: string;
@@ -148,6 +150,39 @@ function buildArcEndpoints(): ArcEndpointConfig[] {
   return endpoints;
 }
 
+function boolEnv(name: string, fallback: boolean): boolean {
+  const raw = process.env[name]?.trim().toLowerCase();
+  if (raw === undefined || raw === "") return fallback;
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
+
+/**
+ * Bounds on how much treasury the writer may risk while the network is
+ * refusing transactions. Every default here is deliberately conservative: the
+ * cost of pausing is a delayed archive write, the cost of not pausing is fees
+ * spent on transactions that can never mine.
+ */
+function buildSpendGuardConfig(): SpendGuardConfig {
+  return {
+    paused: boolEnv("WRITER_SPEND_PAUSED", false),
+    windowMs: Number(optionalEnv("SPEND_GUARD_WINDOW_MS", "120000")),
+    minSamples: Number(optionalEnv("SPEND_GUARD_MIN_SAMPLES", "40")),
+    cautiousRatio: Number(optionalEnv("SPEND_GUARD_CAUTIOUS_RATIO", "0.08")),
+    haltRatio: Number(optionalEnv("SPEND_GUARD_HALT_RATIO", "0.25")),
+    haltCooldownMs: Number(optionalEnv("SPEND_GUARD_HALT_COOLDOWN_MS", "300000")),
+    // A refill output is itself unconfirmed, so it starts at depth 1 and this
+    // ceiling permits a short chain of writes behind it before the pool insists
+    // on settled funds.
+    maxUnconfirmedChainDepth: Number(
+      optionalEnv("MAX_UNCONFIRMED_CHAIN_DEPTH", "5"),
+    ),
+    cautiousUnconfirmedChainDepth: Number(
+      optionalEnv("CAUTIOUS_UNCONFIRMED_CHAIN_DEPTH", "2"),
+    ),
+    maxRejectRequeues: Number(optionalEnv("MAX_REJECT_REQUEUES", "3")),
+  };
+}
+
 function buildArcadeConfig(masterSeed: string): ArcadeConfig {
   const url = (process.env.ARCADE_URL ?? "").trim().replace(/\/+$/, "");
   return {
@@ -169,6 +204,7 @@ export function loadConfig(): Config {
   const walletMasterSeed = requireEnv("WALLET_MASTER_SEED");
   return {
     arcade: buildArcadeConfig(walletMasterSeed),
+    spendGuard: buildSpendGuardConfig(),
     arcEndpoints: buildArcEndpoints(),
     arcCallbackPort: Number(optionalEnv("ARC_CALLBACK_PORT", "9090")),
     wocApiUrl: optionalEnv(

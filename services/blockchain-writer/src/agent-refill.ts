@@ -9,7 +9,11 @@ import {
 } from "./broadcaster.js";
 import type { FundingUtxoManager } from "./funding-utxo-manager.js";
 import { buildRefillTx, derivePubKeyHash, estimateRefillFee } from "./tx-builder.js";
-import { agentRefillOutcomesTotal, agentWalletBalance } from "./metrics.js";
+import {
+  agentRefillOutcomesTotal,
+  agentWalletBalance,
+  spendBlockedTotal,
+} from "./metrics.js";
 import type { ChainLookup } from "./chain-lookup.js";
 import { isWocUnavailable } from "./woc-client.js";
 
@@ -89,6 +93,7 @@ export class AgentWalletRefiller {
   private intervalId: ReturnType<typeof setInterval> | null = null;
   private running = false;
   private readonly cooldowns = new Map<string, number>();
+  private spendGate: (() => boolean) | null = null;
 
   constructor(
     private readonly config: Config,
@@ -131,8 +136,20 @@ export class AgentWalletRefiller {
     }
   }
 
+  /** Supplies the spend governor's verdict; a top-up is a treasury spend too. */
+  setSpendGate(gate: () => boolean): void {
+    this.spendGate = gate;
+  }
+
   async checkAll(): Promise<void> {
     if (this.running) return;
+
+    if (this.spendGate !== null && this.spendGate() === false) {
+      spendBlockedTotal.inc({ site: "agent_refill" });
+      log.warn("Agent top-up cycle skipped — spending is halted by the governor");
+      return;
+    }
+
     this.running = true;
     try {
       for (const target of this.targets) {

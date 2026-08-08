@@ -128,6 +128,13 @@ export interface UTXORecord {
   /** When the lock was taken, so locks orphaned by a crash can be reclaimed. */
   locked_at?: Date | null;
   is_chronicle?: boolean;
+  /**
+   * Unconfirmed ancestors in this output's own spend chain. 0 means the output
+   * is in a block. The writer refuses to extend a chain past a configured
+   * ceiling so one rejected parent cannot invalidate an unbounded tail of
+   * descendants.
+   */
+  unconfirmed_depth?: number;
   created_at: Date;
 }
 

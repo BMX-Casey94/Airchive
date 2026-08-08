@@ -189,6 +189,44 @@ export const statusQueueDepth = new Gauge({
   registers: [registry],
 });
 
+export const spendPostureGauge = new Gauge({
+  name: "airchive_spend_posture",
+  help: "Spend governor posture (0 NORMAL, 1 CAUTIOUS, 2 HALTED)",
+  registers: [registry],
+});
+
+export const spendRejectRatio = new Gauge({
+  name: "airchive_spend_reject_ratio",
+  help: "Share of recent broadcasts the network terminally rejected",
+  registers: [registry],
+});
+
+export const spendGuardTransitionsTotal = new Counter({
+  name: "airchive_spend_guard_transitions_total",
+  help: "Spend governor posture changes by destination posture",
+  labelNames: ["to"] as const,
+  registers: [registry],
+});
+
+export const spendBlockedTotal = new Counter({
+  name: "airchive_spend_blocked_total",
+  help: "Spend attempts refused by the governor, by call site",
+  labelNames: ["site"] as const,
+  registers: [registry],
+});
+
+export const utxoChainDepthDeferralsTotal = new Counter({
+  name: "airchive_utxo_chain_depth_deferrals_total",
+  help: "Writes deferred because every candidate output exceeded the unconfirmed chain ceiling",
+  registers: [registry],
+});
+
+export const utxoChainDepthResetsTotal = new Counter({
+  name: "airchive_utxo_chain_depth_resets_total",
+  help: "Pool outputs whose unconfirmed chain depth was reset after confirming on-chain",
+  registers: [registry],
+});
+
 export const utxoLocksReclaimedTotal = new Counter({
   name: "airchive_utxo_locks_reclaimed_total",
   help: "UTXO locks reclaimed after exceeding the lock TTL",

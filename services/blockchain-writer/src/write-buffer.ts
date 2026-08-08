@@ -28,10 +28,12 @@ import { insertTxResult } from "@airchive/db";
 import {
   pendingWritesGauge,
   recordTypeMetricLabel,
+  spendBlockedTotal,
   writerWriteIngressTotal,
   writerWriteOutcomesTotal,
 } from "./metrics.js";
 import type { AutoRefillMonitor } from "./auto-refill.js";
+import type { SpendGovernor } from "./spend-governor.js";
 
 const log = createLogger({ service: "blockchain-writer:write-buffer" });
 
@@ -68,6 +70,9 @@ function isUtxoUnavailableWriteDeferral(message: string): boolean {
   return message.includes("No available UTXOs")
     || message.includes("UTXO spend cooling down")
     || message.includes("UTXO ready reserve protected")
+    // Funds exist but sit too deep in an unconfirmed chain to extend safely.
+    // Deferring waits for a block or a refill; retrying would spend anyway.
+    || message.includes("Unconfirmed chain depth ceiling reached")
     // A stale pool is a funding problem, not a bad payload. Treating it as a
     // retry would burn the retry budget and hand the write to the purge.
     || message.includes("pool is stale");
@@ -96,6 +101,7 @@ export class WriteBuffer {
   private retrying = false;
   private redisPublisher: Redis | null = null;
   private autoRefill: AutoRefillMonitor | null = null;
+  private spendGovernor: SpendGovernor | null = null;
   private drainBatchSize: number | null = null;
   private fundingDryGate: (() => boolean) | null = null;
   /** When true, the 24h preserved-row prune is paused (e.g. during RECOVERING). */
@@ -110,6 +116,15 @@ export class WriteBuffer {
 
   setAutoRefill(refill: AutoRefillMonitor): void {
     this.autoRefill = refill;
+  }
+
+  /**
+   * While the governor has spending halted the retry loop stands down and newly
+   * buffered samples are preserved rather than coalesced, so a pause costs
+   * latency instead of archive coverage.
+   */
+  setSpendGovernor(governor: SpendGovernor): void {
+    this.spendGovernor = governor;
   }
 
   /**
@@ -166,7 +181,9 @@ export class WriteBuffer {
     payload: Uint8Array,
     flightId?: string,
   ): Promise<void> {
-    const preserveStream = this.fundingDryGate?.() === true;
+    const preserveStream =
+      this.fundingDryGate?.() === true
+      || this.spendGovernor?.allowsBroadcast() === false;
 
     if (recordType === RecordTypeEnum.TELEMETRY && !preserveStream) {
       const result = await upsertPendingTelemetryWrite(this.db, {
@@ -264,6 +281,17 @@ export class WriteBuffer {
     let successCount = 0;
 
     try {
+      // Checked before anything else: a halted governor means no transaction
+      // may be paid for, whatever the backlog looks like.
+      if (this.spendGovernor && !this.spendGovernor.allowsBroadcast()) {
+        spendBlockedTotal.inc({ site: "retry_cycle" });
+        log.debug(
+          { posture: this.spendGovernor.getPosture() },
+          "Skipping retry cycle — spending is halted, backlog held in Postgres",
+        );
+        return 0;
+      }
+
       const broadcasterState = this.broadcaster.getState();
       if (this.broadcaster.isDegraded()) {
         log.debug(
@@ -518,6 +546,7 @@ export class WriteBuffer {
           const blockReason = `Broadcast dependency pending: ${result.code ?? result.description ?? "unknown"}`;
           this.autoRefill?.noteRetryPressure(icao, blockReason);
           this.autoRefill?.requestRefillIfPoolLow(icao, poolState);
+          this.spendGovernor?.noteBroadcastAccepted();
           utxoAcquired = false;
           const orphanRow = {
             txid: localTxid,
@@ -574,6 +603,7 @@ export class WriteBuffer {
         icao,
       );
       this.autoRefill?.requestRefillIfPoolLow(icao, poolState);
+      this.spendGovernor?.noteBroadcastAccepted();
 
       const retryResultRow = {
         txid,

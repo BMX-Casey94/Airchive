@@ -39,7 +39,11 @@ import {
 import { ArcadeBroadcaster, isTerminalArcadeFailure } from "./arcade-broadcaster.js";
 import { extractArcadeRejectDiagnosis } from "./arcade-reject-diagnosis.js";
 import { ArcadeSseClient } from "./arcade-sse.js";
-import { StalePoolError, UtxoManager } from "./utxo-manager.js";
+import {
+  ChainDepthExhaustedError,
+  StalePoolError,
+  UtxoManager,
+} from "./utxo-manager.js";
 import { FundingUtxoManager } from "./funding-utxo-manager.js";
 import { AutoRefillMonitor, treasuryOutputFloorSats } from "./auto-refill.js";
 import { AgentWalletRefiller, resolveAgentTargets } from "./agent-refill.js";
@@ -56,11 +60,13 @@ import {
   recordTypeMetricLabel,
   registry,
   rejectRequeuesTotal,
+  spendBlockedTotal,
   statusEventsShedTotal,
   statusQueueDepth,
   writerWriteIngressTotal,
   writerWriteOutcomesTotal,
 } from "./metrics.js";
+import { SpendGovernor } from "./spend-governor.js";
 
 const log = createLogger({ service: "blockchain-writer" });
 
@@ -69,6 +75,11 @@ const METRICS_PORT = Number(process.env.METRICS_PORT ?? "9091");
 const TRANSIENT_BROADCAST_COOLDOWN_MS = 3_000;
 const PENDING_WRITE_MAX_RETRIES = 10;
 const LOCK_RECLAIM_INTERVAL_MS = 60_000;
+/**
+ * Blocks arrive roughly every ten minutes, so a minute is ample to hand settled
+ * outputs back to the write path promptly without polling the database hard.
+ */
+const CHAIN_DEPTH_SETTLE_INTERVAL_MS = 60_000;
 /**
  * Status events are cheap individually and ruinous in aggregate. The pool is
  * sized around the database connection pool the work ends up queueing behind;
@@ -198,6 +209,18 @@ function handleAcquireFailure(
     return;
   }
 
+  // The wallet holds real funds, they are simply too deep in an unconfirmed
+  // chain to extend. Reconciling would find nothing new; what unblocks it is a
+  // block confirming the lineage, or fresh shallow outputs from a refill.
+  if (err instanceof ChainDepthExhaustedError) {
+    log.debug(
+      { icao, deepRows: err.deepRows, maxDepth: err.maxDepth },
+      "Aircraft outputs too deep in an unconfirmed chain — awaiting confirmation or refill",
+    );
+    autoRefill.requestRefill(icao);
+    return;
+  }
+
   if (shouldRequestRefillForAcquireError(err)) {
     autoRefill.requestRefill(icao);
   }
@@ -208,6 +231,7 @@ function isHandledBackpressureError(err: unknown): boolean {
   return message.includes("Broadcast dependency pending")
     || message.includes("Broadcast local backpressure")
     || message.includes("UTXO spend cooling down")
+    || message.includes("Unconfirmed chain depth ceiling reached")
     || message.includes("Broadcast transient failure");
 }
 
@@ -410,7 +434,16 @@ async function main(): Promise<void> {
     },
   });
 
+  // Decides whether spending is safe at all. Every path that can move coin —
+  // live writes, the retry loop, reject requeues, refills and agent top-ups —
+  // consults it, so a network that is refusing transactions costs one burst of
+  // fees rather than an unattended day of them.
+  const spendGovernor = new SpendGovernor(config.spendGuard);
+
   const utxoManager = new UtxoManager(db, woc);
+  utxoManager.setMaxUnconfirmedChainDepth(() =>
+    spendGovernor.maxUnconfirmedChainDepth(),
+  );
   const fundingUtxoManager = new FundingUtxoManager(db, woc);
   const writeBuffer = new WriteBuffer(db, broadcaster, utxoManager, vault);
   const autoRefill = new AutoRefillMonitor(
@@ -423,6 +456,8 @@ async function main(): Promise<void> {
     config.refillIdleWindowMs,
   );
   writeBuffer.setAutoRefill(autoRefill);
+  writeBuffer.setSpendGovernor(spendGovernor);
+  autoRefill.setSpendGate(() => spendGovernor.allowsTreasurySpend());
   let confirmationPoller: ConfirmationPoller | null = null;
 
   const headerStore = new HeaderStore(db, woc);
@@ -457,6 +492,10 @@ async function main(): Promise<void> {
   }
 
   await utxoManager.purgeSubThresholdUtxos();
+  // Confirmations that landed while the writer was down still count.
+  await utxoManager.settleConfirmedChainDepths().catch((err) =>
+    log.error({ err }, "Initial chain-depth settlement failed"),
+  );
 
   const chroniclePurged = await db("utxo_pool")
     .where("is_chronicle", true)
@@ -528,6 +567,8 @@ async function main(): Promise<void> {
     txid: string,
     rejection?: TerminalRejectionContext,
   ): Promise<void> {
+    spendGovernor.noteTerminalRejection();
+
     try {
       const purged = await utxoManager.invalidateOutputsOf(txid);
 
@@ -572,10 +613,31 @@ async function main(): Promise<void> {
 
     // The rejected txid must never be resubmitted, but the archive payload can
     // be rebuilt into a new transaction once the wallet has a live UTXO again.
+    // Rebuilding is not free, so the governor decides how many attempts a
+    // payload is worth: while the network is refusing transactions at scale,
+    // paying to rebuild each one simply doubles the loss.
+    const maxRequeues = spendGovernor.maxRejectRequeues();
+    if (maxRequeues <= 0) {
+      spendBlockedTotal.inc({ site: "reject_requeue" });
+      rejectRequeuesTotal.inc({ outcome: "skipped_spend_halted" });
+      log.warn(
+        {
+          txid: txid.slice(0, 12),
+          posture: spendGovernor.getPosture(),
+          rejectStatus: rejection?.status,
+          reason: rejection?.reason ?? "(upstream gave no reason)",
+        },
+        "Reject requeue withheld — spending is halted, so this sample stays a "
+          + "FAILED archive gap rather than paying for another attempt",
+      );
+      return;
+    }
+
     try {
       const outcome = await rebufferRejectedTransaction(txid, {
         db,
         onQueued: () => writeBuffer.noteExternalEnqueue(),
+        maxRequeues,
         rejection,
       });
       rejectRequeuesTotal.inc({ outcome });
@@ -855,8 +917,13 @@ async function main(): Promise<void> {
 
     const broadcasterState = broadcaster.getState();
     const liveTelemetryQueueReserve = Math.max(1, config.arcMaxConcurrentBroadcasts);
+    // A halted governor is not backpressure: the sample is durable in Postgres
+    // and costs nothing to hold, whereas broadcasting it right now would pay a
+    // fee the network is likely to refuse.
+    const spendHalted = !spendGovernor.allowsBroadcast();
     const shouldDeferTelemetry =
-      broadcasterState.circuitOpen
+      spendHalted
+      || broadcasterState.circuitOpen
       || broadcasterState.queueDepth >= Math.max(1, config.arcMaxQueueDepth - liveTelemetryQueueReserve);
 
     if (shouldDeferTelemetry) {
@@ -866,13 +933,14 @@ async function main(): Promise<void> {
         RecordType.TELEMETRY,
         payload,
         telemetry.flight_id,
-        "preemptive_defer",
+        spendHalted ? "spend_halted" : "preemptive_defer",
       );
       if (!buffered) return;
+      if (spendHalted) spendBlockedTotal.inc({ site: "live_telemetry" });
       writerWriteOutcomesTotal.inc({
         path: "live",
         record_type: recordTypeLabel,
-        outcome: "buffered_preemptive",
+        outcome: spendHalted ? "buffered_spend_halted" : "buffered_preemptive",
       });
       return;
     }
@@ -957,6 +1025,7 @@ async function main(): Promise<void> {
             record_type: recordTypeLabel,
             outcome: "optimistic_orphan",
           });
+          spendGovernor.noteBroadcastAccepted();
           log.info({ icao, txid: localTxid, code: result.code }, "Orphan-mempool broadcast recorded optimistically");
           return;
         }
@@ -981,6 +1050,7 @@ async function main(): Promise<void> {
         icao,
       );
       autoRefill.requestRefillIfPoolLow(icao, poolState);
+      spendGovernor.noteBroadcastAccepted();
 
       const txResultRow = {
         txid,
@@ -1043,20 +1113,22 @@ async function main(): Promise<void> {
       return;
     }
 
-    if (broadcaster.getState().circuitOpen) {
+    const spendHalted = !spendGovernor.allowsBroadcast();
+    if (spendHalted || broadcaster.getState().circuitOpen) {
       const payload = encodeFlightEventPayload(event);
       const buffered = await bufferDeferredWrite(
         icao,
         RecordType.FLIGHT_EVENT,
         payload,
         event.flight_id,
-        "preemptive_defer",
+        spendHalted ? "spend_halted" : "preemptive_defer",
       );
       if (!buffered) return;
+      if (spendHalted) spendBlockedTotal.inc({ site: "live_flight_event" });
       writerWriteOutcomesTotal.inc({
         path: "live",
         record_type: recordTypeLabel,
-        outcome: "buffered_preemptive",
+        outcome: spendHalted ? "buffered_spend_halted" : "buffered_preemptive",
       });
       return;
     }
@@ -1137,6 +1209,7 @@ async function main(): Promise<void> {
             record_type: recordTypeLabel,
             outcome: "optimistic_orphan",
           });
+          spendGovernor.noteBroadcastAccepted();
           log.info({ icao, txid: localTxid, code: result.code }, "Orphan-mempool flight-event recorded optimistically");
           return;
         }
@@ -1161,6 +1234,7 @@ async function main(): Promise<void> {
         icao,
       );
       autoRefill.requestRefillIfPoolLow(icao, poolState);
+      spendGovernor.noteBroadcastAccepted();
 
       const feResultRow = {
         txid,
@@ -1219,6 +1293,16 @@ async function main(): Promise<void> {
     );
   }, LOCK_RECLAIM_INTERVAL_MS);
 
+  // Depth rises with every write and falls only when blocks confirm the
+  // lineage. Without this sweep the ceiling would eventually park a healthy
+  // wallet's entire pool and drive endless refills.
+  const chainDepthSettleInterval = setInterval(() => {
+    void utxoManager.settleConfirmedChainDepths().catch((err) =>
+      log.error({ err }, "Chain-depth settlement failed"),
+    );
+  }, CHAIN_DEPTH_SETTLE_INTERVAL_MS);
+  chainDepthSettleInterval.unref?.();
+
   async function runConsolidation(): Promise<void> {
     log.info("Running UTXO consolidation cycle");
     for (const aircraft of fleet) {
@@ -1259,6 +1343,7 @@ async function main(): Promise<void> {
     resolveAgentTargets(),
     woc,
   );
+  agentRefiller.setSpendGate(() => spendGovernor.allowsTreasurySpend());
   agentRefiller.start();
 
   confirmationPoller = new ConfirmationPoller(
@@ -1283,7 +1368,15 @@ async function main(): Promise<void> {
   startMetricsServer();
 
   function startMetricsServer(): void {
-    const server = createHttpServer((_req, res) => {
+    const server = createHttpServer((req, res) => {
+      // A halted writer looks healthy from the outside, so the posture has to be
+      // readable without shelling into the container to grep logs.
+      if (req.url?.startsWith("/spend-posture")) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(spendGovernor.getSnapshot()));
+        return;
+      }
+
       registry
         .metrics()
         .then((metrics) => {
@@ -1305,6 +1398,7 @@ async function main(): Promise<void> {
 
     clearInterval(consolidationInterval);
     clearInterval(lockReclaimInterval);
+    clearInterval(chainDepthSettleInterval);
     clearInterval(headerSyncInterval);
     arcadeSse?.stop();
     fundingState.stop();
@@ -1359,7 +1453,14 @@ async function main(): Promise<void> {
   });
 
   log.info(
-    { aircraftCount: fleet.length },
+    {
+      aircraftCount: fleet.length,
+      spendPosture: spendGovernor.getPosture(),
+      spendPaused: spendGovernor.isPaused(),
+      maxUnconfirmedChainDepth: config.spendGuard.maxUnconfirmedChainDepth,
+      spendHaltRatio: config.spendGuard.haltRatio,
+      spendGuardWindowMs: config.spendGuard.windowMs,
+    },
     "Blockchain writer service started",
   );
 }

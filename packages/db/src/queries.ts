@@ -214,7 +214,7 @@ export async function expireStaleFlightSessions(
 export type NewUtxo = Pick<
   UTXORecord,
   "aircraft_icao" | "txid" | "vout" | "satoshis" | "locking_script"
-> & { is_locked?: boolean };
+> & { is_locked?: boolean; unconfirmed_depth?: number };
 
 export async function getAvailableUtxo(
   db: Knex,
@@ -239,9 +239,59 @@ export async function insertUtxo(db: Knex, record: NewUtxo): Promise<void> {
     .insert({
       ...record,
       is_locked: record.is_locked ?? false,
+      unconfirmed_depth: Math.max(0, Math.floor(record.unconfirmed_depth ?? 0)),
     })
     .onConflict(["txid", "vout"])
     .ignore();
+}
+
+/**
+ * Settles the depth of every pool output created by a transaction now proved to
+ * be in a block.
+ *
+ * Reconciliation alone is not enough: it runs only when something goes wrong,
+ * so a healthy, busy wallet would ratchet its outputs deeper and deeper until
+ * the ceiling parked all of them. This sweep is the ordinary path by which
+ * depth recovers — confirmations arrive, and the outputs they settle become
+ * freely spendable again.
+ */
+export async function resetConfirmedUtxoDepths(db: Knex): Promise<number> {
+  const result = await db.raw(
+    `update utxo_pool u
+        set unconfirmed_depth = 0
+       from tx_results t
+      where t.txid = u.txid
+        and t.status = 'MINED'
+        and u.unconfirmed_depth > 0`,
+  );
+  return Number((result as { rowCount?: number }).rowCount ?? 0);
+}
+
+/**
+ * Resets the unconfirmed-chain depth of outputs the chain has now confirmed.
+ *
+ * An output in a block has no unconfirmed ancestors by definition, so settling
+ * it re-opens the whole lineage behind it for spending. Without this the depth
+ * ceiling would ratchet a busy wallet into permanent deferral.
+ */
+export async function markUtxosConfirmed(
+  db: Knex,
+  outpoints: Array<{ txid: string; vout: number }>,
+): Promise<number> {
+  if (outpoints.length === 0) return 0;
+
+  const CHUNK = 500;
+  let updated = 0;
+  for (let i = 0; i < outpoints.length; i += CHUNK) {
+    const chunk = outpoints
+      .slice(i, i + CHUNK)
+      .map(({ txid, vout }) => [txid.trim(), vout] as [string, number]);
+    updated += await db("utxo_pool")
+      .whereIn(["txid", "vout"], chunk)
+      .where("unconfirmed_depth", ">", 0)
+      .update({ unconfirmed_depth: 0 });
+  }
+  return updated;
 }
 
 export async function deleteUtxo(

@@ -5,6 +5,8 @@ import {
   getUtxoCount,
   getUtxoPoolBalance,
   insertUtxo,
+  markUtxosConfirmed,
+  resetConfirmedUtxoDepths,
   type NewUtxo,
 } from "@airchive/db";
 import { createLogger } from "@airchive/logger";
@@ -14,6 +16,8 @@ import {
   type Broadcaster,
 } from "./broadcaster.js";
 import {
+  utxoChainDepthDeferralsTotal,
+  utxoChainDepthResetsTotal,
   utxoLocksReclaimedTotal,
   utxoPoolBalance,
   utxoPoolCount,
@@ -35,9 +39,18 @@ export interface UtxoPoolState {
   unlockedUtxoCount: number;
   readyUtxoCount: number;
   coolingUtxoCount: number;
+  /** Unlocked outputs held back because they sit too deep in an unconfirmed chain. */
+  deepUtxoCount: number;
 }
 
 const MIN_USABLE_SATS = 120;
+/**
+ * Ceiling used when no governor is attached, e.g. in tests and one-shot tools.
+ * Production wires the configured value through `setMaxUnconfirmedChainDepth`.
+ */
+const DEFAULT_MAX_UNCONFIRMED_CHAIN_DEPTH = 5;
+/** Depth assigned to an output the treasury has just delivered but not settled. */
+const REFILL_OUTPUT_DEPTH = 1;
 const ORPHAN_SPEND_COOLDOWN_MS = 1_000;
 const CHAIN_PROPAGATION_COOLDOWN_MS = 0;
 const REFILL_PROPAGATION_COOLDOWN_MS = 500;
@@ -50,6 +63,15 @@ const MAX_CONCURRENT_RECONCILES = 2;
  * rejection, and holding it forever silently shrinks the spendable pool.
  */
 export const UTXO_LOCK_TTL_MS = 2 * 60 * 1_000;
+
+/**
+ * WhatsOnChain reports mempool outputs with a zero (or absent) height. Only a
+ * real block height proves the output — and therefore its whole ancestry — has
+ * settled.
+ */
+function isConfirmedHeight(height: number | null | undefined): boolean {
+  return typeof height === "number" && Number.isFinite(height) && height > 0;
+}
 
 /**
  * Raised when an aircraft's pool still holds rows but none can be spent. The
@@ -67,17 +89,52 @@ export class StalePoolError extends Error {
   }
 }
 
+/**
+ * Raised when the only outputs left would extend an unconfirmed chain past the
+ * ceiling. The funds are real, so this is a wait-for-a-block condition rather
+ * than a funding failure: the write is deferred and a refill is requested so
+ * fresh, shallow outputs arrive.
+ */
+export class ChainDepthExhaustedError extends Error {
+  constructor(
+    readonly icao: string,
+    readonly deepRows: number,
+    readonly maxDepth: number,
+  ) {
+    super(
+      `Unconfirmed chain depth ceiling reached for aircraft ${icao} `
+        + `(${deepRows} output(s) at or beyond depth ${maxDepth})`,
+    );
+    this.name = "ChainDepthExhaustedError";
+  }
+}
+
 export class UtxoManager {
   private readonly utxoCooldownUntil = new Map<string, number>();
   private readonly reconcileInFlight = new Map<string, Promise<void>>();
   private readonly reconcileCooldownUntil = new Map<string, number>();
   private reconcileActive = 0;
   private readonly reconcileWaiters: Array<() => void> = [];
+  private maxUnconfirmedChainDepth: () => number = () =>
+    DEFAULT_MAX_UNCONFIRMED_CHAIN_DEPTH;
 
   constructor(
     private readonly db: Knex,
     private readonly woc: ChainLookup,
   ) {}
+
+  /**
+   * Supplies the live ceiling on unconfirmed chain depth. It is a callback
+   * rather than a number so the spend governor can tighten it the moment
+   * rejections climb, without the pool having to be rebuilt.
+   */
+  setMaxUnconfirmedChainDepth(resolve: () => number): void {
+    this.maxUnconfirmedChainDepth = () => Math.max(1, Math.floor(resolve()));
+  }
+
+  getMaxUnconfirmedChainDepth(): number {
+    return Math.max(1, Math.floor(this.maxUnconfirmedChainDepth()));
+  }
 
   async bootstrap(icao: string, address: string): Promise<boolean> {
     const existing = await getUtxoCount(this.db, icao);
@@ -118,6 +175,7 @@ export class UtxoManager {
         vout: woc.tx_pos,
         satoshis: woc.value,
         locking_script: lockingScript,
+        unconfirmed_depth: isConfirmedHeight(woc.height) ? 0 : REFILL_OUTPUT_DEPTH,
       };
 
       try {
@@ -136,21 +194,46 @@ export class UtxoManager {
   async acquireUtxo(icao: string, minReadyReserve = 0): Promise<UTXORecord> {
     const key = icao.toUpperCase();
     this.pruneExpiredCooldowns();
+    const maxDepth = this.getMaxUnconfirmedChainDepth();
 
     for (let attempt = 0; attempt < 5; attempt++) {
-      const candidates = await this.db("utxo_pool")
+      // Shallowest first, then largest. Preferring settled funds spreads writes
+      // across the pool instead of repeatedly extending whichever lineage
+      // happens to hold the biggest change output, which is what turned a
+      // single rejection into a long tail of doomed descendants.
+      const spendable = await this.db("utxo_pool")
         .where({ aircraft_icao: icao, is_locked: false })
         .where("satoshis", ">=", MIN_USABLE_SATS)
-        .orderBy("satoshis", "desc") as UTXORecord[];
+        .where("unconfirmed_depth", "<", maxDepth)
+        .orderBy([
+          { column: "unconfirmed_depth", order: "asc" },
+          { column: "satoshis", order: "desc" },
+        ]) as UTXORecord[];
 
-      const readyCandidates = candidates.filter(
+      const readyCandidates = spendable.filter(
         (utxo) => !this.isUtxoCooling(utxo.txid, utxo.vout),
       );
 
       if (readyCandidates.length === 0) {
-        if (candidates.length > 0) {
+        if (spendable.length > 0) {
           throw new Error(`UTXO spend cooling down for aircraft ${key}`);
         }
+
+        // Funds may exist but sit too deep in an unconfirmed chain to extend
+        // safely. That is a wait-for-a-block state, not a stale pool, and must
+        // not be resolved by spending anyway.
+        const deep = await this.db("utxo_pool")
+          .where({ aircraft_icao: icao, is_locked: false })
+          .where("satoshis", ">=", MIN_USABLE_SATS)
+          .where("unconfirmed_depth", ">=", maxDepth)
+          .count<[{ count: string }]>({ count: "*" })
+          .first();
+        const deepRows = Number(deep?.count ?? 0);
+        if (deepRows > 0) {
+          utxoChainDepthDeferralsTotal.inc();
+          throw new ChainDepthExhaustedError(key, deepRows, maxDepth);
+        }
+
         // Nothing spendable. If rows still exist they are locked, dust, or
         // phantoms left by a spend the network never accepted — all of which
         // need chain truth to resolve, not another refill.
@@ -311,6 +394,14 @@ export class UtxoManager {
     icao: string,
   ): Promise<UtxoPoolState> {
     await this.db.transaction(async (trx: Knex.Transaction) => {
+      // The change output inherits the parent's position in the unconfirmed
+      // chain and adds one, so the ceiling is enforced against real lineage
+      // rather than a guess.
+      const parent = await trx("utxo_pool")
+        .where({ txid: spentTxid, vout: spentVout })
+        .first<{ unconfirmed_depth: number | string | null }>("unconfirmed_depth");
+      const parentDepth = Math.max(0, Number(parent?.unconfirmed_depth ?? 0) || 0);
+
       await trx("utxo_pool")
         .where({ txid: spentTxid, vout: spentVout })
         .delete();
@@ -323,6 +414,7 @@ export class UtxoManager {
           satoshis: changeSats,
           locking_script: changeLockingScript,
           is_locked: false,
+          unconfirmed_depth: parentDepth + 1,
         });
       } else {
         log.debug(
@@ -375,6 +467,9 @@ export class UtxoManager {
         vout: output.vout,
         satoshis: output.satoshis,
         locking_script: output.lockingScript,
+        // A refill is itself an unconfirmed transaction, so its outputs start
+        // one level into the chain rather than pretending to be settled funds.
+        unconfirmed_depth: REFILL_OUTPUT_DEPTH,
       });
       this.deferFreshOutputReuse(
         icao,
@@ -427,9 +522,14 @@ export class UtxoManager {
 
       let added = 0;
       let removed = 0;
+      const confirmedOutpoints: Array<{ txid: string; vout: number }> = [];
 
       for (const utxo of onChain) {
         const outpoint = `${utxo.tx_hash}:${utxo.tx_pos}`;
+        const confirmed = isConfirmedHeight(utxo.height);
+        if (confirmed) {
+          confirmedOutpoints.push({ txid: utxo.tx_hash, vout: utxo.tx_pos });
+        }
         if (!localSet.has(outpoint) && utxo.value >= MIN_USABLE_SATS) {
           await insertUtxo(this.db, {
             aircraft_icao: key,
@@ -437,9 +537,17 @@ export class UtxoManager {
             vout: utxo.tx_pos,
             satoshis: utxo.value,
             locking_script: lockingScript,
+            unconfirmed_depth: confirmed ? 0 : REFILL_OUTPUT_DEPTH,
           });
           added++;
         }
+      }
+
+      // A confirmed output has no unconfirmed ancestors, so settling it frees
+      // the whole lineage behind it for spending again.
+      const depthResets = await markUtxosConfirmed(this.db, confirmedOutpoints);
+      if (depthResets > 0) {
+        utxoChainDepthResetsTotal.inc(depthResets);
       }
 
       for (const row of localRows) {
@@ -456,8 +564,17 @@ export class UtxoManager {
         }
       }
 
-      if (added > 0 || removed > 0) {
-        log.info({ icao: key, added, removed, onChainTotal: onChain.length }, "Aircraft UTXO pool reconciled");
+      if (added > 0 || removed > 0 || depthResets > 0) {
+        log.info(
+          {
+            icao: key,
+            added,
+            removed,
+            depthResets,
+            onChainTotal: onChain.length,
+          },
+          "Aircraft UTXO pool reconciled",
+        );
       }
 
       await this.refreshMetrics(key);
@@ -487,6 +604,13 @@ export class UtxoManager {
       .orderBy("satoshis", "asc") as UTXORecord[];
 
     if (utxos.length <= threshold) return;
+
+    // Consolidation spends every input at once, so its single output sits one
+    // level below the deepest of them.
+    const consolidatedDepth = utxos.reduce(
+      (deepest, utxo) => Math.max(deepest, Number(utxo.unconfirmed_depth ?? 0) || 0),
+      0,
+    ) + 1;
 
     log.info({ icao, utxoCount: utxos.length }, "Starting UTXO consolidation");
 
@@ -519,6 +643,7 @@ export class UtxoManager {
           satoshis: changeOutput.satoshis,
           locking_script: changeOutput.lockingScript,
           is_locked: false,
+          unconfirmed_depth: consolidatedDepth,
         });
       });
 
@@ -547,18 +672,27 @@ export class UtxoManager {
   ): Promise<UtxoPoolState> {
     this.pruneExpiredCooldowns();
 
+    const maxDepth = this.getMaxUnconfirmedChainDepth();
     const [balanceRaw, utxoCount, unlockedRows] = await Promise.all([
       getUtxoPoolBalance(this.db, icao),
       getUtxoCount(this.db, icao),
       this.db("utxo_pool")
         .where({ aircraft_icao: icao, is_locked: false })
         .where("satoshis", ">=", MIN_USABLE_SATS)
-        .select("txid", "vout") as Promise<Array<{ txid: string; vout: number }>>,
+        .select("txid", "vout", "unconfirmed_depth") as Promise<
+          Array<{ txid: string; vout: number; unconfirmed_depth: number | string | null }>
+        >,
     ]);
 
     const balance = balanceRaw !== null ? Number(balanceRaw) : 0;
-    const unlockedUtxoCount = unlockedRows.length;
-    const readyUtxoCount = unlockedRows.filter(
+    // Outputs too deep in an unconfirmed chain are not spendable right now, so
+    // counting them as available would hide the need for a refill and let the
+    // write path keep discovering the shortfall one deferral at a time.
+    const shallowRows = unlockedRows.filter(
+      (row) => (Number(row.unconfirmed_depth ?? 0) || 0) < maxDepth,
+    );
+    const unlockedUtxoCount = shallowRows.length;
+    const readyUtxoCount = shallowRows.filter(
       (row) => !this.isUtxoCooling(row.txid, row.vout),
     ).length;
     const coolingUtxoCount = Math.max(0, unlockedUtxoCount - readyUtxoCount);
@@ -569,7 +703,26 @@ export class UtxoManager {
       unlockedUtxoCount,
       readyUtxoCount,
       coolingUtxoCount,
+      deepUtxoCount: Math.max(0, unlockedRows.length - unlockedUtxoCount),
     };
+  }
+
+  /**
+   * Frees outputs whose creating transaction has been proved into a block.
+   *
+   * This is what keeps the depth ceiling from becoming a ratchet on a healthy
+   * wallet: writes push depth up, confirmations pull it back to zero.
+   */
+  async settleConfirmedChainDepths(): Promise<number> {
+    const reset = await resetConfirmedUtxoDepths(this.db);
+    if (reset > 0) {
+      utxoChainDepthResetsTotal.inc(reset);
+      log.debug(
+        { reset },
+        "Reset unconfirmed chain depth for pool outputs confirmed on-chain",
+      );
+    }
+    return reset;
   }
 
   async purgeSubThresholdUtxos(): Promise<number> {
