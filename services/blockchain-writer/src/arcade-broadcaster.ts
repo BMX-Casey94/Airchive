@@ -31,6 +31,12 @@ export const ARCADE_STATUS = {
   SENT_TO_NETWORK: "SENT_TO_NETWORK",
   ACCEPTED_BY_NETWORK: "ACCEPTED_BY_NETWORK",
   SEEN_ON_NETWORK: "SEEN_ON_NETWORK",
+  /**
+   * GorillaPool's propagated status. It means the same thing as
+   * SEEN_ON_NETWORK: more than one node has the transaction. It is not
+   * SEEN_IN_ORPHAN_MEMPOOL, which is still waiting on a parent.
+   */
+  SEEN_MULTIPLE_NODES: "SEEN_MULTIPLE_NODES",
   SEEN_IN_ORPHAN_MEMPOOL: "SEEN_IN_ORPHAN_MEMPOOL",
   MINED: "MINED",
   REJECTED: "REJECTED",
@@ -92,6 +98,7 @@ export const DEFAULT_ARCADE_CONFIG: Omit<ArcadeBroadcasterConfig, "url" | "callb
 /** Statuses that mean the network has the transaction and its change is spendable. */
 const SPENDABLE_STATUSES = new Set<string>([
   ARCADE_STATUS.SEEN_ON_NETWORK,
+  ARCADE_STATUS.SEEN_MULTIPLE_NODES,
   ARCADE_STATUS.ACCEPTED_BY_NETWORK,
   ARCADE_STATUS.MINED,
 ]);

@@ -104,6 +104,29 @@ describe("Arcade seen-before-spend gate", () => {
     await broadcaster.closeCallbackReceiver();
   });
 
+  it("accepts GorillaPool SEEN_MULTIPLE_NODES as the transaction being on the network", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (String(url).includes(`/tx/${TX_A}`)) {
+        return json({ txid: TX_A, txStatus: "SEEN_MULTIPLE_NODES" });
+      }
+      return json([{ txid: TX_A, txStatus: "RECEIVED" }]);
+    }));
+    const broadcaster = new ArcadeBroadcaster(
+      {
+        url: "http://arcade.test",
+        callbackToken: "tok",
+        awaitSeenBeforeSpend: true,
+        maxBatchSize: 1,
+        seenGateTimeoutMs: 3_000,
+      },
+      fallback(),
+    );
+
+    const result = await broadcaster.broadcast(fakeTx(TX_A), "ABCDEF");
+    expect(result).toMatchObject({ status: "SEEN_ON_NETWORK", txid: TX_A });
+    await broadcaster.closeCallbackReceiver();
+  });
+
   it("does not resolve success when the seen gate times out", async () => {
     vi.stubGlobal("fetch", vi.fn(async (url: string) => {
       if (String(url).includes(`/tx/${TX_A}`)) return new Response("", { status: 404 });
