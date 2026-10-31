@@ -10,8 +10,11 @@ const RECONNECT_BASE_MS = 1_000;
 const RECONNECT_MAX_MS = 30_000;
 /** Arcade sends periodic comments; silence well beyond that means a dead socket. */
 const IDLE_TIMEOUT_MS = 90_000;
-/** Response headers should arrive immediately; anything slower is a stuck proxy. */
-const CONNECT_TIMEOUT_MS = 15_000;
+/**
+ * Cloudflare-fronted instances (e.g. arcade-eu-1.bsvblockchain.tech) hold the response
+ * headers until the first 15 s keepalive, so this must cover more than one keepalive interval.
+ */
+const CONNECT_TIMEOUT_MS = 45_000;
 
 export interface ArcadeStatusEvent {
   txid: string;
