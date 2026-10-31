@@ -32,6 +32,18 @@ export const txBroadcastFailures = new Counter({
   registers: [registry],
 });
 
+export const networkSpentOutpointsQuarantinedTotal = new Counter({
+  name: "airchive_network_spent_outpoints_quarantined_total",
+  help: "Outpoints quarantined because the network reported them already spent (UTXO_SPENT)",
+  registers: [registry],
+});
+
+export const spendConflictRejectionsTotal = new Counter({
+  name: "airchive_spend_conflict_rejections_total",
+  help: "Rejections that named an already-spent input; kept out of the spend governor's reject ratio",
+  registers: [registry],
+});
+
 export const txBroadcastRetryTotal = new Counter({
   name: "airchive_tx_broadcast_retries_total",
   help: "Total transient broadcast retries attempted",

@@ -62,12 +62,14 @@ import {
   registry,
   rejectRequeuesTotal,
   spendBlockedTotal,
+  spendConflictRejectionsTotal,
   statusEventsShedTotal,
   statusQueueDepth,
   writerWriteIngressTotal,
   writerWriteOutcomesTotal,
 } from "./metrics.js";
 import { SpendGovernor } from "./spend-governor.js";
+import { NetworkSpentRegistry, parseNetworkSpentOutpoints } from "./network-spent-outpoints.js";
 import { GovernedBroadcaster } from "./governed-broadcaster.js";
 import { broadcastHold } from "./broadcast-hold.js";
 import { startLostTxDetector } from "./lost-tx-detector.js";
@@ -540,6 +542,12 @@ async function main(): Promise<void> {
     spendGovernor.maxUnconfirmedChainDepth(),
   );
   const fundingUtxoManager = new FundingUtxoManager(db, woc);
+  const networkSpent = new NetworkSpentRegistry(db);
+  await networkSpent.load();
+  const excludeNetworkSpent = <T extends { tx_hash: string; tx_pos: number }>(utxos: T[]): T[] =>
+    networkSpent.filter(utxos);
+  utxoManager.setNetworkSpentFilter(excludeNetworkSpent);
+  fundingUtxoManager.setNetworkSpentFilter(excludeNetworkSpent);
   const writeBuffer = new WriteBuffer(db, broadcaster, utxoManager, vault);
   const autoRefill = new AutoRefillMonitor(
     config,
@@ -713,6 +721,24 @@ async function main(): Promise<void> {
       );
     }
 
+    // Quarantined before any reconcile below, which would otherwise re-import
+    // the outpoint from explorers that still list it as unspent.
+    const spentInputs = parseNetworkSpentOutpoints(rejection?.reason);
+    if (spentInputs.length > 0) {
+      await networkSpent.quarantine(spentInputs, txid);
+    }
+    // A spend of an input the network already holds as spent pays no fee and
+    // says our pool was stale, not that the network is refusing transactions.
+    // Counting it halted spending, which also stopped the retries that clear
+    // such inputs out of the pool.
+    const noteRejectionForGovernor = (): void => {
+      if (spentInputs.length > 0) {
+        spendConflictRejectionsTotal.inc();
+        return;
+      }
+      spendGovernor.noteTerminalRejection(broadcastAtMs);
+    };
+
     const settled = await settleTerminalRejectionMark(db, txid, {
       status: rejection?.status ?? "REJECTED",
       reason: rejection?.reason
@@ -743,7 +769,7 @@ async function main(): Promise<void> {
     if (settled.kind === "missing") {
       // A refill or split has no tx_results row. Its change and aircraft outputs
       // are still in the pools and would be spent as if the rejection never happened.
-      spendGovernor.noteTerminalRejection(broadcastAtMs);
+      noteRejectionForGovernor();
       utxoManager.noteOutputsInvalidated(txid, settled.aircraftVouts);
       fundingUtxoManager.noteOutputsInvalidated(txid, settled.fundingVouts);
       try {
@@ -776,7 +802,7 @@ async function main(): Promise<void> {
       return "missing";
     }
 
-    spendGovernor.noteTerminalRejection(broadcastAtMs);
+    noteRejectionForGovernor();
 
     log.error(
       {

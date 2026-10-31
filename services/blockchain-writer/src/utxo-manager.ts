@@ -134,11 +134,17 @@ export class UtxoManager {
   private maxUnconfirmedChainDepth: () => number = () =>
     DEFAULT_MAX_UNCONFIRMED_CHAIN_DEPTH;
   private readonly recentSpends = new RecentSpendLedger();
+  private excludeNetworkSpent: <T extends WocUtxo>(utxos: T[]) => T[] = (utxos) => utxos;
 
   constructor(
     private readonly db: Knex,
     private readonly woc: ChainLookup,
   ) {}
+
+  /** Drops outpoints the network reports as already spent from every chain read. */
+  setNetworkSpentFilter(filter: <T extends WocUtxo>(utxos: T[]) => T[]): void {
+    this.excludeNetworkSpent = filter;
+  }
 
   /**
    * Supplies the live ceiling on unconfirmed chain depth. It is a callback
@@ -934,7 +940,7 @@ export class UtxoManager {
     if (!utxos) {
       throw new Error(`WoC UTXO fetch returned no body for ${address}`);
     }
-    return utxos;
+    return this.excludeNetworkSpent(utxos);
   }
 
   private getOutpointKey(txid: string, vout: number): string {

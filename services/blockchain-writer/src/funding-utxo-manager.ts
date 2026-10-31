@@ -114,11 +114,17 @@ export class FundingUtxoManager {
   private readonly chainDepth = new FundingChainDepth();
   /** Set once startup or reconcile has seen the funding key. Reclaim refuses to run without it. */
   private fundingWif: string | null = null;
+  private excludeNetworkSpent: <T extends WocUtxo>(utxos: T[]) => T[] = (utxos) => utxos;
 
   constructor(
     private readonly db: Knex,
     private readonly woc: ChainLookup,
   ) {}
+
+  /** Drops outpoints the network reports as already spent from every chain read. */
+  setNetworkSpentFilter(filter: <T extends WocUtxo>(utxos: T[]) => T[]): void {
+    this.excludeNetworkSpent = filter;
+  }
 
   /**
    * Populate the local funding pool from WoC if it is empty.
@@ -928,7 +934,7 @@ export class FundingUtxoManager {
     if (!utxos) {
       throw new Error("WoC fetch returned no body for the funding wallet");
     }
-    return utxos;
+    return this.excludeNetworkSpent(utxos);
   }
 
   private async refreshMetrics(): Promise<void> {
