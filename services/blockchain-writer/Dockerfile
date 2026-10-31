@@ -48,6 +48,8 @@ COPY --from=build /app/packages/logger/dist packages/logger/dist
 COPY --from=build /app/packages/logger/package.json packages/logger/
 COPY --from=build /app/services/blockchain-writer/dist services/blockchain-writer/dist
 COPY --from=build /app/services/blockchain-writer/package.json services/blockchain-writer/
+# Operator recovery script. The rest of scripts/ is not part of the runtime image.
+COPY --from=build /app/services/blockchain-writer/scripts/recover-lost-writes.mjs services/blockchain-writer/scripts/recover-lost-writes.mjs
 COPY --from=deps /app/node_modules ./node_modules
 # pnpm keeps each project's runtime dependencies in that project's own
 # node_modules as relative symlinks into /app/node_modules/.pnpm, so the

@@ -266,7 +266,12 @@ export type AirportSizeType =
   | "closed";
 
 export interface AirportInfo {
-  icao_code: string;
+  /**
+   * Four-character alphanumeric code safe for `varchar(4)`, or null when the
+   * airport has only a local ident. Null keeps the airport in geographic
+   * matching; it must not be written to an ICAO column.
+   */
+  icao_code: string | null;
   name: string;
   lat: number;
   lon: number;

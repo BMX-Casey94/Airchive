@@ -191,7 +191,7 @@ export const statusQueueDepth = new Gauge({
 
 export const spendPostureGauge = new Gauge({
   name: "airchive_spend_posture",
-  help: "Spend governor posture (0 NORMAL, 1 CAUTIOUS, 2 HALTED)",
+  help: "Spend governor posture (0 NORMAL, 1 CAUTIOUS, 2 HALTED, 3 PROBING)",
   registers: [registry],
 });
 
@@ -212,6 +212,14 @@ export const spendBlockedTotal = new Counter({
   name: "airchive_spend_blocked_total",
   help: "Spend attempts refused by the governor, by call site",
   labelNames: ["site"] as const,
+  registers: [registry],
+});
+
+export const spendStaleRejectsTotal = new Counter({
+  name: "airchive_spend_stale_rejects_total",
+  help:
+    "Terminal rejections that arrived while spending was already stopped, so they "
+    + "describe transactions paid for before the halt and are excluded from the ratio",
   registers: [registry],
 });
 
@@ -289,6 +297,26 @@ export const fundingRunwayHours = new Gauge({
 export const fundingRecoveriesTotal = new Counter({
   name: "airchive_funding_recoveries_total",
   help: "Completed treasury recoveries after a dry period",
+  registers: [registry],
+});
+
+export const poolSweepRowsTotal = new Counter({
+  name: "airchive_pool_sweep_rows_total",
+  help: "Pool rows inserted or deleted by the startup chain sweep",
+  labelNames: ["action"] as const,
+  registers: [registry],
+});
+
+export const poolSweepFailuresTotal = new Counter({
+  name: "airchive_pool_sweep_failures_total",
+  help: "Aircraft or treasury pools whose startup sweep could not read the chain",
+  labelNames: ["pool"] as const,
+  registers: [registry],
+});
+
+export const lostTxTotal = new Counter({
+  name: "airchive_lost_tx_total",
+  help: "SEEN_ON_NETWORK transactions confirmed absent from the chain",
   registers: [registry],
 });
 

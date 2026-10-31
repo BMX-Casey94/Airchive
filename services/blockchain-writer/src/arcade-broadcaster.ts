@@ -8,12 +8,17 @@ import {
   txBroadcastLatency,
 } from "./metrics.js";
 import {
+  NOT_SEEN_ON_NETWORK_CODE,
   type ArcBroadcasterState,
   type BroadcastOptions,
   type BroadcastOutcome,
   type Broadcaster,
 } from "./broadcaster.js";
 import { computeTxid } from "./tx-builder.js";
+import {
+  arcadeAwaitSeenBeforeSpendEnabled,
+  shouldAwaitSeenBeforeSpend,
+} from "./live-path-policy.js";
 
 const log = createLogger({ service: "blockchain-writer:arcade" });
 
@@ -65,6 +70,15 @@ export interface ArcadeBroadcasterConfig {
    * declaring the write failed. Arcade typically reaches this state in ~3s.
    */
   seenGateTimeoutMs: number;
+  /**
+   * When true, a 2xx of RECEIVED, SENT_TO_NETWORK, ACCEPTED_BY_NETWORK, or a
+   * silent accept waits for SEEN_ON_NETWORK before this broadcast() resolves.
+   * Only that transaction's caller waits — other submissions in the batch
+   * resolve on their own — so the 1 Hz path is not globally serialised.
+   * Default false keeps today's timing. hasSeenOnNetworkGate stays true either
+   * way: callers still refuse to record an orphan-mempool result as a spend.
+   */
+  awaitSeenBeforeSpend?: boolean;
 }
 
 export const DEFAULT_ARCADE_CONFIG: Omit<ArcadeBroadcasterConfig, "url" | "callbackToken"> = {
@@ -113,7 +127,13 @@ export class ArcadeBroadcaster extends EventEmitter implements Broadcaster {
   private inFlight = 0;
   private healthy = true;
   private readonly seenWaiters = new Map<string, (spendable: boolean) => void>();
+  private readonly awaitSeenBeforeSpend: boolean;
 
+  /**
+   * Callers use this to refuse an optimistic spend when Arcade reports the
+   * orphan mempool. It stays true whether or not ARCADE_AWAIT_SEEN_BEFORE_SPEND
+   * is enabled; that flag only adds a wait before a not-yet-seen 2xx is success.
+   */
   readonly hasSeenOnNetworkGate = true;
 
   constructor(
@@ -123,6 +143,8 @@ export class ArcadeBroadcaster extends EventEmitter implements Broadcaster {
   ) {
     super();
     this.config = { ...DEFAULT_ARCADE_CONFIG, ...config };
+    this.awaitSeenBeforeSpend = config.awaitSeenBeforeSpend
+      ?? arcadeAwaitSeenBeforeSpendEnabled();
     this.fallback = fallback;
 
     // Status updates from the ARC fallback must still reach the writer.
@@ -194,7 +216,7 @@ export class ArcadeBroadcaster extends EventEmitter implements Broadcaster {
     const start = performance.now();
 
     try {
-      const { outcomes, httpStatus } = await this.postBatch(batch);
+      const { outcomes, statuses, httpStatus } = await this.postBatch(batch);
       const latency = (performance.now() - start) / 1_000;
 
       await Promise.all(
@@ -224,15 +246,35 @@ export class ArcadeBroadcaster extends EventEmitter implements Broadcaster {
             txid: submission.txid,
             status: "SEEN_ON_NETWORK" as const,
           };
+          const txStatus = statuses.get(submission.txid) ?? "";
 
           // A batch member whose parent is still propagating lands in the orphan
           // mempool. Rather than assuming it will be accepted — which is what
           // previously let the writer spend change the network had never seen —
           // wait for Arcade to confirm the transaction really is on the network.
+          // Each submission awaits its own gate; resolving one does not wait for
+          // the rest of the batch, so aircraft writes are not serialised on it.
           if (outcome.status === "FAILED" && outcome.code === "SEEN_IN_ORPHAN_MEMPOOL") {
             const spendable = await this.awaitSeenOnNetwork(submission.txid);
             if (spendable) {
               outcome = { txid: submission.txid, status: "SEEN_ON_NETWORK" };
+            }
+          } else if (
+            outcome.status === "SEEN_ON_NETWORK"
+            && shouldAwaitSeenBeforeSpend({
+              enabled: this.awaitSeenBeforeSpend,
+              httpStatus,
+              txStatus,
+            })
+          ) {
+            const spendable = await this.awaitSeenOnNetwork(submission.txid);
+            if (!spendable) {
+              outcome = {
+                txid: submission.txid,
+                status: "FAILED",
+                code: NOT_SEEN_ON_NETWORK_CODE,
+                description: "Transaction was not seen on the network before the spend gate timed out",
+              };
             }
           }
 
@@ -285,7 +327,11 @@ export class ArcadeBroadcaster extends EventEmitter implements Broadcaster {
    */
   private async postBatch(
     batch: PendingSubmission[],
-  ): Promise<{ outcomes: Map<string, BroadcastOutcome>; httpStatus: number }> {
+  ): Promise<{
+    outcomes: Map<string, BroadcastOutcome>;
+    statuses: Map<string, string>;
+    httpStatus: number;
+  }> {
     const single = batch.length === 1;
     const url = `${this.baseUrl}${single ? "/tx" : "/txs"}`;
     const body = concatExtendedFormat(batch);
@@ -314,19 +360,24 @@ export class ArcadeBroadcaster extends EventEmitter implements Broadcaster {
     }
 
     const raw = await res.text();
-    return { outcomes: this.parseResponses(raw, res.status), httpStatus: res.status };
+    const parsed = this.parseResponses(raw, res.status);
+    return { ...parsed, httpStatus: res.status };
   }
 
-  private parseResponses(raw: string, httpStatus: number): Map<string, BroadcastOutcome> {
+  private parseResponses(
+    raw: string,
+    httpStatus: number,
+  ): { outcomes: Map<string, BroadcastOutcome>; statuses: Map<string, string> } {
     const outcomes = new Map<string, BroadcastOutcome>();
-    if (raw.trim() === "") return outcomes;
+    const statuses = new Map<string, string>();
+    if (raw.trim() === "") return { outcomes, statuses };
 
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
     } catch {
       // A 2xx with an unparseable body still means Arcade accepted the batch.
-      if (httpStatus < 400) return outcomes;
+      if (httpStatus < 400) return { outcomes, statuses };
       throw new Error(`Arcade returned ${httpStatus} with unparseable body`);
     }
 
@@ -337,10 +388,12 @@ export class ArcadeBroadcaster extends EventEmitter implements Broadcaster {
     for (const entry of entries) {
       const txid = entry.txid?.trim();
       if (!txid) continue;
+      const txStatus = String(entry.txStatus ?? "").trim().toUpperCase();
+      statuses.set(txid, txStatus);
       outcomes.set(txid, toOutcome(txid, entry, httpStatus));
     }
 
-    return outcomes;
+    return { outcomes, statuses };
   }
 
   /**

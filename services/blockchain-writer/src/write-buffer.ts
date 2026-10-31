@@ -20,6 +20,7 @@ import {
   isDependencyPendingBroadcastFailure,
   isLocalBackpressureBroadcastFailure,
   isTransientBroadcastFailure,
+  isUnsentBroadcastError,
   type Broadcaster,
 } from "./broadcaster.js";
 import type { UtxoManager } from "./utxo-manager.js";
@@ -34,6 +35,7 @@ import {
 } from "./metrics.js";
 import type { AutoRefillMonitor } from "./auto-refill.js";
 import type { SpendGovernor } from "./spend-governor.js";
+import { broadcastHold } from "./broadcast-hold.js";
 
 const log = createLogger({ service: "blockchain-writer:write-buffer" });
 
@@ -146,9 +148,10 @@ export class WriteBuffer {
   }
 
   /**
-   * Pauses ageing-out of preserved backlog while recovery is draining it.
-   * Without this, a long RECOVERING window can drop 24h-old outage samples
-   * that have not yet been broadcast.
+   * Pauses ageing-out of preserved backlog. The funding machine keeps this
+   * true for the whole of RECOVERING and afterwards while an outage backlog
+   * is still shielded, so leaving RECOVERING cannot drop rows that have not
+   * yet been broadcast.
    */
   setPrunePauseGate(gate: () => boolean): void {
     this.prunePauseGate = gate;
@@ -183,7 +186,8 @@ export class WriteBuffer {
   ): Promise<void> {
     const preserveStream =
       this.fundingDryGate?.() === true
-      || this.spendGovernor?.allowsBroadcast() === false;
+      || this.spendGovernor?.allowsBroadcast() === false
+      || broadcastHold.blocksBroadcast(icao);
 
     if (recordType === RecordTypeEnum.TELEMETRY && !preserveStream) {
       const result = await upsertPendingTelemetryWrite(this.db, {
@@ -283,10 +287,13 @@ export class WriteBuffer {
     try {
       // Checked before anything else: a halted governor means no transaction
       // may be paid for, whatever the backlog looks like.
-      if (this.spendGovernor && !this.spendGovernor.allowsBroadcast()) {
+      if (
+        broadcastHold.isHeld()
+        || (this.spendGovernor && !this.spendGovernor.allowsBroadcast())
+      ) {
         spendBlockedTotal.inc({ site: "retry_cycle" });
         log.debug(
-          { posture: this.spendGovernor.getPosture() },
+          { posture: this.spendGovernor?.getPosture(), sweepHold: broadcastHold.isHeld() },
           "Skipping retry cycle — spending is halted, backlog held in Postgres",
         );
         return 0;
@@ -423,6 +430,21 @@ export class WriteBuffer {
       return {
         successCount,
         deferredCount,
+        failedByIcao,
+        deferredByIcao,
+        refillRequested,
+      };
+    }
+
+    if (broadcastHold.blocksAircraft(icao)) {
+      log.debug(
+        { icao, writes: writes.length },
+        "Skipping retry — this aircraft pool has not been reconciled",
+      );
+      deferredByIcao.set(icao, writes.length);
+      return {
+        successCount: 0,
+        deferredCount: writes.length,
         failedByIcao,
         deferredByIcao,
         refillRequested,
@@ -631,7 +653,9 @@ export class WriteBuffer {
       // the pool. Once it has been broadcast, unlocking it risks a second
       // transaction spending it, and the resulting conflict silently kills the
       // aircraft's whole chain — so leave it locked and let the chain decide.
-      if (utxoAcquired && !broadcastAttempted) {
+      // A refusal raised inside the writer is the exception: nothing was sent,
+      // so the doubt that justifies holding the input does not exist.
+      if (utxoAcquired && (!broadcastAttempted || isUnsentBroadcastError(err))) {
         await this.utxoManager
           .releaseUtxo(utxoTxid, utxoVout)
           .catch(() => {});

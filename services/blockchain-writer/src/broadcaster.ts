@@ -61,22 +61,62 @@ export const BroadcastPriority = {
   CONSOLIDATION: 80,
 } as const;
 
+/**
+ * The writer posted the transaction but did not observe it on the network
+ * before the spend gate closed. Callers must not record a spend, and must not
+ * hard-delete the input: the upstream may still accept it.
+ */
+export const NOT_SEEN_ON_NETWORK_CODE = "NOT_SEEN_ON_NETWORK";
+
+const DEPENDENCY_PENDING_CODES = new Set([
+  "SEEN_IN_ORPHAN_MEMPOOL",
+  NOT_SEEN_ON_NETWORK_CODE,
+]);
+
 export function isDependencyPendingBroadcastFailure(
   result: Pick<BroadcastOutcome, "status" | "code">,
 ): boolean {
-  return result.status === "FAILED" && result.code === "SEEN_IN_ORPHAN_MEMPOOL";
+  return result.status === "FAILED"
+    && DEPENDENCY_PENDING_CODES.has(String(result.code ?? "").trim().toUpperCase());
 }
 
+/**
+ * Refusals that never reached an upstream. They are the writer declining to
+ * send, so the caller must hold the payload and its inputs untouched rather
+ * than treating the transaction as spent or failed on the network.
+ */
 const LOCAL_BACKPRESSURE_CODES = new Set([
   "ARC_QUEUE_SATURATED",
   "ARC_CIRCUIT_OPEN",
+  "SPEND_HALTED",
 ]);
+
+/** Code returned when the spend governor refuses a broadcast outright. */
+export const SPEND_HALTED_CODE = "SPEND_HALTED";
 
 export function isLocalBackpressureBroadcastFailure(
   result: Pick<BroadcastOutcome, "status" | "code">,
 ): boolean {
   return result.status === "FAILED"
     && LOCAL_BACKPRESSURE_CODES.has(String(result.code ?? "").trim().toUpperCase());
+}
+
+/** Message every call site raises when it turns a local refusal into an error. */
+export const LOCAL_BACKPRESSURE_ERROR_PREFIX = "Broadcast local backpressure";
+
+/**
+ * True for a failure the writer raised itself, before any bytes reached an
+ * upstream.
+ *
+ * The distinction decides what happens to the input. After a timeout or a 5xx
+ * the writer cannot say whether the network holds the transaction, so the input
+ * stays locked until chain truth settles it. A local refusal carries no such
+ * doubt — nothing was sent — so holding the input would strand good coin, empty
+ * the aircraft's pool and provoke refills for funds that were never spent.
+ */
+export function isUnsentBroadcastError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err ?? "");
+  return message.includes(LOCAL_BACKPRESSURE_ERROR_PREFIX);
 }
 
 const TRANSIENT_FAILURE_CODES = new Set([
@@ -90,6 +130,44 @@ const TRANSIENT_FAILURE_CODES = new Set([
   "TYPEERROR",
 ]);
 
+const EXPLICIT_TERMINAL_REJECT_CODES = new Set([
+  "REJECTED",
+  "DOUBLE_SPEND_ATTEMPTED",
+]);
+
+/**
+ * Transport-only phrases. A bare "network" match is deliberately absent: Arcade
+ * rejection text such as "not seen on the network" is not a socket failure, and
+ * treating it as one unlocks an input the upstream has already refused.
+ */
+const TRANSPORT_DESCRIPTION_PHRASES = [
+  "fetch failed",
+  "failed to fetch",
+  "networkerror",
+  "network error",
+  "network request failed",
+  "network connection",
+  "timeout",
+  "timed out",
+  "temporarily unavailable",
+  "connection reset",
+  "connection refused",
+  "econnreset",
+  "econnrefused",
+  "enotfound",
+  "eai_again",
+  "socket",
+  "aborted",
+];
+
+function isExplicitTerminalReject(code: string, description: string): boolean {
+  if (EXPLICIT_TERMINAL_REJECT_CODES.has(code)) return true;
+  const descriptionStatus = description.trim().toUpperCase();
+  if (EXPLICIT_TERMINAL_REJECT_CODES.has(descriptionStatus)) return true;
+  if (descriptionStatus.includes("DOUBLE_SPEND_ATTEMPTED")) return true;
+  return /^REJECTED\b/.test(descriptionStatus);
+}
+
 export function isTransientBroadcastFailure(
   result: Pick<BroadcastOutcome, "status" | "code" | "description">,
 ): boolean {
@@ -97,17 +175,14 @@ export function isTransientBroadcastFailure(
 
   const code = String(result.code ?? "").trim().toUpperCase();
   const description = String(result.description ?? "").trim().toLowerCase();
-  if (code === "SEEN_IN_ORPHAN_MEMPOOL") return false;
+  // An explicit rejection is terminal even when the reason mentions the network
+  // or a timeout. Only a transport failure may be retried.
+  if (isExplicitTerminalReject(code, description)) return false;
+  if (DEPENDENCY_PENDING_CODES.has(code)) return false;
   if (LOCAL_BACKPRESSURE_CODES.has(code)) return false;
   if (TRANSIENT_FAILURE_CODES.has(code)) return true;
 
-  return description.includes("fetch failed")
-    || description.includes("network")
-    || description.includes("timeout")
-    || description.includes("timed out")
-    || description.includes("temporarily unavailable")
-    || description.includes("connection reset")
-    || description.includes("socket");
+  return TRANSPORT_DESCRIPTION_PHRASES.some((phrase) => description.includes(phrase));
 }
 
 export interface ArcCallbackPayload {

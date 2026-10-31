@@ -82,6 +82,9 @@ const FUNDING_SELECTION_MESSAGES: Record<FundingSelectionReason, string> = {
   insufficient_within_input_cap:
     "TREASURY FRAGMENTED — the balance is sufficient but spread across more "
     + "outputs than one refill may consume; consolidation is required.",
+  unconfirmed_chain_too_deep:
+    "TREASURY CHAIN DEPTH — funding outputs in this process sit too deep in an "
+    + "unconfirmed chain to extend. Waiting for a confirmation, not consolidation.",
 };
 
 /**

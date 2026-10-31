@@ -111,8 +111,22 @@ export interface FundingRecoveryConfig {
   dryPollMaxMs: number;
   /** Minimum gap between repeat DRY alerts so an outage does not spam. */
   alertRepeatMs: number;
-  /** Pending writes drained per retry cycle while recovering, to avoid a stampede. */
+  /**
+   * Retained so an existing deployment that sets FUNDING_RECOVERY_DRAIN_BATCH
+   * still parses. Recovery no longer drains the backlog itself; the write-buffer
+   * retry loop does, and waiting on it was holding RECOVERING open.
+   */
   recoveryDrainBatchSize: number;
+  /** Attempts per recovery step, including the first. Clamped to 1..5 at use. */
+  recoveryStepAttempts: number;
+  /** Deadline for one attempt of a recovery step. A timeout is not retried. */
+  recoveryStepTimeoutMs: number;
+  /**
+   * Maximum miner fees, in satoshis, a treasury split may pay while chasing
+   * FUNDING_POOL_SPLIT_TARGET. The outputs return to the funding address; this
+   * caps the fee so a split cannot drain the wallet.
+   */
+  splitMaxCostSats: number;
 }
 
 function requireEnv(name: string): string {
@@ -126,6 +140,13 @@ function requireEnv(name: string): string {
 function optionalEnv(name: string, fallback: string): string {
   const value = process.env[name];
   return value !== undefined && value !== "" ? value : fallback;
+}
+
+/** Non-negative integer from the environment. A blank or garbage value uses the fallback. */
+function finiteEnvInt(name: string, fallback: number): number {
+  const parsed = Number(optionalEnv(name, String(fallback)));
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return Math.floor(parsed);
 }
 
 function buildArcEndpoints(): ArcEndpointConfig[] {
@@ -170,6 +191,16 @@ function buildSpendGuardConfig(): SpendGuardConfig {
     cautiousRatio: Number(optionalEnv("SPEND_GUARD_CAUTIOUS_RATIO", "0.08")),
     haltRatio: Number(optionalEnv("SPEND_GUARD_HALT_RATIO", "0.25")),
     haltCooldownMs: Number(optionalEnv("SPEND_GUARD_HALT_COOLDOWN_MS", "300000")),
+    // Doubling per repeat halt tops out at an hour, so a persistently refusing
+    // upstream costs one small trial per hour rather than one every five minutes.
+    haltCooldownMaxMs: Number(
+      optionalEnv("SPEND_GUARD_HALT_COOLDOWN_MAX_MS", "3600000"),
+    ),
+    // Acceptance is reported at broadcast time while rejection arrives seconds
+    // later, so a resume is blind for as long as the upstream takes to answer.
+    // The trial caps what that blind spot can cost.
+    probeBudget: Number(optionalEnv("SPEND_GUARD_PROBE_BUDGET", "20")),
+    probeSettleMs: Number(optionalEnv("SPEND_GUARD_PROBE_SETTLE_MS", "45000")),
     // A refill output is itself unconfirmed, so it starts at depth 1 and this
     // ceiling permits a short chain of writes behind it before the pool insists
     // on settled funds.
@@ -319,6 +350,9 @@ export function loadConfig(): Config {
       recoveryDrainBatchSize: Number(
         optionalEnv("FUNDING_RECOVERY_DRAIN_BATCH", "25"),
       ),
+      recoveryStepAttempts: finiteEnvInt("FUNDING_RECOVERY_STEP_ATTEMPTS", 3),
+      recoveryStepTimeoutMs: finiteEnvInt("FUNDING_RECOVERY_STEP_TIMEOUT_MS", 120_000),
+      splitMaxCostSats: finiteEnvInt("FUNDING_SPLIT_MAX_COST_SATS", 50_000),
     },
     agentRefill: {
       enabled: optionalEnv("AGENT_REFILL_ENABLED", "true").toLowerCase() !== "false",

@@ -11,8 +11,9 @@
 #
 # The published host ports below are for local development and operator access,
 # and every one of them binds to ${HOST_BIND_ADDR}, which defaults to loopback.
-# Only nginx listens on all interfaces, because only nginx is meant to face the
-# internet.
+# nginx publishes 80 and 443 on all interfaces, and only when the legacy-nginx
+# profile is enabled. A plain `docker compose up` does not start it. On the
+# production host Caddy owns 80/443, so that profile stays off.
 #
 # Do not casually set HOST_BIND_ADDR to 0.0.0.0. Publishing a container port is
 # not filtered by firewalld: Docker writes its own rules into the DOCKER chain,
@@ -30,6 +31,15 @@ x-logging: &default-logging
   options:
     max-size: "10m"
     max-file: "5"
+
+# Incident logs for the writer, Arcade and ingestion. 50 MiB × 10 files is
+# 500 MiB per container, 1,500 MiB worst case across the three. Docker's "m"
+# unit is mebibytes (1024×1024). Every other service stays on the 10m × 5 cap.
+x-logging-verbose: &verbose-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "10"
 
 services:
   postgres:
@@ -145,7 +155,12 @@ services:
       ARCADE_KAFKA_BACKEND: memory
       ARCADE_KAFKA_CONSUMER_GROUP: arcade
       ARCADE_CHAINTRACKS_SERVER_ENABLED: "true"
-      ARCADE_P2P_DATAHUB_DISCOVERY: "true"
+      # No verified Teranode endpoint list lives in this repo beyond
+      # ARCADE_TERANODE_BROADCAST_URLS below (default https://arc.taal.com).
+      # Discovery therefore stays on unless the operator sets
+      # ARCADE_P2P_DATAHUB_DISCOVERY=false after choosing that list. While it
+      # is on, Arcade adds peer-supplied endpoints as well as the pinned URLs.
+      ARCADE_P2P_DATAHUB_DISCOVERY: "${ARCADE_P2P_DATAHUB_DISCOVERY:-true}"
       # Required: at least one Teranode broadcast endpoint, comma-separated.
       ARCADE_TERANODE_BROADCAST_URLS: ${ARCADE_TERANODE_BROADCAST_URLS:-https://arc.taal.com}
       ARCADE_TERANODE_AUTH_TOKEN: ${ARCADE_TERANODE_AUTH_TOKEN:-}
@@ -167,7 +182,7 @@ services:
       # Chaintracks header bootstrap and libp2p peer discovery take a while on
       # a cold volume.
       start_period: 120s
-    logging: *default-logging
+    logging: *verbose-logging
 
   # One-shot schema migration. Every service that touches Postgres waits for
   # this to exit zero, so a fresh volume comes up with a complete schema and a
@@ -225,7 +240,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
-    logging: *default-logging
+    logging: *verbose-logging
 
   blockchain-writer:
     build:
@@ -251,7 +266,12 @@ services:
       REDIS_PORT: 6379
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
-      ARCADE_URL: http://arcade:3011
+      # Broadcast path for writes. Defaults to the in-cluster Arcade. Set
+      # WRITER_ARCADE_URL=https://arcade.gorillapool.io to broadcast through the
+      # public GorillaPool Arcade: the self-hosted instance runs with peer
+      # discovery, and any discovered peer answering 200 masks a rejection
+      # from the real nodes.
+      ARCADE_URL: ${WRITER_ARCADE_URL:-http://arcade:3011}
       # Pinned so the healthcheck below and the service agree on the port.
       METRICS_PORT: 9091
     networks:
@@ -262,7 +282,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 45s
-    logging: *default-logging
+    logging: *verbose-logging
 
   overlay-node:
     build:
@@ -426,7 +446,12 @@ services:
       start_period: 30s
     logging: *default-logging
 
+  # Off unless `--profile legacy-nginx` is set. Nothing else depends_on this
+  # service. When the profile is enabled it binds 80 and 443 on all
+  # interfaces, which collides with a host Caddy.
   nginx:
+    profiles:
+      - legacy-nginx
     image: nginx:1.27-alpine
     container_name: airchive-nginx
     restart: unless-stopped

@@ -14,6 +14,12 @@ Environment=COMPOSE_PROJECT_NAME=airchive
 # Compose already sets restart: unless-stopped on every container, so this unit
 # exists to bring the stack up at boot and to give the operator a single
 # systemctl handle — not to supervise individual services.
+#
+# Do not add --profile legacy-nginx. nginx and certbot are in that profile
+# because Caddy on this host owns ports 80 and 443; this command must not
+# start them. Compose does not treat an inactive profile as an orphan, so
+# --remove-orphans leaves an already-running nginx or certbot container
+# running. Stop those two by name once; a later plain `up` will not start them.
 ExecStart=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --remove-orphans
 ExecStop=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.prod.yml stop
 ExecReload=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build --remove-orphans

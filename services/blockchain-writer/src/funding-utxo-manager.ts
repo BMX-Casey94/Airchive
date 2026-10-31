@@ -6,7 +6,6 @@ import {
   getFundingUtxoBalance,
   getFundingUtxoCount,
   insertFundingUtxo,
-  reclaimStaleFundingLocks,
   releaseFundingUtxo,
   unlockAllFundingUtxos,
   type FundingUtxoRow,
@@ -26,7 +25,18 @@ import {
   fundingPoolCount,
   utxoLocksReclaimedTotal,
 } from "./metrics.js";
+import { broadcastHold } from "./broadcast-hold.js";
 import { UTXO_LOCK_TTL_MS } from "./utxo-manager.js";
+import {
+  FundingChainDepth,
+  RecentSpendLedger,
+  coerceTimestampMs,
+  fundingPropagationCooldownMs,
+  outpointKey,
+  reconcileRecentGuardMs,
+  shouldRetainLocalDuringReconcile,
+  shouldSuppressChainReinsert,
+} from "./live-path-policy.js";
 
 const log = createLogger({ service: "blockchain-writer:funding-utxo" });
 
@@ -38,9 +48,29 @@ const MIN_USABLE_SATS = 546;
  * their own value.
  */
 const DEFAULT_MIN_SPLIT_OUTPUT_SATS = 100_000;
+
+/**
+ * True when the next reshape fee still fits under the operator ceiling.
+ * The ceiling is miner fees only: split outputs return to the funding address.
+ * A non-positive or non-finite ceiling (other than +Infinity) refuses the spend.
+ */
+export function splitFeeWithinBudget(
+  feesAlreadySpent: number,
+  nextFeeSats: number,
+  maxCostSats: number,
+): boolean {
+  if (maxCostSats === Number.POSITIVE_INFINITY) return true;
+  if (!Number.isFinite(maxCostSats) || maxCostSats <= 0) return false;
+  if (!Number.isFinite(feesAlreadySpent) || feesAlreadySpent < 0) return false;
+  if (!Number.isFinite(nextFeeSats) || nextFeeSats < 0) return false;
+  return feesAlreadySpent + nextFeeSats <= maxCostSats;
+}
 const MIN_RECONCILE_INTERVAL_MS = 30_000;
 const RATE_LIMITED_COOLDOWN_MS = 120_000;
-const FUNDING_PROPAGATION_COOLDOWN_MS = 500;
+
+function isConfirmedFundingHeight(height: number | null | undefined): boolean {
+  return typeof height === "number" && Number.isFinite(height) && height > 0;
+}
 
 interface WocUtxo {
   tx_hash: string;
@@ -53,7 +83,8 @@ export type FundingSelectionReason =
   | "ok"
   | "no_unlocked_candidates"
   | "all_candidates_cooling"
-  | "insufficient_within_input_cap";
+  | "insufficient_within_input_cap"
+  | "unconfirmed_chain_too_deep";
 
 export interface FundingSelectionDiagnostics {
   candidatesExamined: number;
@@ -69,10 +100,20 @@ export interface FundingSelection {
   diagnostics: FundingSelectionDiagnostics;
 }
 
+export interface FundingReconcileOutcome {
+  ok: boolean;
+  added: number;
+  removed: number;
+}
+
 export class FundingUtxoManager {
-  private reconcileInFlight: Promise<boolean> | null = null;
+  private reconcileInFlight: Promise<FundingReconcileOutcome> | null = null;
   private reconcileEarliestRetryAt = 0;
   private readonly fundingCooldownUntil = new Map<string, number>();
+  private readonly recentSpends = new RecentSpendLedger();
+  private readonly chainDepth = new FundingChainDepth();
+  /** Set once startup or reconcile has seen the funding key. Reclaim refuses to run without it. */
+  private fundingWif: string | null = null;
 
   constructor(
     private readonly db: Knex,
@@ -84,6 +125,7 @@ export class FundingUtxoManager {
    * Only called at startup or during explicit reconciliation.
    */
   async bootstrap(fundingWif: string): Promise<void> {
+    this.fundingWif = fundingWif;
     const existing = await getFundingUtxoCount(this.db);
     if (existing > 0) {
       log.info({ count: existing }, "Funding UTXO pool already populated, skipping bootstrap");
@@ -133,7 +175,10 @@ export class FundingUtxoManager {
         .forUpdate()
         .skipLocked() as FundingUtxoRow[];
 
-      const utxo = candidates.find((row) => !this.isFundingCooling(row.txid, row.vout));
+      const utxo = candidates.find((row) =>
+        !this.isFundingCooling(row.txid, row.vout)
+        && !this.chainDepth.exceedsCap(row.txid, row.vout),
+      );
       if (!utxo) return undefined;
 
       await trx("funding_utxo_pool")
@@ -166,17 +211,24 @@ export class FundingUtxoManager {
         .where({ is_locked: false })
         .where("satoshis", ">=", MIN_USABLE_SATS)
         .orderBy("satoshis", "desc")
-        .limit(cap * 4)
+        // Wide enough to see past large unconfirmed change that the depth cap
+        // refuses. The treasury split target is a few hundred outputs.
+        .limit(Math.max(cap * 4, 512))
         .forUpdate()
         .skipLocked() as FundingUtxoRow[];
 
       const selected: FundingUtxoRow[] = [];
       let cooling = 0;
+      let deepSkipped = 0;
       let total = 0;
       for (const row of candidates) {
         if (selected.length >= cap) break;
         if (this.isFundingCooling(row.txid, row.vout)) {
           cooling += 1;
+          continue;
+        }
+        if (this.chainDepth.exceedsCap(row.txid, row.vout)) {
+          deepSkipped += 1;
           continue;
         }
         selected.push(row);
@@ -204,9 +256,11 @@ export class FundingUtxoManager {
             inputCap: cap,
             reason: candidates.length === 0
               ? ("no_unlocked_candidates" as const)
-              : cooling >= candidates.length
-                ? ("all_candidates_cooling" as const)
-                : ("insufficient_within_input_cap" as const),
+              : selected.length === 0 && deepSkipped > 0 && deepSkipped + cooling >= candidates.length
+                ? ("unconfirmed_chain_too_deep" as const)
+                : cooling >= candidates.length
+                  ? ("all_candidates_cooling" as const)
+                  : ("insufficient_within_input_cap" as const),
           },
         };
       }
@@ -298,8 +352,15 @@ export class FundingUtxoManager {
     for (const input of spent) {
       this.clearFundingCooldown(input.txid, input.vout);
     }
-    if (changeTxid !== null && changeVout !== null && changeSats !== null && changeSats >= MIN_USABLE_SATS) {
-      this.setFundingCooldown(changeTxid, changeVout, FUNDING_PROPAGATION_COOLDOWN_MS);
+    const createdVouts = changeTxid !== null
+      && changeVout !== null
+      && changeSats !== null
+      && changeSats >= MIN_USABLE_SATS
+      ? [changeVout]
+      : [];
+    this.rememberSpend(spent, changeTxid, createdVouts);
+    if (createdVouts.length > 0 && changeTxid !== null && changeVout !== null) {
+      this.setFundingCooldown(changeTxid, changeVout, fundingPropagationCooldownMs());
     }
     await this.refreshMetrics();
   }
@@ -321,15 +382,62 @@ export class FundingUtxoManager {
   }
 
   async reclaimStaleLocks(ttlMs = UTXO_LOCK_TTL_MS): Promise<number> {
-    const reclaimed = await reclaimStaleFundingLocks(this.db, ttlMs);
+    if (!this.fundingWif) {
+      log.warn(
+        "Funding wallet is not bound — stale funding locks stay held rather than unlocking without a chain check",
+      );
+      return 0;
+    }
+    const loaded = await this.loadFundingChain(this.fundingWif);
+    if (!loaded) {
+      log.warn(
+        "Chain lookup unavailable — stale funding locks stay held until a later reclaim can verify them against the chain",
+      );
+      return 0;
+    }
+    const reclaimed = await this.unlockListedFunding(loaded.keys, new Date(Date.now() - ttlMs));
     if (reclaimed > 0) {
       utxoLocksReclaimedTotal.inc({ pool: "funding" }, reclaimed);
       log.warn(
         { reclaimed, ttlMs },
-        "Reclaimed funding UTXO locks held beyond TTL (orphaned by a failed refill)",
+        "Reclaimed funding UTXO locks the chain confirms are still unspent",
       );
     }
     return reclaimed;
+  }
+
+  /**
+   * Startup path. Reconcile, then unlock locked rows the chain still lists.
+   * A failed lookup leaves every lock held.
+   */
+  async unlockLocksListedUnspent(fundingWif: string): Promise<number> {
+    this.fundingWif = fundingWif;
+    const loaded = await this.loadFundingChain(fundingWif);
+    if (!loaded) {
+      log.warn(
+        "Chain lookup unavailable — funding UTXO locks stay held until a later reclaim can verify them against the chain",
+      );
+      return 0;
+    }
+    const unlocked = await this.unlockListedFunding(loaded.keys, null);
+    if (unlocked > 0) {
+      log.info(
+        { unlocked },
+        "Unlocked funding UTXOs the chain still lists as unspent",
+      );
+    }
+    return unlocked;
+  }
+
+  isFundingOutputConfirmed(txid: string, vout: number): boolean {
+    return this.chainDepth.isConfirmed(txid, vout);
+  }
+
+  noteOutputsInvalidated(txid: string, vouts: number[]): void {
+    for (const vout of vouts) {
+      this.clearFundingCooldown(txid, vout);
+      this.chainDepth.forget(txid, vout);
+    }
   }
 
   async getBalance(): Promise<{ balance: number; count: number }> {
@@ -351,6 +459,7 @@ export class FundingUtxoManager {
     broadcaster: Broadcaster,
     desiredMinCount = 80,
     minOutputSats = DEFAULT_MIN_SPLIT_OUTPUT_SATS,
+    maxCostSats = Number.POSITIVE_INFINITY,
   ): Promise<number> {
     const { count, balance } = await this.getBalance();
     if (count >= desiredMinCount) {
@@ -368,8 +477,10 @@ export class FundingUtxoManager {
     const floorSats = Math.max(minOutputSats, MIN_USABLE_SATS);
     const MIN_INPUT_SATS = OUTPUTS_PER_SPLIT * floorSats;
     const PROPAGATION_WAIT_MS = 2_000;
+    let feesSpent = 0;
+    let budgetExhausted = false;
 
-    for (let round = 0; round < MAX_ROUNDS; round++) {
+    for (let round = 0; round < MAX_ROUNDS && !budgetExhausted; round++) {
       const currentPool = await this.getBalance();
       const deficit = desiredMinCount - currentPool.count;
       if (deficit <= 0) break;
@@ -386,6 +497,15 @@ export class FundingUtxoManager {
         const remaining = desiredMinCount - currentPool.count - totalCreated;
         if (remaining <= 0) break;
         const outputCount = Math.max(2, Math.min(remaining, OUTPUTS_PER_SPLIT));
+        const plannedFee = estimateRefillFee(outputCount, false, 1);
+        if (!splitFeeWithinBudget(feesSpent, plannedFee, maxCostSats)) {
+          log.warn(
+            { feesSpent, plannedFee, maxCostSats, round, desiredMinCount },
+            "Stopping funding split — the next fee would exceed the configured cost ceiling",
+          );
+          budgetExhausted = true;
+          break;
+        }
 
         const utxo = await this.acquire(MIN_INPUT_SATS);
         if (!utxo) {
@@ -418,6 +538,7 @@ export class FundingUtxoManager {
             failedThisRound = true;
             break;
           }
+          feesSpent += estimateRefillFee(adjustedCount, false, 1);
           createdThisRound += splitResult;
           totalCreated += splitResult;
           continue;
@@ -430,6 +551,7 @@ export class FundingUtxoManager {
           failedThisRound = true;
           break;
         }
+        feesSpent += plannedFee;
         createdThisRound += splitResult;
         totalCreated += splitResult;
       }
@@ -439,7 +561,7 @@ export class FundingUtxoManager {
         "Funding split round complete",
       );
 
-      if (failedThisRound) break;
+      if (failedThisRound || budgetExhausted) break;
 
       const updatedPool = await this.getBalance();
       if (updatedPool.count >= desiredMinCount) break;
@@ -536,7 +658,10 @@ export class FundingUtxoManager {
         .forUpdate()
         .skipLocked() as FundingUtxoRow[];
 
-      const selected = rows.filter((row) => !this.isFundingCooling(row.txid, row.vout));
+      const selected = rows.filter((row) =>
+        !this.isFundingCooling(row.txid, row.vout)
+        && !this.chainDepth.exceedsCap(row.txid, row.vout),
+      );
       if (selected.length === 0) return [];
 
       await trx("funding_utxo_pool")
@@ -606,8 +731,9 @@ export class FundingUtxoManager {
           satoshis: out.satoshis,
           locking_script: out.lockingScript,
         });
-        this.setFundingCooldown(txid, out.vout, FUNDING_PROPAGATION_COOLDOWN_MS);
+        this.setFundingCooldown(txid, out.vout, fundingPropagationCooldownMs());
       }
+      this.rememberSpend(spent, txid, outputs.map((out) => out.vout));
 
       log.info(
         { txid, inputs: spent.length, inputSats, newOutputs: outputs.length },
@@ -625,20 +751,39 @@ export class FundingUtxoManager {
    * Reconcile local state against on-chain reality.
    * De-duplicated: if a reconciliation is in-flight, callers join it;
    * if one completed recently (or the chain API rate-limited us), callers
-   * skip and receive `false` so they do not treat a stale local pool as truth.
+   * skip and receive `{ ok: false }` so they do not treat a stale local pool as truth.
    */
-  async reconcile(fundingWif: string): Promise<boolean> {
-    if (Date.now() < this.reconcileEarliestRetryAt) return false;
-    if (this.reconcileInFlight) return this.reconcileInFlight;
+  async reconcile(
+    fundingWif: string,
+    options?: { force?: boolean },
+  ): Promise<FundingReconcileOutcome> {
+    this.fundingWif = fundingWif;
+    const force = options?.force === true;
+    const skipped: FundingReconcileOutcome = { ok: false, added: 0, removed: 0 };
+    if (!force && Date.now() < this.reconcileEarliestRetryAt) return skipped;
+    if (this.reconcileInFlight) {
+      const joined = await this.reconcileInFlight;
+      if (!force) return joined;
+    }
 
-    this.reconcileInFlight = this.doReconcile(fundingWif).finally(() => {
-      this.reconcileInFlight = null;
-    });
+    const task = this.loadFundingChain(fundingWif, force)
+      .then((loaded): FundingReconcileOutcome => (
+        loaded
+          ? { ok: true, added: loaded.added, removed: loaded.removed }
+          : skipped
+      ))
+      .finally(() => {
+        this.reconcileInFlight = null;
+      });
 
-    return this.reconcileInFlight;
+    this.reconcileInFlight = task;
+    return task;
   }
 
-  private async doReconcile(fundingWif: string): Promise<boolean> {
+  private async loadFundingChain(
+    fundingWif: string,
+    force = false,
+  ): Promise<{ keys: Set<string>; added: number; removed: number } | null> {
     const fundingKey = PrivateKey.fromWif(fundingWif);
     const address = fundingKey.toAddress();
     const pkh = derivePubKeyHash(fundingKey);
@@ -648,53 +793,131 @@ export class FundingUtxoManager {
     try {
       onChain = await this.fetchFromChain(address);
     } catch (err) {
-      const msg = (err as Error).message ?? "";
-      const cooldown = msg.includes("429")
-        ? RATE_LIMITED_COOLDOWN_MS
-        : MIN_RECONCILE_INTERVAL_MS;
-      this.reconcileEarliestRetryAt = Date.now() + cooldown;
-      log.warn({ err, retryInMs: cooldown }, "Funding reconciliation skipped — chain unreachable");
-      return false;
+      if (!force) {
+        const msg = (err as Error).message ?? "";
+        const cooldown = msg.includes("429")
+          ? RATE_LIMITED_COOLDOWN_MS
+          : MIN_RECONCILE_INTERVAL_MS;
+        this.reconcileEarliestRetryAt = Date.now() + cooldown;
+        log.warn({ err, retryInMs: cooldown }, "Funding reconciliation skipped — chain unreachable");
+      } else {
+        log.warn({ err }, "Funding reconciliation skipped — chain unreachable");
+      }
+      return null;
     }
 
     this.reconcileEarliestRetryAt = Date.now() + MIN_RECONCILE_INTERVAL_MS;
 
-    const onChainSet = new Set(onChain.map((u) => `${u.tx_hash}:${u.tx_pos}`));
+    const now = Date.now();
+    const guardMs = force ? 0 : reconcileRecentGuardMs();
+    const onChainSet = new Set(onChain.map((u) => outpointKey(u.tx_hash, u.tx_pos)));
 
-    const localRows = await this.db("funding_utxo_pool").select("txid", "vout");
-    const localSet = new Set(localRows.map((r: { txid: string; vout: number }) => `${r.txid.trim()}:${r.vout}`));
+    const localRows = await this.db("funding_utxo_pool").select("txid", "vout", "created_at") as Array<{
+      txid: string;
+      vout: number;
+      created_at?: unknown;
+    }>;
+    const localSet = new Set(
+      localRows.map((row) => outpointKey(String(row.txid), Number(row.vout))),
+    );
 
     let added = 0;
     let removed = 0;
+    let retained = 0;
+    let suppressed = 0;
 
-    for (const u of onChain) {
-      const key = `${u.tx_hash}:${u.tx_pos}`;
-      if (!localSet.has(key) && u.value >= MIN_USABLE_SATS) {
-        await insertFundingUtxo(this.db, {
-          txid: u.tx_hash,
-          vout: u.tx_pos,
-          satoshis: u.value,
-          locking_script: lockingScript,
-        });
-        added++;
+    for (const utxo of onChain) {
+      if (isConfirmedFundingHeight(utxo.height)) {
+        this.chainDepth.confirm(utxo.tx_hash, utxo.tx_pos);
       }
+      const key = outpointKey(utxo.tx_hash, utxo.tx_pos);
+      if (localSet.has(key) || utxo.value < MIN_USABLE_SATS) continue;
+      const spentAtMs = this.recentSpends.spentAtIfFresh(utxo.tx_hash, utxo.tx_pos, now, guardMs);
+      if (shouldSuppressChainReinsert({ nowMs: now, guardMs, spentAtMs })) {
+        suppressed++;
+        continue;
+      }
+      await insertFundingUtxo(this.db, {
+        txid: utxo.tx_hash,
+        vout: utxo.tx_pos,
+        satoshis: utxo.value,
+        locking_script: lockingScript,
+      });
+      added++;
     }
 
     for (const row of localRows) {
-      const key = `${(row.txid as string).trim()}:${row.vout}`;
-      if (!onChainSet.has(key)) {
-        await deleteFundingUtxo(this.db, (row.txid as string).trim(), row.vout as number);
-        this.clearFundingCooldown((row.txid as string).trim(), row.vout as number);
-        removed++;
+      const txid = String(row.txid).trim();
+      const vout = Number(row.vout);
+      if (onChainSet.has(outpointKey(txid, vout))) continue;
+      if (shouldRetainLocalDuringReconcile({
+        nowMs: now,
+        guardMs,
+        createdAtMs: coerceTimestampMs(row.created_at),
+        spentAtMs: this.recentSpends.spentAtIfFresh(txid, vout, now, guardMs),
+        creatingBroadcastAtMs: this.recentSpends.broadcastAtIfFresh(txid, now, guardMs),
+      })) {
+        retained++;
+        continue;
       }
+      await deleteFundingUtxo(this.db, txid, vout);
+      this.clearFundingCooldown(txid, vout);
+      this.chainDepth.forget(txid, vout);
+      removed++;
     }
 
-    if (added > 0 || removed > 0) {
-      log.info({ added, removed, onChainTotal: onChain.length }, "Funding pool reconciled");
+    if (added > 0 || removed > 0 || retained > 0 || suppressed > 0) {
+      log.info(
+        { added, removed, retained, suppressed, guardMs, onChainTotal: onChain.length },
+        "Funding pool reconciled",
+      );
     }
 
+    broadcastHold.unblockFunding();
     await this.refreshMetrics();
-    return true;
+    return { keys: onChainSet, added, removed };
+  }
+
+  private async unlockListedFunding(
+    listed: Set<string>,
+    staleBefore: Date | null,
+  ): Promise<number> {
+    let query = this.db("funding_utxo_pool").where({ is_locked: true });
+    if (staleBefore) {
+      query = query.where((builder) => {
+        void builder.where("locked_at", "<", staleBefore).orWhereNull("locked_at");
+      });
+    }
+    const rows = await query.select("txid", "vout") as Array<{ txid: string; vout: number }>;
+    let unlocked = 0;
+    for (const row of rows) {
+      const txid = String(row.txid).trim();
+      const vout = Number(row.vout);
+      if (!listed.has(outpointKey(txid, vout))) continue;
+      unlocked += await this.db("funding_utxo_pool")
+        .where({ txid, vout, is_locked: true })
+        .update({ is_locked: false, locked_at: null });
+    }
+    return unlocked;
+  }
+
+  private rememberSpend(
+    spent: Array<{ txid: string; vout: number }>,
+    createdTxid: string | null,
+    createdVouts: number[],
+  ): void {
+    let parentDepth = 0;
+    for (const input of spent) {
+      parentDepth = Math.max(parentDepth, this.chainDepth.depthOf(input.txid, input.vout));
+      this.recentSpends.noteSpent(input.txid, input.vout);
+      this.chainDepth.forget(input.txid, input.vout);
+    }
+    if (!createdTxid) return;
+    this.recentSpends.noteBroadcast(createdTxid);
+    const childDepth = parentDepth + 1;
+    for (const vout of createdVouts) {
+      this.chainDepth.noteUnconfirmed(createdTxid, vout, childDepth);
+    }
   }
 
   private async fetchFromChain(address: string): Promise<WocUtxo[]> {

@@ -12,7 +12,8 @@ const INCLUDED_TYPES = new Set<string>([
 ]);
 
 interface AirportEntry {
-  ident: string;
+  /** varchar(4)-safe code, or null when this airport has none. Still indexed by location. */
+  icao: string | null;
   name: string;
   lat: number;
   lon: number;
@@ -20,6 +21,32 @@ interface AirportEntry {
   iso_country: string;
   municipality: string;
   type: AirportSizeType;
+}
+
+/**
+ * `flight_sessions.origin_icao` and `dest_icao` are varchar(4). OurAirports
+ * `ident` is the ICAO code when one exists, otherwise a local code that can
+ * be longer (`AE-0001`) or shorter (`16A`). Those airports stay in nearest
+ * matching; only a 4-character alphanumeric code may be stored or passed to
+ * `findByIcao`.
+ */
+const AIRPORT_ICAO_CODE = /^[A-Z0-9]{4}$/;
+
+/** Returns an uppercase 4-character airport code, or null when it cannot be stored. */
+export function normaliseAirportIcao(raw: string | null | undefined): string | null {
+  if (typeof raw !== "string") {
+    return null;
+  }
+  const code = raw.trim().toUpperCase();
+  return AIRPORT_ICAO_CODE.test(code) ? code : null;
+}
+
+/**
+ * Prefer the OurAirports `icao_code` column. Fall back to `ident` only when
+ * that column is missing or not itself a 4-character code.
+ */
+function resolveAirportIcao(icaoColumn: string, ident: string): string | null {
+  return normaliseAirportIcao(icaoColumn) ?? normaliseAirportIcao(ident);
 }
 
 function defaultCsvPath(): string {
@@ -131,7 +158,7 @@ function buildGrid(airports: AirportEntry[]): Map<string, AirportEntry[]> {
 
 function toAirportInfo(entry: AirportEntry): AirportInfo {
   return {
-    icao_code: entry.ident,
+    icao_code: entry.icao,
     name: entry.name,
     lat: entry.lat,
     lon: entry.lon,
@@ -156,10 +183,13 @@ function parseAirportRows(rows: string[][]): AirportEntry[] {
       continue;
     }
 
-    const ident = cell(row, col, "ident").toUpperCase();
+    // Same inclusion rule as before the ICAO-column fix: a non-empty ident.
+    // A missing storable code does not drop the airport.
+    const ident = cell(row, col, "ident");
     if (!ident) {
       continue;
     }
+    const icao = resolveAirportIcao(cell(row, col, "icao_code"), ident);
 
     const lat = Number.parseFloat(cell(row, col, "latitude_deg"));
     const lon = Number.parseFloat(cell(row, col, "longitude_deg"));
@@ -172,7 +202,7 @@ function parseAirportRows(rows: string[][]): AirportEntry[] {
     const elevation = Number.isFinite(elevation_ft) ? elevation_ft : 0;
 
     entries.push({
-      ident,
+      icao,
       name: cell(row, col, "name"),
       lat,
       lon,
@@ -217,7 +247,13 @@ export class AirportLookup {
   private constructor(airports: AirportEntry[]) {
     this.airports = airports;
     this.grid = buildGrid(airports);
-    this.byIcao = new Map(airports.map((a) => [a.ident, a]));
+    const byIcao = new Map<string, AirportEntry>();
+    for (const airport of airports) {
+      if (airport.icao !== null) {
+        byIcao.set(airport.icao, airport);
+      }
+    }
+    this.byIcao = byIcao;
   }
 
   static async load(csvPath?: string): Promise<AirportLookup> {
@@ -250,7 +286,7 @@ export class AirportLookup {
   }
 
   findByIcao(icao: string): AirportInfo | null {
-    const key = icao.trim().toUpperCase();
+    const key = normaliseAirportIcao(icao);
     if (!key) {
       return null;
     }

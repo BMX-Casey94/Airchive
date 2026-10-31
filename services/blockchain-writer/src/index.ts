@@ -18,9 +18,7 @@ import {
   getDb,
   getFundingState,
   insertTxResult,
-  markTxRejected,
   TREASURY_SCOPE,
-  unlockAllAircraftUtxos,
   upsertAircraftConfig,
 } from "@airchive/db";
 import { createLogger } from "@airchive/logger";
@@ -31,12 +29,15 @@ import {
   isDependencyPendingBroadcastFailure,
   isLocalBackpressureBroadcastFailure,
   isTransientBroadcastFailure,
+  isUnsentBroadcastError,
   type ArcCallbackPayload,
   type BroadcastOutcome,
   type Broadcaster,
   type TerminalRejectionContext,
 } from "./broadcaster.js";
 import { ArcadeBroadcaster, isTerminalArcadeFailure } from "./arcade-broadcaster.js";
+import { arcadeAwaitSeenBeforeSpendEnabled, coerceTimestampMs } from "./live-path-policy.js";
+import { settleTerminalRejectionMark } from "./missing-tx-unwind.js";
 import { extractArcadeRejectDiagnosis } from "./arcade-reject-diagnosis.js";
 import { ArcadeSseClient } from "./arcade-sse.js";
 import {
@@ -67,6 +68,10 @@ import {
   writerWriteOutcomesTotal,
 } from "./metrics.js";
 import { SpendGovernor } from "./spend-governor.js";
+import { GovernedBroadcaster } from "./governed-broadcaster.js";
+import { broadcastHold } from "./broadcast-hold.js";
+import { startLostTxDetector } from "./lost-tx-detector.js";
+import { poolSweepEnabled, sweepPools } from "./pool-sweep.js";
 
 const log = createLogger({ service: "blockchain-writer" });
 
@@ -87,6 +92,13 @@ const CHAIN_DEPTH_SETTLE_INTERVAL_MS = 60_000;
  */
 const STATUS_QUEUE_CONCURRENCY = 8;
 const STATUS_QUEUE_MAX_DEPTH = 5_000;
+/**
+ * Terminal rejections unwind phantom outputs and requeue the payload, so they
+ * get their own lane: a flood of intermediate statuses must never push one out.
+ * Each queued task is a small closure, so the deeper bound costs little memory.
+ */
+const REJECTION_QUEUE_CONCURRENCY = 4;
+const REJECTION_QUEUE_MAX_DEPTH = 50_000;
 /** Blocks arrive roughly every ten minutes, so this stays comfortably ahead. */
 const HEADER_SYNC_INTERVAL_MS = 120_000;
 /** Published by ingestion on every telemetry tick the dashboard renders. */
@@ -96,6 +108,79 @@ const AIRCRAFT_ACTIVITY_CHANNEL = "aircraft-activity";
  * Distinguishes "this write could not be funded" from "this write is bad".
  * Only the latter may ever be discarded.
  */
+function fundingDetailsShielded(details: unknown): boolean {
+  if (!details) return false;
+  if (typeof details === "string") {
+    try {
+      return fundingDetailsShielded(JSON.parse(details) as unknown);
+    } catch {
+      return false;
+    }
+  }
+  if (typeof details !== "object" || Array.isArray(details)) return false;
+  return (details as { backlogShield?: unknown }).backlogShield === true;
+}
+
+/**
+ * Epoch milliseconds for a broadcast clock.
+ *
+ * `tx_results.timestamp` is the writer's `Date.now()` at insert. Postgres
+ * returns that bigint as a digit string, which `Date.parse` would reject.
+ * `created_at` is a timestamp and is only used when the epoch value is absent.
+ * Zero and unparseable values are treated as absent.
+ */
+function broadcastInstantMs(value: unknown): number | null {
+  if (typeof value === "bigint") {
+    const ms = Number(value);
+    return Number.isFinite(ms) && ms > 0 ? ms : null;
+  }
+  if (typeof value === "string" && /^-?\d+$/.test(value.trim())) {
+    const ms = Number(value.trim());
+    return Number.isFinite(ms) && ms > 0 ? ms : null;
+  }
+  if (typeof value === "number") {
+    return Number.isFinite(value) && value > 0 ? value : null;
+  }
+  const parsed = coerceTimestampMs(value);
+  return parsed != null && parsed > 0 ? parsed : null;
+}
+
+/**
+ * When the rejected transaction was broadcast, or null when no clock is stored.
+ *
+ * Prefers `tx_results.timestamp`, then `tx_results.created_at`. A refill or
+ * split has no `tx_results` row; the earliest pool-output `created_at` is the
+ * remaining record, and it has to be read before those outputs are deleted.
+ */
+async function lookupRejectionBroadcastAtMs(
+  db: Knex,
+  txid: string,
+): Promise<number | null> {
+  const recorded = await db("tx_results")
+    .where({ txid })
+    .first("timestamp", "created_at") as {
+      timestamp?: unknown;
+      created_at?: unknown;
+    } | undefined;
+  const fromRecord = broadcastInstantMs(recorded?.timestamp)
+    ?? broadcastInstantMs(recorded?.created_at);
+  if (fromRecord != null) return fromRecord;
+
+  const aircraft = await db("utxo_pool")
+    .where({ txid })
+    .orderBy("created_at", "asc")
+    .first("created_at") as { created_at?: unknown } | undefined;
+  const funding = await db("funding_utxo_pool")
+    .where({ txid })
+    .orderBy("created_at", "asc")
+    .first("created_at") as { created_at?: unknown } | undefined;
+  const fromAircraft = broadcastInstantMs(aircraft?.created_at);
+  const fromFunding = broadcastInstantMs(funding?.created_at);
+  if (fromAircraft == null) return fromFunding;
+  if (fromFunding == null) return fromAircraft;
+  return Math.min(fromAircraft, fromFunding);
+}
+
 function isFundingRelatedError(lastError: string | null): boolean {
   if (!lastError) return false;
   return lastError.includes("No available UTXOs")
@@ -114,10 +199,11 @@ async function purgeUnrecoverablePendingWrites(db: Knex): Promise<void> {
   // A funding outage in progress means every exhausted row is suspect. Nothing
   // is discarded until the treasury is demonstrably healthy again.
   const funding = await getFundingState(db, TREASURY_SCOPE).catch(() => undefined);
-  if (funding && funding.state !== "HEALTHY") {
+  const shielded = fundingDetailsShielded(funding?.details);
+  if (!funding || funding.state !== "HEALTHY" || shielded) {
     log.warn(
-      { fundingState: funding.state },
-      "Skipping pending-write purge — funding is not healthy, backlog preserved in full",
+      { fundingState: funding?.state ?? "unreadable", backlogShield: shielded },
+      "Skipping pending-write purge — funding is not healthy or the outage backlog is still shielded",
     );
     return;
   }
@@ -247,9 +333,11 @@ function isHandledBackpressureError(err: unknown): boolean {
  * chain for that aircraft is invalid. That is precisely how an aircraft goes
  * quiet while still appearing live.
  *
- * So: release only when the transaction was never handed to the broadcaster.
- * Otherwise leave the input locked and let chain truth decide, which the
- * reconcile below does immediately and the lock-TTL sweep repeats as a backstop.
+ * So: release only when the transaction was never handed to the broadcaster,
+ * or when the broadcaster itself refused to send it — a refusal is certain in a
+ * way an upstream failure is not. Otherwise leave the input locked and let chain
+ * truth decide, which the reconcile below does immediately and the lock-TTL
+ * sweep repeats as a backstop.
  */
 async function settleInputAfterFailedWrite(
   icao: string,
@@ -257,8 +345,9 @@ async function settleInputAfterFailedWrite(
   utxo: { txid: string; vout: number },
   walletAddress: string,
   broadcastAttempted: boolean,
+  err?: unknown,
 ): Promise<void> {
-  if (!broadcastAttempted) {
+  if (!broadcastAttempted || isUnsentBroadcastError(err)) {
     await utxoManager.releaseUtxo(utxo.txid, utxo.vout).catch(() => {});
     return;
   }
@@ -393,6 +482,7 @@ async function main(): Promise<void> {
         batchWindowMs: config.arcade.batchWindowMs,
         maxBatchSize: config.arcade.maxBatchSize,
         callbackToken: config.arcade.callbackToken,
+        awaitSeenBeforeSpend: arcadeAwaitSeenBeforeSpendEnabled(),
       },
       arcBroadcaster,
     );
@@ -403,6 +493,7 @@ async function main(): Promise<void> {
         batchWindowMs: config.arcade.batchWindowMs,
         maxBatchSize: config.arcade.maxBatchSize,
         sse: config.arcade.sseEnabled,
+        awaitSeenBeforeSpend: arcadeAwaitSeenBeforeSpendEnabled(),
       },
       "Arcade broadcaster enabled (ARC retained as fallback)",
     );
@@ -410,7 +501,17 @@ async function main(): Promise<void> {
     log.warn("ARCADE_URL not set — broadcasting via ARC only");
   }
 
-  const broadcaster: Broadcaster = arcadeBroadcaster ?? arcBroadcaster;
+  // Decides whether spending is safe at all, from how the network has been
+  // answering rather than from how healthy the treasury looks. Wrapping the
+  // upstream makes the verdict structural: every transaction the writer can
+  // produce, including treasury reshaping and consolidation, passes the gate,
+  // so a halt cannot be defeated by a call site that forgot to ask.
+  const spendGovernor = new SpendGovernor(config.spendGuard);
+  const upstreamBroadcaster: Broadcaster = arcadeBroadcaster ?? arcBroadcaster;
+  const broadcaster: Broadcaster = new GovernedBroadcaster(
+    upstreamBroadcaster,
+    spendGovernor,
+  );
 
   // Independent providers share the work so a WhatsOnChain 429 no longer
   // freezes confirmations and wallet reconciliation at the same time.
@@ -434,12 +535,6 @@ async function main(): Promise<void> {
     },
   });
 
-  // Decides whether spending is safe at all. Every path that can move coin —
-  // live writes, the retry loop, reject requeues, refills and agent top-ups —
-  // consults it, so a network that is refusing transactions costs one burst of
-  // fees rather than an unattended day of them.
-  const spendGovernor = new SpendGovernor(config.spendGuard);
-
   const utxoManager = new UtxoManager(db, woc);
   utxoManager.setMaxUnconfirmedChainDepth(() =>
     spendGovernor.maxUnconfirmedChainDepth(),
@@ -457,8 +552,11 @@ async function main(): Promise<void> {
   );
   writeBuffer.setAutoRefill(autoRefill);
   writeBuffer.setSpendGovernor(spendGovernor);
-  autoRefill.setSpendGate(() => spendGovernor.allowsTreasurySpend());
+  autoRefill.setSpendGate(
+    () => spendGovernor.allowsTreasurySpend() && !broadcastHold.blocksFunding(),
+  );
   let confirmationPoller: ConfirmationPoller | null = null;
+  let lostTxTimer: ReturnType<typeof setInterval> | null = null;
 
   const headerStore = new HeaderStore(db, woc);
   const initialHeaders = await headerStore.syncTip();
@@ -470,12 +568,37 @@ async function main(): Promise<void> {
     void headerStore.syncTip().catch((err) => log.warn({ err }, "Header sync failed"));
   }, HEADER_SYNC_INTERVAL_MS);
 
-  /* ── Startup: unlock stale locks from previous unclean shutdown ── */
-  const unlockedAircraft = await unlockAllAircraftUtxos(db);
-  if (unlockedAircraft > 0) {
-    log.info({ unlocked: unlockedAircraft }, "Unlocked stale aircraft UTXOs from previous run");
+  /* ── Startup: reconcile first, then unlock only chain-unspent locks ── */
+  for (const aircraft of fleet) {
+    try {
+      const address = vault.getAircraftAddress(aircraft.icao);
+      const unlocked = await utxoManager.unlockLocksListedUnspent(aircraft.icao, address);
+      if (unlocked > 0) {
+        log.info(
+          { icao: aircraft.icao, unlocked },
+          "Unlocked aircraft UTXOs the chain still lists as unspent",
+        );
+      }
+    } catch (err) {
+      log.error(
+        { err, icao: aircraft.icao },
+        "Aircraft lock reconciliation failed — locks stay held",
+      );
+    }
   }
-  await fundingUtxoManager.unlockAll();
+  try {
+    const unlockedFunding = await fundingUtxoManager.unlockLocksListedUnspent(
+      config.fundingWalletWif,
+    );
+    if (unlockedFunding > 0) {
+      log.info(
+        { unlocked: unlockedFunding },
+        "Unlocked funding UTXOs the chain still lists as unspent",
+      );
+    }
+  } catch (err) {
+    log.error({ err }, "Funding lock reconciliation failed — locks stay held");
+  }
 
   /* ── Bootstrap aircraft UTXO pools ── */
   log.info("Bootstrapping UTXO pools");
@@ -508,11 +631,6 @@ async function main(): Promise<void> {
   await writeBuffer.coalesceTelemetryBacklog().catch((err) =>
     log.error({ err }, "Telemetry backlog coalescing failed"),
   );
-  // A restart following a long outage should trim the backlog immediately
-  // rather than waiting for the first scheduled prune.
-  await writeBuffer.prunePreservedBacklog().catch((err) =>
-    log.error({ err }, "Preserved backlog prune failed"),
-  );
 
   /* ── Bootstrap funding/treasury UTXO pool ── */
   log.info("Bootstrapping funding UTXO pool");
@@ -521,31 +639,45 @@ async function main(): Promise<void> {
   );
 
   /* ── Reshape the treasury for refill concurrency ── */
-  const treasuryFloorSats = treasuryOutputFloorSats(
-    config.refillAmountSats,
-    config.refillMaxOutputsPerTx,
-  );
+  async function reshapeTreasury(): Promise<void> {
+    const treasuryFloorSats = treasuryOutputFloorSats(
+      config.refillAmountSats,
+      config.refillMaxOutputsPerTx,
+    );
 
-  // Consolidate before splitting: an already-fragmented treasury has no output
-  // big enough to split, so splitting first would be a no-op and the pool would
-  // stay stuck below the refill floor.
-  await fundingUtxoManager
-    .consolidateIfFragmented(config.fundingWalletWif, broadcaster, treasuryFloorSats)
-    .catch((err) => log.error({ err }, "Funding pool consolidation failed"));
+    // Consolidate before splitting: an already-fragmented treasury has no output
+    // big enough to split, so splitting first would be a no-op and the pool would
+    // stay stuck below the refill floor.
+    await fundingUtxoManager
+      .consolidateIfFragmented(config.fundingWalletWif, broadcaster, treasuryFloorSats)
+      .catch((err) => log.error({ err }, "Funding pool consolidation failed"));
 
-  await fundingUtxoManager
-    .splitIfNeeded(
-      config.fundingWalletWif,
-      broadcaster,
-      config.fundingPoolSplitTarget,
-      treasuryFloorSats,
-    )
-    .catch((err) => log.error({ err }, "Funding pool split failed"));
+    await fundingUtxoManager
+      .splitIfNeeded(
+        config.fundingWalletWif,
+        broadcaster,
+        config.fundingPoolSplitTarget,
+        treasuryFloorSats,
+        config.funding.splitMaxCostSats,
+      )
+      .catch((err) => log.error({ err }, "Funding pool split failed"));
+  }
+
+  // When the startup sweep is on, reshaping waits until phantoms are gone.
+  if (!poolSweepEnabled()) {
+    await reshapeTreasury();
+  }
 
   const statusUpdateQueue = new BoundedTaskQueue({
     name: "status-update",
     concurrency: STATUS_QUEUE_CONCURRENCY,
     maxDepth: STATUS_QUEUE_MAX_DEPTH,
+    onOverflow: () => statusEventsShedTotal.inc(),
+  });
+  const rejectionQueue = new BoundedTaskQueue({
+    name: "status-rejection",
+    concurrency: REJECTION_QUEUE_CONCURRENCY,
+    maxDepth: REJECTION_QUEUE_MAX_DEPTH,
     onOverflow: () => statusEventsShedTotal.inc(),
   });
 
@@ -566,8 +698,98 @@ async function main(): Promise<void> {
   async function handleTerminalRejection(
     txid: string,
     rejection?: TerminalRejectionContext,
-  ): Promise<void> {
-    spendGovernor.noteTerminalRejection();
+  ): Promise<"recorded" | "missing" | "ignored"> {
+    // Read before settle: a missing row's pool outputs are deleted there, and
+    // they are the only clock that transaction has. Null means no clock was
+    // stored and the verdict is stale. A failed read leaves this undefined so
+    // the verdict still counts — a database error must not hide a reject storm.
+    let broadcastAtMs: number | null | undefined;
+    try {
+      broadcastAtMs = await lookupRejectionBroadcastAtMs(db, txid);
+    } catch (err) {
+      log.error(
+        { err, txid: txid.slice(0, 12) },
+        "Could not read the broadcast time of a rejected transaction — the verdict will still count toward the spend ratio",
+      );
+    }
+
+    const settled = await settleTerminalRejectionMark(db, txid, {
+      status: rejection?.status ?? "REJECTED",
+      reason: rejection?.reason
+        ?? (rejection?.upstreamSnippet
+          ? `no reason field; upstream=${rejection.upstreamSnippet}`
+          : null),
+      competingTxs: rejection?.competingTxs ?? null,
+    }, {
+      isFundingConfirmed: (outputTxid, vout) =>
+        fundingUtxoManager.isFundingOutputConfirmed(outputTxid, vout),
+    });
+
+    if (settled.kind === "mined" || settled.kind === "present") {
+      log.warn(
+        {
+          txid: txid.slice(0, 12),
+          disposition: settled.kind,
+          rejectStatus: rejection?.status,
+          source: rejection?.source,
+        },
+        settled.kind === "mined"
+          ? "Ignoring terminal rejection for a mined transaction — confirmed outputs were left untouched"
+          : "Ignoring terminal rejection that did not update tx_results",
+      );
+      return "ignored";
+    }
+
+    if (settled.kind === "missing") {
+      // A refill or split has no tx_results row. Its change and aircraft outputs
+      // are still in the pools and would be spent as if the rejection never happened.
+      spendGovernor.noteTerminalRejection(broadcastAtMs);
+      utxoManager.noteOutputsInvalidated(txid, settled.aircraftVouts);
+      fundingUtxoManager.noteOutputsInvalidated(txid, settled.fundingVouts);
+      try {
+        for (const icao of settled.aircraftIcaos) {
+          await utxoManager.reconcile(icao, vault.getAircraftAddress(icao));
+        }
+        if (settled.fundingDeleted > 0) {
+          await fundingUtxoManager.reconcile(config.fundingWalletWif);
+        }
+      } catch (err) {
+        log.error(
+          { err, txid: txid.slice(0, 12), source: rejection?.source },
+          "Failed to reconcile after removing outputs of a rejected transaction with no tx_results row",
+        );
+      }
+      log.warn(
+        {
+          txid,
+          aircraftDeleted: settled.aircraftDeleted,
+          fundingDeleted: settled.fundingDeleted,
+          aircraftConfirmedSkipped: settled.aircraftConfirmedSkipped,
+          fundingConfirmedSkipped: settled.fundingConfirmedSkipped,
+          aircraftIcaos: settled.aircraftIcaos,
+          rejectStatus: rejection?.status,
+          reason: rejection?.reason ?? "(upstream gave no reason)",
+          source: rejection?.source,
+        },
+        "Rejected transaction had no tx_results row — unconfirmed pool outputs removed and reconcile scheduled",
+      );
+      return "missing";
+    }
+
+    spendGovernor.noteTerminalRejection(broadcastAtMs);
+
+    log.error(
+      {
+        txid,
+        rejectStatus: rejection?.status,
+        reason: rejection?.reason ?? "(upstream gave no reason)",
+        competingTxs: rejection?.competingTxs,
+        upstreamSnippet: rejection?.upstreamSnippet,
+        source: rejection?.source,
+      },
+      "Transaction terminally rejected by the network — "
+        + "payload will be re-queued for a fresh broadcast when possible",
+    );
 
     try {
       const purged = await utxoManager.invalidateOutputsOf(txid);
@@ -630,7 +852,7 @@ async function main(): Promise<void> {
         "Reject requeue withheld — spending is halted, so this sample stays a "
           + "FAILED archive gap rather than paying for another attempt",
       );
-      return;
+      return "recorded";
     }
 
     try {
@@ -654,6 +876,7 @@ async function main(): Promise<void> {
         "Failed to re-queue payload after terminal rejection",
       );
     }
+    return "recorded";
   }
 
   async function processStatusUpdate(payload: ArcCallbackPayload): Promise<void> {
@@ -673,36 +896,8 @@ async function main(): Promise<void> {
           upstreamSnippet: diagnosis.upstreamSnippet,
         };
 
-        // A transaction already proved to be in a block cannot subsequently be
-        // rejected; such an event is stale ordering, not new information.
-        const marked = await markTxRejected(db, payload.txid, {
-          status: rejection.status,
-          reason: rejection.reason
-            ?? (rejection.upstreamSnippet
-              ? `no reason field; upstream=${rejection.upstreamSnippet}`
-              : null),
-          competingTxs: rejection.competingTxs,
-        });
-        if (marked === 0) return;
-
-        log.error(
-          {
-            txid: payload.txid,
-            rejectStatus: rejection.status,
-            reason: rejection.reason ?? "(upstream gave no reason)",
-            competingTxs: rejection.competingTxs,
-            upstreamSnippet: rejection.upstreamSnippet,
-            source: rejection.source,
-          },
-          "Transaction terminally rejected by the network — "
-            + "payload will be re-queued for a fresh broadcast when possible",
-        );
-
-        // The rejected transaction's outputs do not exist, so anything the
-        // writer optimistically recorded from it must go before it becomes the
-        // parent of the aircraft's next write and propagates the rejection.
-        // handleTerminalRejection also re-queues the OP_RETURN into pending_writes.
-        await handleTerminalRejection(payload.txid, rejection);
+        const action = await handleTerminalRejection(payload.txid, rejection);
+        if (action === "ignored") return;
 
         await publisher
           .publish("txresult", JSON.stringify({
@@ -781,8 +976,10 @@ async function main(): Promise<void> {
    * exhausted the heap.
    */
   function handleStatusUpdate(payload: ArcCallbackPayload): void {
-    const accepted = statusUpdateQueue.push(() => processStatusUpdate(payload));
-    statusQueueDepth.set(statusUpdateQueue.depth);
+    const terminal = isTerminalArcadeFailure(String(payload.txStatus ?? ""));
+    const queue = terminal ? rejectionQueue : statusUpdateQueue;
+    const accepted = queue.push(() => processStatusUpdate(payload));
+    statusQueueDepth.set(statusUpdateQueue.depth + rejectionQueue.depth);
     if (!accepted) {
       log.warn(
         {
@@ -790,7 +987,7 @@ async function main(): Promise<void> {
           rejectStatus: payload.txStatus,
           reason: payload.extraInfo ?? undefined,
           competingTxs: payload.competingTxs,
-          maxDepth: STATUS_QUEUE_MAX_DEPTH,
+          maxDepth: terminal ? REJECTION_QUEUE_MAX_DEPTH : STATUS_QUEUE_MAX_DEPTH,
         },
         "Status event shed — backlog saturated; the confirmation poller remains the backstop",
       );
@@ -875,6 +1072,19 @@ async function main(): Promise<void> {
     }
   });
 
+  if (poolSweepEnabled()) {
+    await sweepPools({
+      aircraft: fleet.map((aircraft) => ({
+        icao: aircraft.icao,
+        address: vault.getAircraftAddress(aircraft.icao),
+      })),
+      utxoManager,
+      fundingUtxoManager,
+      fundingWif: config.fundingWalletWif,
+    }).catch((err) => log.error({ err }, "Startup pool sweep failed"));
+    await reshapeTreasury();
+  }
+
   async function bufferDeferredWrite(
     icao: string,
     recordType: RecordType,
@@ -920,7 +1130,7 @@ async function main(): Promise<void> {
     // A halted governor is not backpressure: the sample is durable in Postgres
     // and costs nothing to hold, whereas broadcasting it right now would pay a
     // fee the network is likely to refuse.
-    const spendHalted = !spendGovernor.allowsBroadcast();
+    const spendHalted = !spendGovernor.allowsBroadcast() || broadcastHold.blocksBroadcast(icao);
     const shouldDeferTelemetry =
       spendHalted
       || broadcasterState.circuitOpen
@@ -1073,7 +1283,7 @@ async function main(): Promise<void> {
       });
     } catch (err) {
       await settleInputAfterFailedWrite(
-        icao, utxoManager, utxo, walletAddress, broadcastAttempted,
+        icao, utxoManager, utxo, walletAddress, broadcastAttempted, err,
       );
       const payload = encodeTelemetryPayload(telemetry);
       await writeBuffer
@@ -1113,7 +1323,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    const spendHalted = !spendGovernor.allowsBroadcast();
+    const spendHalted = !spendGovernor.allowsBroadcast() || broadcastHold.blocksBroadcast(icao);
     if (spendHalted || broadcaster.getState().circuitOpen) {
       const payload = encodeFlightEventPayload(event);
       const buffered = await bufferDeferredWrite(
@@ -1256,7 +1466,7 @@ async function main(): Promise<void> {
       });
     } catch (err) {
       await settleInputAfterFailedWrite(
-        icao, utxoManager, utxo, walletAddress, broadcastAttempted,
+        icao, utxoManager, utxo, walletAddress, broadcastAttempted, err,
       );
       const payload = encodeFlightEventPayload(event);
       await writeBuffer
@@ -1325,13 +1535,21 @@ async function main(): Promise<void> {
     config,
     fundingUtxoManager,
     autoRefill,
-    writeBuffer,
     broadcaster,
     publisher,
   );
   writeBuffer.setFundingDryGate(() => fundingState.isDry());
-  writeBuffer.setPrunePauseGate(() => fundingState.isRecovering());
+  // RECOVERING ends once the pool is reshaped. The shield stays up until the
+  // preserved backlog has been broadcast, which is also what the startup purge
+  // reads from funding_state.details.
+  writeBuffer.setPrunePauseGate(() => fundingState.pausesBacklogMaintenance());
   await fundingState.start();
+  // Deferred until the machine has adopted a persisted RECOVERING row or
+  // backlog shield. Running it earlier deletes preserved rows on every boot,
+  // including while recovery is still responsible for them.
+  await writeBuffer.prunePreservedBacklog().catch((err) =>
+    log.error({ err }, "Preserved backlog prune failed"),
+  );
 
   autoRefill.start();
   writeBuffer.startRetryLoop();
@@ -1343,7 +1561,9 @@ async function main(): Promise<void> {
     resolveAgentTargets(),
     woc,
   );
-  agentRefiller.setSpendGate(() => spendGovernor.allowsTreasurySpend());
+  agentRefiller.setSpendGate(
+    () => spendGovernor.allowsTreasurySpend() && !broadcastHold.blocksFunding(),
+  );
   agentRefiller.start();
 
   confirmationPoller = new ConfirmationPoller(
@@ -1356,6 +1576,15 @@ async function main(): Promise<void> {
   confirmationPoller.setRedisPublisher(publisher);
   confirmationPoller.setTerminalRejectionHandler(handleTerminalRejection);
   confirmationPoller.start();
+  lostTxTimer = startLostTxDetector({
+    db,
+    probe: (txid) => woc.probeTx(txid),
+    utxoManager,
+    fundingUtxoManager,
+    fundingWif: config.fundingWalletWif,
+    addressFor: (icao) => vault.getAircraftAddress(icao),
+    onQueued: () => writeBuffer.noteExternalEnqueue(),
+  });
 
   log.info("Running initial auto-refill check (activity-aware bootstrap)");
   void autoRefill.checkAll(false).catch((err) =>
@@ -1405,6 +1634,7 @@ async function main(): Promise<void> {
     autoRefill.stop();
     agentRefiller.stop();
     writeBuffer.stopRetryLoop();
+    if (lostTxTimer) clearInterval(lostTxTimer);
     confirmationPoller?.stop();
 
     try {
@@ -1460,6 +1690,10 @@ async function main(): Promise<void> {
       maxUnconfirmedChainDepth: config.spendGuard.maxUnconfirmedChainDepth,
       spendHaltRatio: config.spendGuard.haltRatio,
       spendGuardWindowMs: config.spendGuard.windowMs,
+      spendProbeBudget: config.spendGuard.probeBudget,
+      spendProbeSettleMs: config.spendGuard.probeSettleMs,
+      spendHaltCooldownMs: config.spendGuard.haltCooldownMs,
+      spendHaltCooldownMaxMs: config.spendGuard.haltCooldownMaxMs,
     },
     "Blockchain writer service started",
   );

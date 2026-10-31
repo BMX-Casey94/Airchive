@@ -18,6 +18,12 @@ const log = createLogger({ service: "blockchain-writer:chain-lookup" });
  * elsewhere. Routing by capability keeps each request on a source that can
  * actually serve it, instead of burning budgets on guaranteed 404s.
  */
+export interface TxProbe {
+  presence: "found" | "absent" | "unknown";
+  /** Providers that returned a definite 404. Set only when presence is absent. */
+  providers: string[];
+}
+
 export type ChainCapability =
   | "utxo"
   | "txStatus"
@@ -195,6 +201,53 @@ export class ChainLookup {
   }
 
   /**
+   * Whether any healthy provider has this transaction, in a block or the mempool.
+   * Absent only when every provider that was asked returned a definite 404.
+   * A rate limit, transport error, or unexpected body is unknown: the caller
+   * must not treat the transaction as lost.
+   */
+  async probeTx(txid: string): Promise<TxProbe> {
+    const normalised = txid.trim().toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(normalised)) {
+      return { presence: "unknown", providers: [] };
+    }
+
+    const candidates = this.providers.filter((client) =>
+      this.providerMeta.get(client.name)?.capabilities.includes("tx"),
+    );
+    if (candidates.length === 0) return { presence: "unknown", providers: [] };
+
+    const absent: string[] = [];
+    for (const client of candidates) {
+      if (client.isRateLimited()) return { presence: "unknown", providers: [] };
+      const meta = this.providerMeta.get(client.name);
+      if (!meta) return { presence: "unknown", providers: [] };
+
+      let body: unknown;
+      try {
+        body = await client.getJson<unknown>(
+          this.resolvePath(`/tx/${normalised}`, meta),
+          { label: "lost_tx", timeoutMs: 10_000, allowNotFound: true },
+        );
+      } catch {
+        return { presence: "unknown", providers: [] };
+      }
+
+      if (body == null) {
+        absent.push(client.name);
+        continue;
+      }
+      if (txBodyMatches(body, normalised)) {
+        return { presence: "found", providers: [client.name] };
+      }
+      return { presence: "unknown", providers: [] };
+    }
+
+    if (absent.length === 0) return { presence: "unknown", providers: [] };
+    return { presence: "absent", providers: absent };
+  }
+
+  /**
    * Address UTXOs, normalised to the WhatsOnChain shape every wallet manager
    * already speaks. Prefer Bitails when configured — that is the workload
    * WhatsOnChain is worst at under load — then fall back to any
@@ -318,6 +371,13 @@ export class ChainLookup {
     throw errors[0]
       ?? new WocUnavailableError(`All chain providers failed for ${label}`);
   }
+}
+
+function txBodyMatches(body: unknown, txid: string): boolean {
+  if (typeof body !== "object" || body === null) return false;
+  const record = body as Record<string, unknown>;
+  const id = String(record.txid ?? record.hash ?? record.tx_hash ?? "").trim().toLowerCase();
+  return id === txid;
 }
 
 /** Build the production lookup graph from environment-derived config. */

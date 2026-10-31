@@ -1,11 +1,29 @@
 import type { Knex } from "knex";
 import { FlightPhase, type FlightSession, type FlightStats } from "@airchive/types";
-import type { AirportLookup } from "@airchive/airports";
+import { normaliseAirportIcao, type AirportLookup } from "@airchive/airports";
+import { createLogger } from "@airchive/logger";
 import {
   createFlightSession,
   getActiveSession as selectActiveSession,
   updateFlightSession,
 } from "@airchive/db";
+
+const log = createLogger({ service: "ingestion" });
+
+const AIRPORT_NAME_MAX_LENGTH = 100;
+
+/** Trim and cap an airport name so it fits `flight_sessions` varchar(100). */
+export function airportNameForStorage(name: string): string | undefined {
+  const trimmed = name.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  const characters = Array.from(trimmed);
+  if (characters.length <= AIRPORT_NAME_MAX_LENGTH) {
+    return trimmed;
+  }
+  return characters.slice(0, AIRPORT_NAME_MAX_LENGTH).join("");
+}
 
 export async function startSession(
   db: Knex,
@@ -17,11 +35,19 @@ export async function startSession(
   initialPhase: FlightPhase = FlightPhase.TAXI,
 ): Promise<FlightSession> {
   const nearest = airportLookup.findNearest(lat, lon, 10);
+  const originIcao = normaliseAirportIcao(nearest?.icao_code);
+  const originName = nearest ? airportNameForStorage(nearest.name) : undefined;
+  if (nearest && originIcao === null) {
+    log.debug(
+      { aircraft: icao },
+      "Origin stored by name; no 4-character ICAO",
+    );
+  }
   return createFlightSession(db, {
     aircraft_icao: icao,
     callsign,
-    origin_icao: nearest?.icao_code,
-    origin_name: nearest?.name,
+    origin_icao: originIcao ?? undefined,
+    origin_name: originName,
     phase: initialPhase,
   });
 }
@@ -94,13 +120,28 @@ export async function closeSession(
 export async function updateSessionDest(
   db: Knex,
   sessionId: string,
-  destIcao: string,
+  destIcao: string | null,
   destName: string,
 ): Promise<void> {
-  await updateFlightSession(db, sessionId, {
-    dest_icao: destIcao,
-    dest_name: destName,
-  });
+  const code = normaliseAirportIcao(destIcao);
+  if (typeof destIcao === "string" && destIcao.trim() !== "" && code === null) {
+    const length = destIcao.trim().length;
+    throw new Error(
+      `Destination ICAO cannot be stored (length ${length}); flight_sessions.dest_icao is varchar(4)`,
+    );
+  }
+  const destNameStored = airportNameForStorage(destName);
+  const updates: { dest_icao?: string; dest_name?: string } = {};
+  if (code) {
+    updates.dest_icao = code;
+  }
+  if (destNameStored) {
+    updates.dest_name = destNameStored;
+  }
+  if (updates.dest_icao === undefined && updates.dest_name === undefined) {
+    return;
+  }
+  await updateFlightSession(db, sessionId, updates);
 }
 
 export async function getActiveSession(

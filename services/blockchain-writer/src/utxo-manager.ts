@@ -23,6 +23,17 @@ import {
   utxoPoolCount,
 } from "./metrics.js";
 import type { ChainLookup } from "./chain-lookup.js";
+import { broadcastHold } from "./broadcast-hold.js";
+import {
+  RecentSpendLedger,
+  chainPropagationCooldownMs,
+  coerceTimestampMs,
+  outpointKey,
+  reconcileRecentGuardMs,
+  refillPropagationCooldownMs,
+  shouldRetainLocalDuringReconcile,
+  shouldSuppressChainReinsert,
+} from "./live-path-policy.js";
 
 const log = createLogger({ service: "blockchain-writer:utxo" });
 
@@ -52,8 +63,6 @@ const DEFAULT_MAX_UNCONFIRMED_CHAIN_DEPTH = 5;
 /** Depth assigned to an output the treasury has just delivered but not settled. */
 const REFILL_OUTPUT_DEPTH = 1;
 const ORPHAN_SPEND_COOLDOWN_MS = 1_000;
-const CHAIN_PROPAGATION_COOLDOWN_MS = 0;
-const REFILL_PROPAGATION_COOLDOWN_MS = 500;
 const RECONCILE_COOLDOWN_MS = 60_000;
 const MAX_CONCURRENT_RECONCILES = 2;
 
@@ -77,6 +86,13 @@ function isConfirmedHeight(height: number | null | undefined): boolean {
  * Raised when an aircraft's pool still holds rows but none can be spent. The
  * pool cannot fix this itself — only reconciliation against the chain can.
  */
+export interface ReconcileCounts {
+  added: number;
+  removed: number;
+  /** False when the chain could not be read, or a cooldown skipped the pass. */
+  applied: boolean;
+}
+
 export class StalePoolError extends Error {
   constructor(
     readonly icao: string,
@@ -111,12 +127,13 @@ export class ChainDepthExhaustedError extends Error {
 
 export class UtxoManager {
   private readonly utxoCooldownUntil = new Map<string, number>();
-  private readonly reconcileInFlight = new Map<string, Promise<void>>();
+  private readonly reconcileInFlight = new Map<string, Promise<ReconcileCounts>>();
   private readonly reconcileCooldownUntil = new Map<string, number>();
   private reconcileActive = 0;
   private readonly reconcileWaiters: Array<() => void> = [];
   private maxUnconfirmedChainDepth: () => number = () =>
     DEFAULT_MAX_UNCONFIRMED_CHAIN_DEPTH;
+  private readonly recentSpends = new RecentSpendLedger();
 
   constructor(
     private readonly db: Knex,
@@ -279,43 +296,52 @@ export class UtxoManager {
    * hands the same output to the next write, producing a conflicting spend
    * whose rejection then invalidates every transaction chained behind it.
    *
-   * Reconciling each affected wallet first removes the outputs that are truly
-   * spent; whatever survives is safe to unlock.
+   * If the chain cannot be read, the locks stay held. The TTL alone is not
+   * evidence the output is still unspent.
    */
   async reclaimStaleLocks(
     resolveAddress?: (icao: string) => string,
     ttlMs = UTXO_LOCK_TTL_MS,
   ): Promise<number> {
-    const cutoff = new Date(Date.now() - ttlMs);
-
-    const staleQuery = () =>
-      this.db("utxo_pool")
-        .where({ is_locked: true })
-        .where((builder) => {
-          void builder.where("locked_at", "<", cutoff).orWhereNull("locked_at");
-        });
-
-    const affected = await staleQuery().distinct("aircraft_icao") as Array<{
-      aircraft_icao: string;
-    }>;
-    if (affected.length === 0) return 0;
-
-    if (resolveAddress) {
-      for (const { aircraft_icao: icao } of affected) {
-        try {
-          await this.reconcile(icao, resolveAddress(icao));
-        } catch (err) {
-          log.warn(
-            { err, icao },
-            "Could not reconcile before reclaiming locks — leaving them held",
-          );
-        }
-      }
+    if (!resolveAddress) {
+      log.warn(
+        "No aircraft address resolver — stale aircraft locks stay held rather than unlocking without a chain check",
+      );
+      return 0;
     }
 
-    // Rows deleted by reconciliation were spent, so this only unlocks the ones
-    // the chain still recognises.
-    const reclaimed = await staleQuery().update({ is_locked: false, locked_at: null });
+    const cutoff = new Date(Date.now() - ttlMs);
+    const affected = await this.db("utxo_pool")
+      .where({ is_locked: true })
+      .where((builder) => {
+        void builder.where("locked_at", "<", cutoff).orWhereNull("locked_at");
+      })
+      .distinct("aircraft_icao") as Array<{ aircraft_icao: string }>;
+    if (affected.length === 0) return 0;
+
+    let reclaimed = 0;
+    for (const { aircraft_icao: icao } of affected) {
+      let address: string;
+      try {
+        address = resolveAddress(icao);
+      } catch (err) {
+        log.warn(
+          { err, icao },
+          "Could not resolve aircraft address — stale locks stay held",
+        );
+        continue;
+      }
+      const onChain = await this.readChain(address);
+      if (!onChain) {
+        log.warn(
+          { icao },
+          "Chain lookup unavailable — stale aircraft locks stay held until a later reclaim can verify them against the chain",
+        );
+        continue;
+      }
+      await this.applyChainSnapshot(icao, address, onChain);
+      reclaimed += await this.unlockListedLocks(icao, onChain, cutoff);
+    }
 
     if (reclaimed > 0) {
       utxoLocksReclaimedTotal.inc({ pool: "aircraft" }, reclaimed);
@@ -325,6 +351,35 @@ export class UtxoManager {
       );
     }
     return reclaimed;
+  }
+
+  /**
+   * Startup path. Reconcile against the chain, then unlock locked rows the
+   * chain still lists. A failed lookup leaves every lock held.
+   */
+  async unlockLocksListedUnspent(icao: string, address: string): Promise<number> {
+    const onChain = await this.readChain(address);
+    if (!onChain) {
+      log.warn(
+        { icao },
+        "Chain lookup unavailable — aircraft UTXO locks stay held until a later reclaim can verify them against the chain",
+      );
+      return 0;
+    }
+    await this.applyChainSnapshot(icao, address, onChain);
+    const unlocked = await this.unlockListedLocks(icao, onChain, null);
+    if (unlocked > 0) {
+      log.info(
+        { icao, unlocked },
+        "Unlocked aircraft UTXOs the chain still lists as unspent",
+      );
+    }
+    return unlocked;
+  }
+
+  /** Clears in-memory cooldowns for outputs removed because their creating tx was rejected. */
+  noteOutputsInvalidated(txid: string, vouts: number[]): void {
+    for (const vout of vouts) this.clearUtxoCooldown(txid, vout);
   }
 
   delaySpendRetries(
@@ -425,12 +480,14 @@ export class UtxoManager {
     });
 
     this.clearUtxoCooldown(spentTxid, spentVout);
+    this.recentSpends.noteSpent(spentTxid, spentVout);
+    this.recentSpends.noteBroadcast(changeTxid);
     if (changeSats >= MIN_USABLE_SATS) {
       this.deferFreshOutputReuse(
         icao,
         changeTxid,
         changeVout,
-        CHAIN_PROPAGATION_COOLDOWN_MS,
+        chainPropagationCooldownMs(),
       );
     }
     return await this.refreshMetrics(icao);
@@ -475,114 +532,67 @@ export class UtxoManager {
         icao,
         output.txid,
         output.vout,
-        REFILL_PROPAGATION_COOLDOWN_MS,
+        refillPropagationCooldownMs(),
       );
     }
     return await this.refreshMetrics(icao);
   }
 
-  async reconcile(icao: string, address: string): Promise<void> {
+  async reconcile(
+    icao: string,
+    address: string,
+    options?: { force?: boolean },
+  ): Promise<ReconcileCounts> {
     const key = icao.toUpperCase();
+    const force = options?.force === true;
+    const skipped: ReconcileCounts = { added: 0, removed: 0, applied: false };
     const existing = this.reconcileInFlight.get(key);
     if (existing) {
-      await existing;
-      return;
+      await existing.catch(() => undefined);
+      if (!force) return skipped;
     }
 
-    const cooldownUntil = this.reconcileCooldownUntil.get(key) ?? 0;
-    if (cooldownUntil > Date.now()) {
-      log.debug(
-        { icao: key, remainingMs: cooldownUntil - Date.now() },
-        "Skipping aircraft reconciliation — cooldown active",
-      );
-      return;
+    if (!force) {
+      const cooldownUntil = this.reconcileCooldownUntil.get(key) ?? 0;
+      if (cooldownUntil > Date.now()) {
+        log.debug(
+          { icao: key, remainingMs: cooldownUntil - Date.now() },
+          "Skipping aircraft reconciliation — cooldown active",
+        );
+        return skipped;
+      }
+      this.reconcileCooldownUntil.set(key, Date.now() + RECONCILE_COOLDOWN_MS);
     }
-    this.reconcileCooldownUntil.set(key, Date.now() + RECONCILE_COOLDOWN_MS);
 
-    const task = (async () => {
+    const task = (async (): Promise<ReconcileCounts> => {
       await this.acquireReconcileSlot();
       let onChain: WocUtxo[];
       try {
         onChain = await this.fetchFromChain(address);
       } catch (err) {
         log.warn({ err, icao: key }, "Aircraft reconciliation skipped — WoC unreachable");
-        return;
+        return skipped;
       } finally {
         this.releaseReconcileSlot();
       }
 
       const lockingScript = this.deriveLockingScriptHex(address);
-      const onChainSet = new Set(onChain.map((u) => `${u.tx_hash}:${u.tx_pos}`));
-      const localRows = await this.db("utxo_pool")
-        .where({ aircraft_icao: key })
-        .select("txid", "vout");
-      const localSet = new Set(
-        localRows.map((row: { txid: string; vout: number }) => `${row.txid.trim()}:${row.vout}`),
+      const counts = await this.applyChainSnapshot(
+        key,
+        address,
+        onChain,
+        lockingScript,
+        force ? 0 : undefined,
       );
-
-      let added = 0;
-      let removed = 0;
-      const confirmedOutpoints: Array<{ txid: string; vout: number }> = [];
-
-      for (const utxo of onChain) {
-        const outpoint = `${utxo.tx_hash}:${utxo.tx_pos}`;
-        const confirmed = isConfirmedHeight(utxo.height);
-        if (confirmed) {
-          confirmedOutpoints.push({ txid: utxo.tx_hash, vout: utxo.tx_pos });
-        }
-        if (!localSet.has(outpoint) && utxo.value >= MIN_USABLE_SATS) {
-          await insertUtxo(this.db, {
-            aircraft_icao: key,
-            txid: utxo.tx_hash,
-            vout: utxo.tx_pos,
-            satoshis: utxo.value,
-            locking_script: lockingScript,
-            unconfirmed_depth: confirmed ? 0 : REFILL_OUTPUT_DEPTH,
-          });
-          added++;
-        }
+      if (force) {
+        this.reconcileCooldownUntil.set(key, Date.now() + RECONCILE_COOLDOWN_MS);
       }
-
-      // A confirmed output has no unconfirmed ancestors, so settling it frees
-      // the whole lineage behind it for spending again.
-      const depthResets = await markUtxosConfirmed(this.db, confirmedOutpoints);
-      if (depthResets > 0) {
-        utxoChainDepthResetsTotal.inc(depthResets);
-      }
-
-      for (const row of localRows) {
-        const outpoint = `${(row.txid as string).trim()}:${row.vout as number}`;
-        if (!onChainSet.has(outpoint)) {
-          await this.db("utxo_pool")
-            .where({
-              txid: (row.txid as string).trim(),
-              vout: row.vout as number,
-            })
-            .delete();
-          this.clearUtxoCooldown((row.txid as string).trim(), row.vout as number);
-          removed++;
-        }
-      }
-
-      if (added > 0 || removed > 0 || depthResets > 0) {
-        log.info(
-          {
-            icao: key,
-            added,
-            removed,
-            depthResets,
-            onChainTotal: onChain.length,
-          },
-          "Aircraft UTXO pool reconciled",
-        );
-      }
-
-      await this.refreshMetrics(key);
+      return { ...counts, applied: true };
     })();
 
     this.reconcileInFlight.set(key, task);
     try {
-      await task;
+      return await task;
     } finally {
       if (this.reconcileInFlight.get(key) === task) {
         this.reconcileInFlight.delete(key);
@@ -649,12 +659,14 @@ export class UtxoManager {
 
       for (const u of utxos) {
         this.clearUtxoCooldown(u.txid, u.vout);
+        this.recentSpends.noteSpent(u.txid, u.vout);
       }
+      this.recentSpends.noteBroadcast(txid);
       this.deferFreshOutputReuse(
         icao,
         txid,
         0,
-        CHAIN_PROPAGATION_COOLDOWN_MS,
+        chainPropagationCooldownMs(),
       );
 
       log.info(
@@ -769,6 +781,149 @@ export class UtxoManager {
       { icao: icao.toUpperCase(), txid: txid.slice(0, 12), vout, cooldownMs: ms },
       "Cooling fresh aircraft output before reuse",
     );
+  }
+
+  private async readChain(address: string): Promise<WocUtxo[] | null> {
+    try {
+      return await this.fetchFromChain(address);
+    } catch (err) {
+      log.warn({ err }, "Chain lookup unavailable");
+      return null;
+    }
+  }
+
+  private async unlockListedLocks(
+    icao: string,
+    onChain: WocUtxo[],
+    staleBefore: Date | null,
+  ): Promise<number> {
+    const listed = new Set(onChain.map((utxo) => outpointKey(utxo.tx_hash, utxo.tx_pos)));
+    let query = this.db("utxo_pool").where({
+      aircraft_icao: icao.toUpperCase(),
+      is_locked: true,
+    });
+    if (staleBefore) {
+      query = query.where((builder) => {
+        void builder.where("locked_at", "<", staleBefore).orWhereNull("locked_at");
+      });
+    }
+    const rows = await query.select("txid", "vout") as Array<{ txid: string; vout: number }>;
+    let unlocked = 0;
+    for (const row of rows) {
+      const txid = String(row.txid).trim();
+      const vout = Number(row.vout);
+      if (!listed.has(outpointKey(txid, vout))) continue;
+      unlocked += await this.db("utxo_pool")
+        .where({ txid, vout, is_locked: true })
+        .update({ is_locked: false, locked_at: null });
+    }
+    return unlocked;
+  }
+
+  /**
+   * Applies one chain snapshot. Recent local outputs are kept when the snapshot
+   * does not list them yet, and outpoints spent in this process are not put
+   * back while that spend may still be propagating.
+   */
+  private async applyChainSnapshot(
+    icao: string,
+    address: string,
+    onChain: WocUtxo[],
+    lockingScript = this.deriveLockingScriptHex(address),
+    guardMsOverride?: number,
+  ): Promise<{ added: number; removed: number }> {
+    const key = icao.toUpperCase();
+    const onChainSet = new Set(onChain.map((utxo) => outpointKey(utxo.tx_hash, utxo.tx_pos)));
+    const localRows = await this.db("utxo_pool")
+      .where({ aircraft_icao: key })
+      .select("txid", "vout", "created_at") as Array<{
+        txid: string;
+        vout: number;
+        created_at?: unknown;
+      }>;
+    const localSet = new Set(
+      localRows.map((row) => outpointKey(String(row.txid), Number(row.vout))),
+    );
+    const now = Date.now();
+    const guardMs = guardMsOverride ?? reconcileRecentGuardMs();
+
+    let added = 0;
+    let removed = 0;
+    let retained = 0;
+    let suppressed = 0;
+    const confirmedOutpoints: Array<{ txid: string; vout: number }> = [];
+
+    for (const utxo of onChain) {
+      const outpoint = outpointKey(utxo.tx_hash, utxo.tx_pos);
+      const confirmed = isConfirmedHeight(utxo.height);
+      if (confirmed) {
+        confirmedOutpoints.push({ txid: utxo.tx_hash, vout: utxo.tx_pos });
+      }
+      if (localSet.has(outpoint) || utxo.value < MIN_USABLE_SATS) continue;
+      const spentAtMs = this.recentSpends.spentAtIfFresh(
+        utxo.tx_hash,
+        utxo.tx_pos,
+        now,
+        guardMs,
+      );
+      if (shouldSuppressChainReinsert({ nowMs: now, guardMs, spentAtMs })) {
+        suppressed++;
+        continue;
+      }
+      await insertUtxo(this.db, {
+        aircraft_icao: key,
+        txid: utxo.tx_hash,
+        vout: utxo.tx_pos,
+        satoshis: utxo.value,
+        locking_script: lockingScript,
+        unconfirmed_depth: confirmed ? 0 : REFILL_OUTPUT_DEPTH,
+      });
+      added++;
+    }
+
+    const depthResets = await markUtxosConfirmed(this.db, confirmedOutpoints);
+    if (depthResets > 0) {
+      utxoChainDepthResetsTotal.inc(depthResets);
+    }
+
+    for (const row of localRows) {
+      const txid = String(row.txid).trim();
+      const vout = Number(row.vout);
+      if (onChainSet.has(outpointKey(txid, vout))) continue;
+      if (shouldRetainLocalDuringReconcile({
+        nowMs: now,
+        guardMs,
+        createdAtMs: coerceTimestampMs(row.created_at),
+        spentAtMs: this.recentSpends.spentAtIfFresh(txid, vout, now, guardMs),
+        creatingBroadcastAtMs: this.recentSpends.broadcastAtIfFresh(txid, now, guardMs),
+      })) {
+        retained++;
+        continue;
+      }
+      await this.db("utxo_pool").where({ txid, vout }).delete();
+      this.clearUtxoCooldown(txid, vout);
+      removed++;
+    }
+
+    if (added > 0 || removed > 0 || depthResets > 0 || retained > 0 || suppressed > 0) {
+      log.info(
+        {
+          icao: key,
+          added,
+          removed,
+          retained,
+          suppressed,
+          depthResets,
+          guardMs,
+          onChainTotal: onChain.length,
+        },
+        "Aircraft UTXO pool reconciled",
+      );
+    }
+
+    broadcastHold.unblockAircraft(key);
+    await this.refreshMetrics(key);
+    return { added, removed };
   }
 
   private async fetchFromChain(address: string): Promise<WocUtxo[]> {

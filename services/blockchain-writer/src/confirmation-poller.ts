@@ -208,7 +208,7 @@ export class ConfirmationPoller {
   private lastNudgePollAt = 0;
   private redisPublisher: { publish(channel: string, message: string): Promise<number> } | null = null;
   private onTerminalRejection:
-    | ((txid: string, rejection?: TerminalRejectionContext) => Promise<void>)
+    | ((txid: string, rejection?: TerminalRejectionContext) => Promise<unknown>)
     | null = null;
   /** Height → verified merkle tree. Avoids re-downloading the same hot block. */
   private readonly blockTrees = new Map<number, CachedBlockTree>();
@@ -233,7 +233,7 @@ export class ConfirmationPoller {
    * rejected in turn, which is how a single rejection becomes a stuck chain.
    */
   setTerminalRejectionHandler(
-    handler: (txid: string, rejection?: TerminalRejectionContext) => Promise<void>,
+    handler: (txid: string, rejection?: TerminalRejectionContext) => Promise<unknown>,
   ): void {
     this.onTerminalRejection = handler;
   }
@@ -886,42 +886,39 @@ export class ConfirmationPoller {
           upstreamSnippet: diagnosis.upstreamSnippet,
         };
 
-        await markTxRejected(this.db, txid, {
-          status: rejection.status,
-          reason: rejection.reason
-            ?? (rejection.upstreamSnippet
-              ? `no reason field; upstream=${rejection.upstreamSnippet}`
-              : null),
-          competingTxs: rejection.competingTxs,
-        });
-        log.error(
-          {
-            txid,
-            rejectStatus: rejection.status,
-            reason: rejection.reason ?? "(upstream gave no reason)",
+        if (!this.onTerminalRejection) {
+          await markTxRejected(this.db, txid, {
+            status: rejection.status,
+            reason: rejection.reason
+              ?? (rejection.upstreamSnippet
+                ? `no reason field; upstream=${rejection.upstreamSnippet}`
+                : null),
             competingTxs: rejection.competingTxs,
-            upstreamSnippet: rejection.upstreamSnippet,
-            source: rejection.source,
-            icao: row.aircraft_icao,
-            recordType: Number(row.record_type),
-          },
-          "Transaction terminally rejected by the network — "
-            + "payload will be re-queued for a fresh broadcast when possible",
-        );
-        if (this.onTerminalRejection) {
-          await this.onTerminalRejection(txid, rejection).catch((err: unknown) => {
-            log.error(
-              {
-                err,
-                txid,
-                rejectStatus: rejection.status,
-                reason: rejection.reason,
-                upstreamSnippet: rejection.upstreamSnippet,
-              },
-              "Failed to unwind a rejection found by polling",
-            );
           });
+          log.error(
+            {
+              txid,
+              rejectStatus: rejection.status,
+              reason: rejection.reason ?? "(upstream gave no reason)",
+              source: rejection.source,
+            },
+            "Transaction terminally rejected by the network — "
+              + "payload will be re-queued for a fresh broadcast when possible",
+          );
+          return 0;
         }
+        await this.onTerminalRejection(txid, rejection).catch((err: unknown) => {
+          log.error(
+            {
+              err,
+              txid,
+              rejectStatus: rejection.status,
+              reason: rejection.reason,
+              upstreamSnippet: rejection.upstreamSnippet,
+            },
+            "Failed to unwind a rejection found by polling",
+          );
+        });
         return 0;
       }
 

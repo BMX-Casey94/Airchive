@@ -16,11 +16,12 @@ import {
   type TelemetryRecord,
 } from "@airchive/types";
 import type { AirportLookup } from "@airchive/airports";
-import { haversineDistanceMiles } from "@airchive/airports";
+import { haversineDistanceMiles, normaliseAirportIcao } from "@airchive/airports";
 import { expireStaleFlightSessions, getSessionLastPositionTs } from "@airchive/db";
 import { createLogger } from "@airchive/logger";
 import { Redis } from "ioredis";
 import type { Knex } from "knex";
+import { DestResolveBackoff, DEST_RESOLVE_BACKOFF_MS } from "./dest-resolve-backoff.js";
 import * as sessionManager from "./session-manager.js";
 import { SessionPositionRecorder } from "./session-position-recorder.js";
 import {
@@ -112,6 +113,16 @@ function formatDistanceMiles(miles: number): string {
   return miles < 10 ? miles.toFixed(1) : String(Math.round(miles));
 }
 
+/** Name, with the ICAO in parentheses only when a storable code exists. */
+function airportLabel(
+  name: string | null | undefined,
+  code: string | null | undefined,
+  fallback: string,
+): string {
+  if (!name) return fallback;
+  return code ? `${name} (${code})` : name;
+}
+
 function startedAtMs(session: FlightSession): number {
   const d = session.started_at;
   if (d instanceof Date) return d.getTime();
@@ -162,6 +173,18 @@ export class PhaseEngine {
 
   /** Airframes whose first-contact session resolution has already run. */
   private readonly sessionResolutionDone = new Set<string>();
+
+  /**
+   * Sessions whose last destination write failed. Further polls wait out the
+   * backoff and the warning is emitted once, not on every telemetry frame.
+   */
+  private readonly destResolveBackoff = new DestResolveBackoff(DEST_RESOLVE_BACKOFF_MS);
+
+  /**
+   * Sessions whose destination was saved. Includes a name-only save when the
+   * nearest airport has no 4-character ICAO, so that case is not retried.
+   */
+  private readonly destResolved = new Set<string>();
 
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -396,7 +419,7 @@ export class PhaseEngine {
       // On approach and low, the nearest airport is where this flight is
       // going — fill the destination now instead of waiting for touchdown.
       if (
-        !session.dest_icao
+        !this.destinationSettled(session)
         && phase === FlightPhase.APPROACH
         && Number.isFinite(record.alt_baro)
         && record.alt_baro < DEST_RESOLVE_MAX_ALT_FT
@@ -503,7 +526,7 @@ export class PhaseEngine {
     const gs = Number.isFinite(record.gs) ? Math.round(record.gs) : 0;
 
     const nearest = this.airportLookup.findNearest(record.lat, record.lon, 15);
-    const airportIcao = nearest?.icao_code;
+    const airportIcao = nearest?.icao_code ?? undefined;
     const airportName = nearest?.name;
 
     const flightId = session?.id ?? `orphan-${icao}`;
@@ -512,26 +535,19 @@ export class PhaseEngine {
 
     switch (event) {
       case "TAXI_START": {
-        const origin =
-          session?.origin_name && session.origin_icao
-            ? `${session.origin_name} (${session.origin_icao})`
-            : airportName && airportIcao
-              ? `${airportName} (${airportIcao})`
-              : "unknown airfield";
+        const origin = session?.origin_name
+          ? airportLabel(session.origin_name, session.origin_icao, "unknown airfield")
+          : airportLabel(airportName, airportIcao, "unknown airfield");
         summary = `${callsign} (${reg}, ${acType}) taxiing at ${origin}, heading ${hdg}°, ${alt} ft baro, ${gs} kt groundspeed.`;
         break;
       }
       case "TAKEOFF": {
-        const origin =
-          session?.origin_name && session.origin_icao
-            ? `${session.origin_name} (${session.origin_icao})`
-            : airportName && airportIcao
-              ? `${airportName} (${airportIcao})`
-              : "departure point";
-        const dest =
-          session?.dest_name && session.dest_icao
-            ? `${session.dest_name} (${session.dest_icao})`
-            : null;
+        const origin = session?.origin_name
+          ? airportLabel(session.origin_name, session.origin_icao, "departure point")
+          : airportLabel(airportName, airportIcao, "departure point");
+        const dest = session?.dest_name
+          ? airportLabel(session.dest_name, session.dest_icao, "")
+          : "";
         const destPhrase = dest ? `heading to ${dest}` : "destination not yet known";
         summary = `${callsign} (${reg}, ${acType}) taking off from ${origin}, ${destPhrase}.`;
         break;
@@ -543,8 +559,7 @@ export class PhaseEngine {
         summary = `${callsign} (${reg}) top of descent: ${alt} ft baro, ${gs} kt, track ${hdg}°.`;
         break;
       case "LANDING": {
-        const apt =
-          airportName && airportIcao ? `${airportName} (${airportIcao})` : "destination";
+        const apt = airportLabel(airportName, airportIcao, "destination");
         const st = stats;
         if (st) {
           summary = `${callsign} landed at ${apt}, flight duration so far: ${formatDuration(st.duration_min)}, distance flown: ${formatDistanceMiles(st.distance_miles)} miles, max altitude: ${Math.round(st.max_alt_ft)} ft.`;
@@ -554,8 +569,7 @@ export class PhaseEngine {
         break;
       }
       case "PARKED": {
-        const apt =
-          airportName && airportIcao ? `${airportName} (${airportIcao})` : "stand";
+        const apt = airportLabel(airportName, airportIcao, "stand");
         const st = stats;
         if (st) {
           summary = `${callsign} parked at ${apt}, flight duration: ${formatDuration(st.duration_min)}, distance: ${formatDistanceMiles(st.distance_miles)} miles, max altitude: ${Math.round(st.max_alt_ft)} ft.`;
@@ -638,6 +652,7 @@ export class PhaseEngine {
       (await getSessionLastPositionTs(this.db, dbSession.id))
       ?? startedAtMs(dbSession);
     if (recTs - lastMs > maxGapMs) {
+      this.forgetDestState(dbSession.id);
       await sessionManager.expireSession(this.db, dbSession, lastMs);
       log.info(
         {
@@ -674,6 +689,7 @@ export class PhaseEngine {
       ?? (await getSessionLastPositionTs(this.db, session.id))
       ?? startedAtMs(session);
     await sessionManager.expireSession(this.db, session, lastMs);
+    this.forgetDestState(session.id);
     if (this.activeSessions.get(icao)?.id === session.id) {
       this.activeSessions.delete(icao);
       this.sessionAggs.delete(icao);
@@ -737,6 +753,24 @@ export class PhaseEngine {
     }
   }
 
+  /**
+   * True once a destination has been saved, including a name with no ICAO.
+   * `dest_name` covers a restart; the in-memory set covers a save that had
+   * nothing safe to write.
+   */
+  private destinationSettled(session: FlightSession): boolean {
+    return (
+      this.destResolved.has(session.id)
+      || Boolean(session.dest_icao)
+      || Boolean(session.dest_name)
+    );
+  }
+
+  private forgetDestState(sessionId: string): void {
+    this.destResolveBackoff.clear(sessionId);
+    this.destResolved.delete(sessionId);
+  }
+
   /** Resolve an unset destination to the nearest airport, in DB and memory. */
   private async maybeResolveDest(
     icao: string,
@@ -744,25 +778,41 @@ export class PhaseEngine {
     rec: TelemetryRecord,
     radiusMiles: number,
   ): Promise<void> {
-    if (session.dest_icao) return;
+    if (this.destinationSettled(session)) return;
+    if (this.destResolveBackoff.shouldSkip(session.id)) return;
     try {
       const nearest = this.airportLookup.findNearest(rec.lat, rec.lon, radiusMiles);
       if (!nearest) return;
-      await sessionManager.updateSessionDest(
-        this.db,
-        session.id,
-        nearest.icao_code,
-        nearest.name,
-      );
-      session.dest_icao = nearest.icao_code;
-      session.dest_name = nearest.name;
+      const code = normaliseAirportIcao(nearest.icao_code);
+      const name = sessionManager.airportNameForStorage(nearest.name);
+      if (code || name) {
+        await sessionManager.updateSessionDest(this.db, session.id, code, name ?? "");
+      }
+      this.destResolveBackoff.clear(session.id);
+      this.destResolved.add(session.id);
+      if (code) session.dest_icao = code;
+      if (name) session.dest_name = name;
       this.activeSessions.set(icao, session);
-      log.info(
-        { icao, sessionId: session.id, dest: nearest.icao_code },
-        "Destination resolved",
-      );
+      if (code) {
+        log.info(
+          { icao, sessionId: session.id, dest: code },
+          "Destination resolved",
+        );
+      } else {
+        log.debug(
+          { icao, sessionId: session.id, destName: name },
+          "Destination stored by name; no 4-character ICAO",
+        );
+      }
     } catch (err) {
-      log.warn({ err, icao }, "Destination resolution failed");
+      this.noteDestResolveFailure(icao, session.id, err);
+    }
+  }
+
+  /** Log a destination-write failure once per session and suppress the next polls. */
+  private noteDestResolveFailure(icao: string, sessionId: string, err: unknown): void {
+    if (this.destResolveBackoff.recordFailure(sessionId)) {
+      log.warn({ err, icao, sessionId }, "Destination resolution failed");
     }
   }
 
@@ -776,6 +826,7 @@ export class PhaseEngine {
       if (expired.length === 0) return;
       for (const row of expired) {
         const icao = normaliseIcao(row.aircraft_icao);
+        this.forgetDestState(row.id);
         if (this.activeSessions.get(icao)?.id === row.id) {
           this.activeSessions.delete(icao);
           this.sessionAggs.delete(icao);
@@ -927,6 +978,7 @@ export class PhaseEngine {
         const ev = this.generateFlightEvent("PARKED", rec, session, finalStats);
         await this.publishFlightEvent(ev, icao);
         await sessionManager.closeSession(this.db, session.id, finalStats);
+        this.forgetDestState(session.id);
         this.activeSessions.delete(icao);
         this.sessionAggs.delete(icao);
         this.writeRateController.reset(icao);
