@@ -1,9 +1,8 @@
 "use client";
 
-import { useRef, useEffect, useState } from "react";
+import { useRef, useEffect } from "react";
 import clsx from "clsx";
-import { useAlertStore } from "@/stores/alert-store";
-import { useAircraftStore } from "@/stores/aircraft-store";
+import { alertTime, useAlertStore } from "@/stores/alert-store";
 import { AlertSeverity } from "@/types/airchive";
 import type { AlertRecord } from "@/types/airchive";
 import { fmtTimePrecise } from "@/lib/format";
@@ -30,13 +29,11 @@ const ROW_BG: Record<string, string> = {
   EMERGENCY: "bg-alert-red/10",
 };
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+
 export function AlertsPanel() {
   const alerts = useAlertStore((s) => s.alerts);
-  const selectedIcao = useAircraftStore((s) => s.selectedIcao);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const [isSimulating, setIsSimulating] = useState(false);
-  const [actionMessage, setActionMessage] = useState<string | null>(null);
-  const [actionError, setActionError] = useState<string | null>(null);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -44,125 +41,49 @@ export function AlertsPanel() {
     el.scrollTop = el.scrollHeight;
   }, [alerts.length]);
 
-  async function handleSimulateAlert(): Promise<void> {
-    if (isSimulating) return;
-
-    setIsSimulating(true);
-    setActionMessage(null);
-    setActionError(null);
-
-    try {
-      // Same-origin BFF mints a short-lived operator JWT server-side; the
-      // browser never talks to the JWT-protected gateway route directly.
-      const res = await fetch("/api/alerts/test", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-        },
-        body: JSON.stringify(selectedIcao ? { icao: selectedIcao } : {}),
-      });
-      const payload = (await res.json().catch(() => null)) as {
-        success?: boolean;
-        error?: string;
-      } | null;
-
-      if (!res.ok || payload?.success === false) {
-        throw new Error(
-          payload?.error ?? `Alert test failed (${res.status})`,
-        );
-      }
-
-      setActionMessage(
-        selectedIcao
-          ? `Test alert sent for ${selectedIcao}.`
-          : "Test alert sent for the tracked fleet.",
-      );
-    } catch (err) {
-      setActionError(
-        err instanceof Error ? err.message : "Failed to trigger test alert.",
-      );
-    } finally {
-      setIsSimulating(false);
-    }
-  }
-
-  const unackCount = alerts.filter((a) => !a.acknowledged).length;
+  const since = Date.now() - DAY_MS;
+  const recent = alerts.filter((a) => alertTime(a) >= since);
+  const recentSerious = recent.some(
+    (a) => a.severity === AlertSeverity.CRITICAL || a.severity === AlertSeverity.EMERGENCY,
+  );
 
   const badge =
-    unackCount > 0 ? (
-      <span className="rounded-full bg-alert-red/20 border border-alert-red/40 px-2 py-0.5 text-[10px] font-mono text-alert-red tabular-nums">
-        {unackCount} unacknowledged
+    recent.length > 0 ? (
+      <span
+        className={clsx(
+          "rounded-full border px-2 py-0.5 text-[10px] font-mono tabular-nums",
+          recentSerious
+            ? "bg-alert-red/20 border-alert-red/40 text-alert-red"
+            : "bg-neon-amber/10 border-neon-amber/30 text-neon-amber",
+        )}
+      >
+        {recent.length} in last 24 h
       </span>
     ) : null;
 
   return (
     <Panel title="Alert Log" headerAction={badge}>
-      <div className="-mx-4 -mb-4 space-y-3 px-4 pb-4">
-        <div
-          ref={scrollRef}
-          className="max-h-[360px] overflow-y-auto"
-        >
-          {alerts.map((alert) => (
-            <AlertRow key={alert.id} alert={alert} />
-          ))}
+      <div
+        ref={scrollRef}
+        className="-mx-4 -mb-4 max-h-[360px] overflow-y-auto px-4 pb-4"
+      >
+        {alerts.map((alert) => (
+          <AlertRow key={alert.id} alert={alert} />
+        ))}
 
-          {alerts.length === 0 && (
-            <div className="flex flex-col items-center justify-center py-12 gap-3">
-              <div className="h-10 w-10 rounded-full border border-signal-green/30 flex items-center justify-center">
-                <span className="text-signal-green text-sm">✓</span>
-              </div>
-              <p className="text-sm text-hud-muted">
-                No alerts recorded.
-              </p>
-              <p className="text-[10px] text-hud-muted/60">
-                Alerts will appear for squawk changes, emergency codes, and anomalies.
-              </p>
+        {alerts.length === 0 && (
+          <div className="flex flex-col items-center justify-center py-12 gap-3">
+            <div className="h-10 w-10 rounded-full border border-signal-green/30 flex items-center justify-center">
+              <span className="text-signal-green text-sm">✓</span>
             </div>
-          )}
-        </div>
-
-        <div className="border-t border-panel-border/30 pt-3">
-          <div className="flex items-center justify-between gap-3">
+            <p className="text-sm text-hud-muted">
+              No alerts recorded.
+            </p>
             <p className="text-[10px] text-hud-muted/60">
-              {selectedIcao
-                ? `Test will target ${selectedIcao}.`
-                : "Test will use an enabled aircraft automatically."}
+              Alerts appear for emergency squawks, unusual flight behaviour, signal loss and treasury status.
             </p>
-            <button
-              type="button"
-              onClick={() => void handleSimulateAlert()}
-              disabled={isSimulating}
-              aria-busy={isSimulating}
-              className={clsx(
-                "rounded-full border px-3 py-1 font-mono text-[10px] uppercase tracking-wide transition-colors",
-                isSimulating
-                  ? "cursor-wait border-panel-border/40 bg-deep-navy/50 text-hud-muted/60"
-                  : "border-electric-cyan/30 bg-electric-cyan/10 text-electric-cyan hover:bg-electric-cyan/20",
-              )}
-            >
-              {isSimulating ? (
-                "Sending..."
-              ) : (
-                <>
-                  <span className="sm:hidden">Simulate Alert</span>
-                  <span className="hidden sm:inline">Simulate/Test Alert System</span>
-                </>
-              )}
-            </button>
           </div>
-
-          {(actionMessage || actionError) && (
-            <p
-              className={clsx(
-                "mt-2 text-[10px]",
-                actionError ? "text-alert-red" : "text-signal-green",
-              )}
-            >
-              {actionError ?? actionMessage}
-            </p>
-          )}
-        </div>
+        )}
       </div>
     </Panel>
   );
@@ -194,11 +115,7 @@ function AlertRow({ alert }: { alert: AlertRecord }) {
       </span>
 
       <span className="flex-shrink-0 font-mono text-[10px] text-hud-muted tabular-nums mt-0.5 w-[82px]">
-        {fmtTimePrecise(
-          alert.created_at instanceof Date
-            ? alert.created_at.getTime()
-            : new Date(alert.created_at).getTime(),
-        )}
+        {fmtTimePrecise(alertTime(alert))}
       </span>
 
       <span className="flex-shrink-0 rounded bg-deep-navy px-1.5 py-0.5 font-mono text-[10px] text-electric-cyan tabular-nums border border-panel-border">

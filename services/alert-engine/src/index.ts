@@ -16,7 +16,11 @@ import { AlertNotifier } from "./notifier.js";
 
 const log = createLogger({ service: "alert-engine" });
 
-/** Alerts raised by other services and already persisted by them. */
+/**
+ * Live alert feed the gateway relays to dashboards. Other services publish
+ * their own persisted alerts here, and this engine publishes the aircraft
+ * alerts it raises.
+ */
 const SYSTEM_ALERT_CHANNEL = "alerts";
 /** Bounded so a long-running process cannot accumulate ids indefinitely. */
 const DISPATCHED_ALERT_MEMORY = 500;
@@ -169,6 +173,15 @@ async function main(): Promise<void> {
   await redis.connect();
   await subscriber.connect();
 
+  // Marked as dispatched first: the engine also subscribes to this channel and
+  // must not notify a second time when its own message comes back.
+  async function publishAlert(alert: AlertRecord): Promise<void> {
+    rememberDispatched(alert.id);
+    await redis.publish(SYSTEM_ALERT_CHANNEL, JSON.stringify(alert)).catch((err: Error) => {
+      log.warn({ err: err.message, alertId: alert.id }, "Could not publish alert to the live feed");
+    });
+  }
+
   const channels: string[] = config.trackedAircraft.flatMap((icao) => {
     const u = icao.trim().toUpperCase();
     return [`telemetry:${u}`, `phase:${u}`];
@@ -209,6 +222,7 @@ async function main(): Promise<void> {
       for (const a of alerts) {
         try {
           await insertAlert(db, toNewAlert(a));
+          await publishAlert(a);
           await notifier.notify(a);
         } catch (err) {
           log.error({ err, alertId: a.id }, "Signal loss alert pipeline failed");
@@ -243,6 +257,7 @@ async function main(): Promise<void> {
       const phase = detector.update(record);
       const alerts = await engine.evaluate(record, phase);
       for (const a of alerts) {
+        await publishAlert(a);
         await n.notify(a);
       }
       return;
@@ -258,6 +273,7 @@ async function main(): Promise<void> {
       );
       if (alert === null) return;
       await insertAlert(database, toNewAlert(alert));
+      await publishAlert(alert);
       await n.notify(alert);
     }
   }

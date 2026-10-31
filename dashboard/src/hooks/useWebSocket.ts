@@ -216,6 +216,17 @@ export function useWebSocket() {
       .catch(() => {});
   }, []);
 
+  const backfillRecentAlerts = useCallback(() => {
+    fetch(`${API_URL}/api/alerts?limit=200`)
+      .then((r) => r.json())
+      .then((json: { success: boolean; data?: AlertRecord[] }) => {
+        if (json.success && Array.isArray(json.data)) {
+          useAlertStore.getState().mergeAlerts(json.data);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
@@ -234,6 +245,7 @@ export function useWebSocket() {
       }
 
       backfillRecentTransactions();
+      backfillRecentAlerts();
     };
 
     ws.onmessage = (event) => {
@@ -294,7 +306,7 @@ export function useWebSocket() {
       ws.close();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [updateAircraft, updateFleet, pushEntry, setDailySummary, pushAlert, enqueueGlobeUpdate, pushAgentEvent, sendMessage, backfillRecentTransactions]);
+  }, [updateAircraft, updateFleet, pushEntry, setDailySummary, pushAlert, enqueueGlobeUpdate, pushAgentEvent, sendMessage, backfillRecentTransactions, backfillRecentAlerts]);
 
   const scheduleReconnect = useCallback(() => {
     if (reconnectTimer.current) clearTimeout(reconnectTimer.current);

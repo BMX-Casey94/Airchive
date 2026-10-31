@@ -68,7 +68,9 @@ export class WsHub {
           : "phase_change";
 
         const payload = JSON.stringify({ type, payload: data });
-        const broadcastToAll = type === "agent_activity";
+        // Alerts are rare and include fleet-wide SYSTEM alerts with no aircraft,
+        // so a client following particular aircraft must still receive them.
+        const broadcastToAll = type === "agent_activity" || type === "alert";
 
         for (const client of this.clients) {
           if (client.ws.readyState !== WebSocket.OPEN) continue;

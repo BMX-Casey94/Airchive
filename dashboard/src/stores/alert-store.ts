@@ -20,6 +20,8 @@ interface AlertState {
   pushAlert: (alert: AlertRecord) => void;
   /** Bulk-replace alerts (e.g. on initial load). */
   setAlerts: (alerts: AlertRecord[]) => void;
+  /** Merge loaded history with live alerts, de-duplicated by ID, oldest first. */
+  mergeAlerts: (alerts: AlertRecord[]) => void;
   /** Mark an alert as acknowledged by ID. */
   acknowledgeAlert: (id: string) => void;
   /** Trigger the emergency overlay. */
@@ -30,6 +32,13 @@ interface AlertState {
 
 const MAX_ALERTS = 500;
 
+export function alertTime(alert: AlertRecord): number {
+  const t = alert.created_at instanceof Date
+    ? alert.created_at.getTime()
+    : new Date(alert.created_at).getTime();
+  return Number.isFinite(t) ? t : 0;
+}
+
 export const useAlertStore = create<AlertState>((set) => ({
   alerts: [],
   emergencyActive: false,
@@ -37,11 +46,22 @@ export const useAlertStore = create<AlertState>((set) => ({
 
   pushAlert: (alert) =>
     set((prev) => {
+      if (prev.alerts.some((a) => a.id === alert.id)) return prev;
       const next = [...prev.alerts, alert].slice(-MAX_ALERTS);
       return { alerts: next };
     }),
 
   setAlerts: (alerts) => set({ alerts: alerts.slice(-MAX_ALERTS) }),
+
+  mergeAlerts: (incoming) =>
+    set((prev) => {
+      const byId = new Map<string, AlertRecord>();
+      for (const a of [...incoming, ...prev.alerts]) byId.set(a.id, a);
+      const merged = [...byId.values()].sort(
+        (a, b) => alertTime(a) - alertTime(b),
+      );
+      return { alerts: merged.slice(-MAX_ALERTS) };
+    }),
 
   acknowledgeAlert: (id) =>
     set((prev) => ({
