@@ -1,6 +1,7 @@
 import { createServer as createHttpServer } from "node:http";
 import type { Knex } from "knex";
 import { Redis } from "ioredis";
+import { PrivateKey } from "@bsv/sdk";
 import {
   RecordType,
   type FlightEventRecord,
@@ -73,6 +74,7 @@ import { NetworkSpentRegistry, parseNetworkSpentOutpoints } from "./network-spen
 import { GovernedBroadcaster } from "./governed-broadcaster.js";
 import { broadcastHold } from "./broadcast-hold.js";
 import { startLostTxDetector } from "./lost-tx-detector.js";
+import { minedLookupFromChain, startGhostSpendRecovery } from "./ghost-spend-recovery.js";
 import { poolSweepEnabled, sweepPools } from "./pool-sweep.js";
 
 const log = createLogger({ service: "blockchain-writer" });
@@ -565,6 +567,7 @@ async function main(): Promise<void> {
   );
   let confirmationPoller: ConfirmationPoller | null = null;
   let lostTxTimer: ReturnType<typeof setInterval> | null = null;
+  let ghostSpendRecovery: { stop(): void } | null = null;
 
   const headerStore = new HeaderStore(db, woc);
   const initialHeaders = await headerStore.syncTip();
@@ -1611,6 +1614,33 @@ async function main(): Promise<void> {
     addressFor: (icao) => vault.getAircraftAddress(icao),
     onQueued: () => writeBuffer.noteExternalEnqueue(),
   });
+  // The fleet registered above is the set of wallets this process can spend.
+  // force matches the startup sweep: a cooldown skip would leave the returned
+  // outputs out of the pools.
+  ghostSpendRecovery = startGhostSpendRecovery({
+    db,
+    enabled: config.ghostRecovery.enabled,
+    intervalMs: config.ghostRecovery.intervalMs,
+    batch: config.ghostRecovery.batch,
+    maxAttempts: config.ghostRecovery.maxAttempts,
+    datahubUrls: config.ghostRecovery.datahubUrls,
+    submitUrls: config.ghostRecovery.submitUrls,
+    arcadeBaseUrl: config.arcade.url,
+    callbackToken: config.arcade.callbackToken,
+    apiKey: config.arcade.apiKey,
+    resolveOwned: () => ({
+      treasuryAddress: PrivateKey.fromWif(config.fundingWalletWif).toAddress(),
+      aircraft: fleet.map((aircraft) => ({
+        icao: aircraft.icao,
+        address: vault.getAircraftAddress(aircraft.icao),
+      })),
+    }),
+    reconcileFunding: () =>
+      fundingUtxoManager.reconcile(config.fundingWalletWif, { force: true }),
+    reconcileAircraft: (icao, address) =>
+      utxoManager.reconcile(icao, address, { force: true }),
+    lookupMined: (txid) => minedLookupFromChain(woc, txid),
+  });
 
   log.info("Running initial auto-refill check (activity-aware bootstrap)");
   void autoRefill.checkAll(false).catch((err) =>
@@ -1660,6 +1690,7 @@ async function main(): Promise<void> {
     autoRefill.stop();
     agentRefiller.stop();
     writeBuffer.stopRetryLoop();
+    ghostSpendRecovery?.stop();
     if (lostTxTimer) clearInterval(lostTxTimer);
     confirmationPoller?.stop();
 

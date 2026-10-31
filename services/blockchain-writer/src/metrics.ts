@@ -332,6 +332,13 @@ export const lostTxTotal = new Counter({
   registers: [registry],
 });
 
+export const ghostSpendRecoveryTotal = new Counter({
+  name: "airchive_ghost_spend_recovery_total",
+  help: "Ghost-spend recovery results for quarantined outpoints, by outcome",
+  labelNames: ["outcome"] as const,
+  registers: [registry],
+});
+
 export function recordTypeMetricLabel(recordType: RecordType): string {
   switch (recordType) {
     case RecordType.FLIGHT_EVENT:

@@ -1,5 +1,9 @@
 import { createHash } from "node:crypto";
 import type { SpendGuardConfig } from "./spend-governor.js";
+import {
+  ghostRecoverySettings,
+  type GhostRecoverySettings,
+} from "./ghost-spend-recovery.js";
 
 export interface RedisConfig {
   host: string;
@@ -74,6 +78,8 @@ export interface Config {
   fundingPoolSplitTarget: number;
   funding: FundingRecoveryConfig;
   agentRefill: AgentRefillConfig;
+  /** Rebroadcast of our own transactions stuck on one Teranode node. */
+  ghostRecovery: GhostRecoverySettings;
 }
 
 /**
@@ -363,5 +369,6 @@ export function loadConfig(): Config {
       minOutputSats: Number(optionalEnv("AGENT_REFILL_MIN_OUTPUT_SATS", "1200")),
       minUsableOutputs: Number(optionalEnv("AGENT_REFILL_MIN_USABLE_OUTPUTS", "6")),
     },
+    ghostRecovery: ghostRecoverySettings(),
   };
 }
