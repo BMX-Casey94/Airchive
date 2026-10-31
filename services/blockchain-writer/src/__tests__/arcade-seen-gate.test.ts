@@ -2,7 +2,11 @@ import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Transaction } from "@bsv/sdk";
 import { ArcadeBroadcaster } from "../arcade-broadcaster.js";
-import type { Broadcaster } from "../broadcaster.js";
+import {
+  isDependencyPendingBroadcastFailure,
+  isTransientBroadcastFailure,
+  type Broadcaster,
+} from "../broadcaster.js";
 
 const TX_A = "aa".repeat(32);
 const TX_B = "bb".repeat(32);
@@ -145,6 +149,54 @@ describe("Arcade seen-before-spend gate", () => {
 
     const result = await broadcaster.broadcast(fakeTx(TX_A), "ABCDEF");
     expect(result).toMatchObject({ status: "FAILED", code: "NOT_SEEN_ON_NETWORK" });
+    await broadcaster.closeCallbackReceiver();
+  });
+
+  it("reports a double spend seen during the gate as terminal, not as still propagating", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (String(url).includes(`/tx/${TX_A}`)) {
+        return json({ txid: TX_A, txStatus: "DOUBLE_SPEND_ATTEMPTED" });
+      }
+      return json([{ txid: TX_A, txStatus: "RECEIVED" }]);
+    }));
+    const broadcaster = new ArcadeBroadcaster(
+      {
+        url: "http://arcade.test",
+        callbackToken: "tok",
+        awaitSeenBeforeSpend: true,
+        maxBatchSize: 1,
+        seenGateTimeoutMs: 3_000,
+      },
+      fallback(),
+    );
+
+    const result = await broadcaster.broadcast(fakeTx(TX_A), "ABCDEF");
+    expect(result).toMatchObject({ status: "FAILED", code: "DOUBLE_SPEND_ATTEMPTED" });
+    expect(isDependencyPendingBroadcastFailure(result)).toBe(false);
+    expect(isTransientBroadcastFailure(result)).toBe(false);
+    await broadcaster.closeCallbackReceiver();
+  });
+
+  it("reports a rejection delivered over SSE during an orphan-mempool wait as terminal", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (String(url).includes(`/tx/${TX_A}`)) return new Response("", { status: 404 });
+      return json([{ txid: TX_A, txStatus: "SEEN_IN_ORPHAN_MEMPOOL" }]);
+    }));
+    const broadcaster = new ArcadeBroadcaster(
+      {
+        url: "http://arcade.test",
+        callbackToken: "tok",
+        awaitSeenBeforeSpend: true,
+        maxBatchSize: 1,
+        seenGateTimeoutMs: 2_000,
+      },
+      fallback(),
+    );
+
+    const pending = broadcaster.broadcast(fakeTx(TX_A), "ABCDEF");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    broadcaster.noteStatus(TX_A, "rejected");
+    await expect(pending).resolves.toMatchObject({ status: "FAILED", code: "REJECTED" });
     await broadcaster.closeCallbackReceiver();
   });
 

@@ -631,7 +631,8 @@ export async function markTxRejected(
       status: "FAILED",
       reject_status: rejectStatus || null,
       reject_reason: reason,
-      reject_competing_txs: competing,
+      // node-postgres sends a JS array as a Postgres array literal, which jsonb rejects.
+      reject_competing_txs: competing ? db.raw("?::jsonb", [JSON.stringify(competing)]) : null,
     });
 }
 

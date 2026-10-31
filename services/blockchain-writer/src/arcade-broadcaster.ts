@@ -56,6 +56,24 @@ export function isTerminalArcadeFailure(status: string): boolean {
   return TERMINAL_FAILURE_STATUSES.has(status.trim().toUpperCase());
 }
 
+/** "SEEN", "TIMEOUT", or the terminal Arcade status that refused the transaction. */
+type SeenGateVerdict = string;
+
+/**
+ * A refusal seen while the gate was waiting is final. It must not be reported
+ * as NOT_SEEN_ON_NETWORK: callers hold and retry the input for that code, and a
+ * double-spent input never becomes spendable again.
+ */
+function gateRejection(txid: string, status: string): BroadcastOutcome {
+  log.warn({ txid, txStatus: status }, "Arcade refused the transaction during the spend gate");
+  return {
+    txid,
+    status: "FAILED",
+    code: status,
+    description: `Arcade reported ${status} while the spend gate was waiting`,
+  };
+}
+
 export interface ArcadeBroadcasterConfig {
   /** Base URL, e.g. https://arcade-v2-us-1.bsvblockchain.tech */
   url: string;
@@ -133,7 +151,7 @@ export class ArcadeBroadcaster extends EventEmitter implements Broadcaster {
   private batchTimer: ReturnType<typeof setTimeout> | null = null;
   private inFlight = 0;
   private healthy = true;
-  private readonly seenWaiters = new Map<string, (spendable: boolean) => void>();
+  private readonly seenWaiters = new Map<string, (verdict: SeenGateVerdict) => void>();
   private readonly awaitSeenBeforeSpend: boolean;
 
   /**
@@ -262,9 +280,11 @@ export class ArcadeBroadcaster extends EventEmitter implements Broadcaster {
           // Each submission awaits its own gate; resolving one does not wait for
           // the rest of the batch, so aircraft writes are not serialised on it.
           if (outcome.status === "FAILED" && outcome.code === "SEEN_IN_ORPHAN_MEMPOOL") {
-            const spendable = await this.awaitSeenOnNetwork(submission.txid);
-            if (spendable) {
+            const verdict = await this.awaitSeenOnNetwork(submission.txid);
+            if (verdict === "SEEN") {
               outcome = { txid: submission.txid, status: "SEEN_ON_NETWORK" };
+            } else if (verdict !== "TIMEOUT") {
+              outcome = gateRejection(submission.txid, verdict);
             }
           } else if (
             outcome.status === "SEEN_ON_NETWORK"
@@ -274,14 +294,16 @@ export class ArcadeBroadcaster extends EventEmitter implements Broadcaster {
               txStatus,
             })
           ) {
-            const spendable = await this.awaitSeenOnNetwork(submission.txid);
-            if (!spendable) {
+            const verdict = await this.awaitSeenOnNetwork(submission.txid);
+            if (verdict === "TIMEOUT") {
               outcome = {
                 txid: submission.txid,
                 status: "FAILED",
                 code: NOT_SEEN_ON_NETWORK_CODE,
                 description: "Transaction was not seen on the network before the spend gate timed out",
               };
+            } else if (verdict !== "SEEN") {
+              outcome = gateRejection(submission.txid, verdict);
             }
           }
 
@@ -413,27 +435,28 @@ export class ArcadeBroadcaster extends EventEmitter implements Broadcaster {
     if (!waiter) return;
 
     const normalised = status.trim().toUpperCase();
-    if (SPENDABLE_STATUSES.has(normalised)) waiter(true);
-    else if (isTerminalArcadeFailure(normalised)) waiter(false);
+    if (SPENDABLE_STATUSES.has(normalised)) waiter("SEEN");
+    else if (isTerminalArcadeFailure(normalised)) waiter(normalised);
   }
 
   /**
-   * Resolves true once Arcade reports the transaction on the network. Uses the
-   * SSE stream when it is delivering, and falls back to polling `GET /tx/{txid}`
-   * so the gate still works if SSE is disabled or disconnected.
+   * Resolves "SEEN" once Arcade reports the transaction on the network, the
+   * terminal status if Arcade refuses it, or "TIMEOUT". Uses the SSE stream when
+   * it is delivering, and falls back to polling `GET /tx/{txid}` so the gate
+   * still works if SSE is disabled or disconnected.
    */
-  private async awaitSeenOnNetwork(txid: string): Promise<boolean> {
+  private async awaitSeenOnNetwork(txid: string): Promise<SeenGateVerdict> {
     const deadline = Date.now() + this.config.seenGateTimeoutMs;
 
-    return new Promise<boolean>((resolve) => {
+    return new Promise<SeenGateVerdict>((resolve) => {
       let settled = false;
-      const finish = (spendable: boolean): void => {
+      const finish = (verdict: SeenGateVerdict): void => {
         if (settled) return;
         settled = true;
         clearInterval(pollTimer);
         clearTimeout(deadlineTimer);
         this.seenWaiters.delete(txid);
-        resolve(spendable);
+        resolve(verdict);
       };
 
       this.seenWaiters.set(txid, finish);
@@ -442,8 +465,8 @@ export class ArcadeBroadcaster extends EventEmitter implements Broadcaster {
         if (Date.now() >= deadline) return;
         void this.fetchStatus(txid).then((status) => {
           if (!status) return;
-          if (SPENDABLE_STATUSES.has(status)) finish(true);
-          else if (isTerminalArcadeFailure(status)) finish(false);
+          if (SPENDABLE_STATUSES.has(status)) finish("SEEN");
+          else if (isTerminalArcadeFailure(status)) finish(status);
         });
       }, 1_000);
 
@@ -452,7 +475,7 @@ export class ArcadeBroadcaster extends EventEmitter implements Broadcaster {
           { txid, timeoutMs: this.config.seenGateTimeoutMs },
           "Transaction not seen on network within the gate window — treating as unconfirmed",
         );
-        finish(false);
+        finish("TIMEOUT");
       }, this.config.seenGateTimeoutMs);
     });
   }
